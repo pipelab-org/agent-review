@@ -1,0 +1,16 @@
+# Trusted default-branch repository policy; only these two sections are allowed.
+[review]
+instructions = """
+This repository is a shared review engine that other repositories load at a
+pinned commit. Check that admission identity, permissions, the trusted checkout
+repository, the caller template, and the profile reader still fail closed.
+Changes to the reusable workflow, the source helper, or the caller template
+change what every pinned caller must match; report any drift between them.
+Python reads caller files as bounded data and never executes caller content.
+Provider fallback must stay limited to explicit billing rejections. Output must
+not echo credentials, model text, or exception bodies into comments or logs.
+Require negative tests that fail when a guard is removed.
+"""
+
+[ignore]
+glob = []
