@@ -268,7 +268,7 @@ class ReplyAdmissionTests(unittest.TestCase):
         self.event["action"] = "created"
         for key, value in (("body", "edited"), ("commit_id", "9" * 40), ("in_reply_to_id", None),
                            ("pull_request_url", "https://api.github.com/repos/other/project/pulls/1"),
-                           ("updated_at", "2026-10-18T17:01:00Z")):
+                           ("created_at", "2026-10-18T17:00:01Z")):
             old = self.event["comment"][key]
             self.event["comment"][key] = value
             with self.subTest(key=key), self.assertRaises(f.FollowupAbort): self.admit()
@@ -282,6 +282,15 @@ class ReplyAdmissionTests(unittest.TestCase):
         self.user["type"] = "Bot"
         self.live.user.type = "Bot"
         with self.assertRaises(f.FollowupAbort): self.admit()
+
+    def test_github_creation_clock_step_still_admits_same_head_reply(self):
+        # The created event keeps equal timestamps. The refetch has the one-second
+        # updated_at step GitHub stores on unedited replies.
+        self.live.raw_data["updated_at"] = "2026-10-18T17:00:01Z"
+        self.assertIs(self.live, self.admit())
+        self.event["comment"]["updated_at"] = ""
+        with self.assertRaises(f.FollowupAbort):
+            self.admit()
 
     def test_exact_root_manifest_review_and_digest_required(self):
         record = evidence()

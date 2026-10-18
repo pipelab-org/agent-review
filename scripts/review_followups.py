@@ -363,10 +363,17 @@ def admit_reply(event, env, repo, pr, membership):
         raise FollowupAbort("Reply event is ineligible")
     live = pr.get_review_comment(comment["id"])
     # Explicit field equality catches edited and stale/mismatched event payloads.
-    fields = ("id", "body", "in_reply_to_id", "pull_request_review_id", "commit_id", "original_commit_id", "path", "created_at", "updated_at", "pull_request_url")
+    # GitHub can store updated_at one second after created_at on a reply that
+    # was not edited. Public cli/cli pull 14673 comments 4295607645 and
+    # 4295608262 are on that pull's head, with commit_id == original_commit_id,
+    # and updated_at one second after created_at. An edit is a mismatch of
+    # body, creation time, commits, path, or thread ids against the created
+    # event. updated_at is not that signal.
+    fields = ("id", "body", "in_reply_to_id", "pull_request_review_id", "commit_id", "original_commit_id", "path", "created_at", "pull_request_url")
+    updated = comment.get("updated_at")
     if (not identity(live.user, {k: user.get(k) for k in ("id", "login", "type")}) or any(live.raw_data.get(k) != comment.get(k) for k in fields)
             or not isinstance(comment.get("created_at"), str) or not comment["created_at"]
-            or comment.get("created_at") != comment.get("updated_at")
+            or not isinstance(updated, str) or not updated
             or not isinstance(live.body, str) or not live.body.strip()
             or not positive(comment.get("in_reply_to_id"))
             or comment.get("commit_id") != pr.head.sha

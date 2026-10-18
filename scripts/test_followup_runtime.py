@@ -161,13 +161,23 @@ class FollowupRuntimeTests(unittest.TestCase):
         self.assertEqual(2, sum(path == "/orgs/example/memberships/member" for _, path, _ in self.calls))
         complete.assert_awaited_once()
 
+    def test_refetch_updated_at_clock_step_still_answers(self):
+        self.event["comment"] = dict(self.question)
+        self.question["updated_at"] = "2026-10-18T17:00:01Z"
+        complete = self.completion()
+        self.run_reply(complete)
+        complete.assert_awaited_once()
+        self.assertEqual(f.reply_marker(11, 10) + "\n" + self.reply_body, self.responses[-1]["body"])
+
     def test_unrelated_bot_root_and_edited_comment_cannot_spend(self):
         for attack in ("root", "edited", "rerun", "bot"):
             with self.subTest(attack=attack):
                 complete = self.completion()
                 old = copy.deepcopy(self.question)
                 if attack == "root": self.record["roots"] = []
-                if attack == "edited": self.question["updated_at"] = "later"
+                if attack == "edited":
+                    self.event["comment"] = dict(self.question)
+                    self.question["body"] = "Edited after the created event"
                 if attack == "rerun": self.env["GITHUB_RUN_ATTEMPT"] = "2"
                 if attack == "bot": self.question["user"] = f.BOT
                 with self.assertRaises(f.FollowupAbort): self.run_reply(complete)
