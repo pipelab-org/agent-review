@@ -9,13 +9,15 @@ on:
         required: false
       OPENAI_API_KEY:
         required: false
+      ORG_MEMBERS_TOKEN:
+        required: false
 
 permissions: {}
 
 jobs:
   source:
     if: >-
-      github.event_name == 'issue_comment' &&
+      (github.event_name == 'issue_comment' &&
       github.event.action == 'created' &&
       github.actor == 'luckyPipewrench' &&
       github.actor_id == '142104046' &&
@@ -26,7 +28,14 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)
+      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+      github.event.action == 'created' &&
+      github.run_attempt == '1' &&
+      github.actor == github.event.comment.user.login &&
+      github.triggering_actor == github.actor &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.in_reply_to_id)
     # Local nested calls load from this workflow's own immutable revision.
     # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_iduses
     permissions: {}
@@ -99,6 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
+      actions: read # Verify immutable completion artifacts from prior runs.
       contents: read # Check out the trusted workflow revision.
       issues: write # Update the persistent summary on the pull request.
       pull-requests: write # Publish inline review threads.
@@ -151,6 +161,89 @@ jobs:
           REVIEW_DEPTH: ${{ github.event.comment.body == '/review deep' && 'deep' || 'default' }}
           REVIEW_HEAD: ${{ needs.admit.outputs.head }}
           REVIEW_BASE: ${{ needs.admit.outputs.base }}
+          LITELLM_LOCAL_MODEL_COST_MAP: 'True'
+          OTEL_SDK_DISABLED: 'true'
+          REVIEW_COMPLETION_PATH: ${{ runner.temp }}/agent-review-completion/completion.json
+        run: python trusted-agent-review/scripts/pr_agent_review.py
+      - name: Preserve immutable completion proof for later commands and replies
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-review-completion
+          path: ${{ runner.temp }}/agent-review-completion/completion.json
+          if-no-files-found: ignore
+
+  reply:
+    name: Answer an inline review question
+    needs: source
+    if: >-
+      github.event_name == 'pull_request_review_comment' &&
+      github.event.action == 'created' &&
+      github.run_attempt == '1' &&
+      github.actor == github.event.comment.user.login &&
+      github.triggering_actor == github.actor &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.in_reply_to_id
+    concurrency:
+      group: agent-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    container:
+      image: pragent/pr-agent:0.47.0@sha256:7d98954c29289846a08faf00aaea0f1f1375b1676cd8a2ed303e0af07010af7a
+      options: --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges
+    steps:
+      - name: Check out immutable agent-review source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: pipelab-org/agent-review
+          ref: ${{ needs.source.outputs.reviewer_sha }}
+          path: trusted-agent-review
+          persist-credentials: false
+      - name: Resolve immutable default-branch policy and validate the loaded caller as data
+        id: policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: python trusted-agent-review/scripts/agent_review_contract.py --resolve-reply-policy --source-sha "$REVIEW_SOURCE_SHA"
+      - name: Check out caller policy as data from its loaded default-branch revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.policy.outputs.sha }}
+          path: trusted-agent-profile
+          persist-credentials: false
+          sparse-checkout: |
+            .github/agent-review.toml
+            .github/workflows/agent-review.yaml
+          sparse-checkout-cone-mode: false
+      - name: Validate the trusted caller and restricted profile before inference
+        env:
+          # The caller's ref, not this file's: rejects a decoy agent-review.yaml.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+        run: python trusted-agent-review/scripts/agent_review_contract.py --root trusted-agent-profile --source-sha "$REVIEW_SOURCE_SHA"
+      - name: Answer an admitted inline question
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY_2: ${{ secrets.ANTHROPIC_API_KEY_2 }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ORG_MEMBERS_TOKEN: ${{ secrets.ORG_MEMBERS_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+          REVIEW_PROFILE_SHA: ${{ steps.policy.outputs.sha }}
+          REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
+          # Select a fixed value after exact-command admission; never interpolate command arguments.
+          REVIEW_DEPTH: default
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
+          REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
           LITELLM_LOCAL_MODEL_COST_MAP: 'True'
           OTEL_SDK_DISABLED: 'true'
         run: python trusted-agent-review/scripts/pr_agent_review.py
@@ -257,7 +350,7 @@ jobs:
                   for item in comments:
                       author = item.get("user", {})
                       if (author.get("login") == "github-actions[bot]" and author.get("type") == "Bot"
-                              and item.get("body", "").split("\n", 1)[0] == marker):
+                              and marker in item.get("body", "").splitlines()):
                           if type(item.get("id")) is not int or item["id"] <= 0:
                               raise ValueError("Invalid notification comment")
                           api("PATCH", f"{prefix}/issues/comments/{item['id']}", {"body": body})

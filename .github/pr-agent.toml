@@ -31,7 +31,7 @@ max_output_tokens = 16000
 ai_timeout = 300
 max_description_tokens = 500
 max_commits_tokens = 500
-persistent_inline_comments = true
+persistent_inline_comments = false
 ignore_pr_title = []
 # Supported overrides for models newer than LiteLLM's bundled metadata.
 # Claude Haiku 5.5 rejects non-default sampling values. PR-Agent already drops
@@ -47,7 +47,7 @@ reasoning_effort = "medium"
 inline_key_issues = true
 persistent_comment = true
 publish_output_no_suggestions = true
-persistent_finding_state = true
+persistent_finding_state = false
 review_heading = "Diff review"
 final_update_message = false
 num_max_findings = 10
@@ -92,3 +92,16 @@ enabled = false
 
 [artifacts]
 enable = false
+
+# Operator policy, not a review-quality guarantee. Model IDs are published at
+# https://platform.claude.com/docs/en/models/overview . Budget settings above
+# apply to both depths. Profiles cannot override these central choices.
+[review_depth.default]
+model = "anthropic/claude-sonnet-5-5"
+fallback_models = ["gpt-6-luna"]
+reasoning_effort = "medium"
+
+[review_depth.deep]
+model = "anthropic/claude-opus-5-5"
+fallback_models = ["gpt-6-luna"]
+reasoning_effort = "high"

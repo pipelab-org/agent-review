@@ -188,9 +188,28 @@ class CallerTests(unittest.TestCase):
                             contract.main()
                         self.assertEqual(code, raised.exception.code)
 
+    def test_inline_events_bind_exact_merge_ref_and_immutable_default_policy(self):
+        repo = "example/project"
+        with patch.dict(os.environ, GITHUB_EVENT_NAME="pull_request_review_comment"):
+            contract.validate_caller_ref(f"{repo}/.github/workflows/agent-review.yaml@refs/pull/1/merge", repo)
+            for ref in (f"{repo}/.github/workflows/other.yaml@refs/pull/1/merge",
+                        f"{repo}/.github/workflows/agent-review.yaml@refs/heads/feature",
+                        f"{repo}/.github/workflows/agent-review.yaml@refs/pull/1/head"):
+                with self.assertRaises(ValueError): contract.validate_caller_ref(ref, repo)
+        reply = WORKFLOW["jobs"]["reply"]
+        checkout, policy, profile, validate, run = reply["steps"]
+        self.assertNotIn("secrets.", json.dumps(policy))
+        self.assertEqual("${{ steps.policy.outputs.sha }}", profile["with"]["ref"])
+        self.assertIn("--resolve-reply-policy", policy["run"])
+        self.assertEqual("${{ github.event.pull_request.head.sha }}", run["env"]["REVIEW_HEAD"])
+        self.assertIn("ORG_MEMBERS_TOKEN", run["env"])
+        self.assertEqual("default", run["env"]["REVIEW_DEPTH"])
+        self.assertEqual("max", reply["concurrency"]["queue"])
+        self.assertEqual("false", reply["concurrency"]["cancel-in-progress"])
+
     def test_every_job_repeats_the_exact_admission_gate(self):
         gate = WORKFLOW['jobs']['admit']['if']
-        self.assertEqual(gate, WORKFLOW['jobs']['source']['if'])
+        self.assertIn(gate, WORKFLOW['jobs']['source']['if'])
         self.assertTrue(WORKFLOW['jobs']['notify-failure']['if'].startswith('always() && ' + gate + ' && ('))
 
     def test_source_binding_and_queue_precede_provider_work(self):
@@ -202,7 +221,7 @@ class CallerTests(unittest.TestCase):
         job = WORKFLOW['jobs']['review']
         self.assertEqual('max', job['concurrency']['queue'])
         self.assertEqual('false', job['concurrency']['cancel-in-progress'])
-        run = job['steps'][-1]
+        run = job['steps'][-2]
         self.assertEqual('${{ needs.source.outputs.reviewer_sha }}', run['env']['REVIEW_SOURCE_SHA'])
         self.assertEqual('${{ github.workflow_sha }}', run['env']['REVIEW_PROFILE_SHA'])
         self.assertEqual('trusted-agent-profile/.github/agent-review.toml', run['env']['REVIEW_PROFILE_PATH'])

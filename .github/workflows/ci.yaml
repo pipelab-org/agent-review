@@ -67,4 +67,4 @@ jobs:
           TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
         run: |
           python -c "import pr_agent" || { echo "pinned image has no pr_agent module" >&2; exit 1; }
-          python -m unittest -v scripts.test_pr_agent_runtime
+          python -m unittest -v scripts.test_pr_agent_runtime scripts.test_followup_runtime scripts.test_review_followups

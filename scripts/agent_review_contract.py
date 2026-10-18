@@ -21,8 +21,10 @@ REMOTE_CALL = "pipelab-org/agent-review/.github/workflows/agent-review-reusable.
 EXPECTED_CALLER = r"""name: PR-Agent review
 
 on:
-  # Default-branch code only; the identity gate and fork admission are tested.
+  # Commands run on the default branch; inline replies have independent admission.
   issue_comment: # zizmor: ignore[dangerous-triggers]
+    types: [created]
+  pull_request_review_comment: # zizmor: ignore[dangerous-triggers]
     types: [created]
 
 permissions: {}
@@ -30,7 +32,7 @@ permissions: {}
 jobs:
   review:
     if: >-
-      github.event_name == 'issue_comment' &&
+      (github.event_name == 'issue_comment' &&
       github.event.action == 'created' &&
       github.actor == 'luckyPipewrench' &&
       github.actor_id == '142104046' &&
@@ -41,8 +43,16 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)
+      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+      github.event.action == 'created' &&
+      github.run_attempt == '1' &&
+      github.actor == github.event.comment.user.login &&
+      github.triggering_actor == github.actor &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.in_reply_to_id)
     permissions:
+      actions: read
       contents: read
       issues: write
       pull-requests: write
@@ -51,6 +61,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_API_KEY_2: ${{ secrets.ANTHROPIC_API_KEY_2 }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ORG_MEMBERS_TOKEN: ${{ secrets.ORG_MEMBERS_TOKEN }}
 """
 
 
@@ -88,7 +99,13 @@ def validate_caller(path, source_sha, *, allow_local=False):
     """The trusted validator's source pin is authority, never the proposed pin."""
     if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
         raise ValueError("reviewer source must be a full immutable SHA")
-    text = read_data(path)
+    validate_caller_text(read_data(path), source_sha, allow_local=allow_local)
+    return source_sha
+
+
+def validate_caller_text(text, source_sha, *, allow_local=False):
+    if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("reviewer source must be a full immutable SHA")
     expected = EXPECTED_CALLER.replace(LOCAL_CALL, REMOTE_CALL + source_sha + " # main")
     if text != expected and not (allow_local and text == EXPECTED_CALLER):
         raise ValueError("caller differs from the trusted maintainer-gated definition")
@@ -107,7 +124,10 @@ def validate_caller_ref(workflow_ref, repository):
     # issue_comment loads the caller from a branch. Git permits "@" in file
     # names, so a ref containing "@" could hide a path like agent-review.yaml@x.
     prefix = f"{repository}/.github/workflows/agent-review.yaml@refs/heads/"
-    if not (isinstance(workflow_ref, str) and re.fullmatch(re.escape(prefix) + r"[^@\s]+", workflow_ref)):
+    expected = re.escape(prefix) + r"[^@\s]+"
+    if os.environ.get("GITHUB_EVENT_NAME") == "pull_request_review_comment":
+        expected = re.escape(f"{repository}/.github/workflows/agent-review.yaml@refs/pull/") + r"[1-9][0-9]*/merge"
+    if not (isinstance(workflow_ref, str) and re.fullmatch(expected, workflow_ref)):
         raise ValueError("running caller is not the validated caller file")
 
 
@@ -129,17 +149,46 @@ def load_profile(path):
     return data, hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def resolve_reply_policy(source_sha):
+    # Review-comment events load a PR merge ref. Its caller is read only as data;
+    # executable source stays pinned, and profiles come from immutable default.
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review_comment
+    from github import Auth, Github
+    repository = os.environ["GITHUB_REPOSITORY"]
+    validate_caller_ref(os.environ.get("CALLER_WORKFLOW_REF"), repository)
+    repo = Github(auth=Auth.Token(os.environ.pop("GITHUB_TOKEN"))).get_repo(repository)
+    loaded = os.environ["CALLER_WORKFLOW_SHA"]
+    if not re.fullmatch(r"[0-9a-f]{40}", loaded):
+        raise ValueError("invalid loaded caller")
+    allow_local = repository == "pipelab-org/agent-review"
+    validate_caller_text(repo.get_contents(".github/workflows/agent-review.yaml", ref=loaded).decoded_content.decode(),
+                         source_sha, allow_local=allow_local)
+    sha = repo.get_branch(repo.default_branch).commit.sha
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("invalid default branch")
+    validate_caller_text(repo.get_contents(".github/workflows/agent-review.yaml", ref=sha).decoded_content.decode(),
+                         source_sha, allow_local=allow_local)
+    with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+        stream.write(f"sha={sha}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=pathlib.Path, required=True)
+    parser.add_argument("--root", type=pathlib.Path)
+    parser.add_argument("--resolve-reply-policy", action="store_true")
     parser.add_argument("--source-sha", required=True)
     args = parser.parse_args()
     try:
+        if args.resolve_reply_policy:
+            resolve_reply_policy(args.source_sha)
+            return
+        if args.root is None:
+            raise ValueError("missing root")
         validate_caller_ref(os.environ.get("CALLER_WORKFLOW_REF"), os.environ.get("GITHUB_REPOSITORY"))
         validate_caller(args.root / ".github/workflows/agent-review.yaml", args.source_sha,
                         allow_local=os.environ.get("GITHUB_REPOSITORY") == "pipelab-org/agent-review")
         load_profile(args.root / ".github/agent-review.toml")
-    except (OSError, ValueError):
+    except Exception:
         # Paths and parser messages can contain proposed content. Fixed output only.
         parser.exit(1, "Invalid review caller or profile\n")
     print("Review caller and profile contract passed")
