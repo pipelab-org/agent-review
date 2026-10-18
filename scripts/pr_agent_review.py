@@ -270,6 +270,11 @@ def stored_findings_ok(findings):
     return True
 
 
+def exact_positive_int(value):
+    # bool is an int subclass, and JSON true must not compare equal to pull request 1.
+    return type(value) is int and value > 0
+
+
 def parse_result(body):
     """Use the last marker. Model text can precede the marker the publisher appends."""
     matches = list(re.finditer(rf"<!-- {RESULT_MARKER} ([A-Za-z0-9+/=]+) -->", body))
@@ -280,7 +285,9 @@ def parse_result(body):
         data = json.loads(base64.b64decode(token, validate=True))
     except (ValueError, json.JSONDecodeError):
         return None
-    if not isinstance(data, dict) or not stored_findings_ok(data.get("findings")):
+    if (not isinstance(data, dict) or not exact_positive_int(data.get("number"))
+            or not exact_positive_int(data.get("summary"))
+            or not stored_findings_ok(data.get("findings"))):
         return None
     return token, data
 

@@ -3,6 +3,7 @@
 
 """Shared caller/profile data contract and host-only failure reporting."""
 
+import base64
 import copy
 import hashlib
 import io
@@ -336,6 +337,42 @@ class ReuseTests(unittest.TestCase):
         summary.body = 'Complete review'
         summary.user = None
         self.assertIsNone(adapter.completed_review([good, summary], key, *identity))
+
+    def test_non_integer_identifiers_do_not_suppress_rerun(self):
+        key = 'c' * 64
+        identity = ("example/project", 1, "a" * 40, "b" * 40, "default")
+        good_summary, good = self.bound(key, [])
+        self.assertIs(good, adapter.completed_review([good, good_summary], key, *identity))
+
+        def record(number, summary_value, comment_id):
+            evidence = {"repository": "example/project", "number": number, "base": "b" * 40,
+                        "head": "a" * 40, "depth": "default", "key": key,
+                        "summary": summary_value, "findings": []}
+            manifest = adapter.result_manifest(evidence)
+            line = adapter.result_comment(manifest)
+            body = "Complete review\n" + line
+            digest = hashlib.sha256(body.encode()).hexdigest()
+            summary = NS(id=comment_id, body=body, user=NS(login='github-actions[bot]', type='Bot'))
+            status = NS(id=9, body=(
+                f'<!-- agent-review-status:v1 state=success key={key} summary={comment_id} '
+                f'digest={digest} -->\nComplete\n{line}'),
+                user=NS(login='github-actions[bot]', type='Bot'))
+            return summary, status, manifest
+
+        summary, status, manifest = record(True, 7, 7)
+        self.assertIn('"number":true', base64.b64decode(manifest).decode())
+        self.assertIsNone(adapter.parse_result(summary.body))
+        self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
+        summary, status, manifest = record(1, True, 1)
+        self.assertIn('"summary":true', base64.b64decode(manifest).decode())
+        self.assertIsNone(adapter.parse_result(summary.body))
+        self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
+        for number, summary_value, comment_id in (
+                (1.0, 7, 7), (1, 1.0, 1), ("1", 7, 7), (1, "7", 7),
+                (0, 7, 7), (1, 0, 7), (-1, 7, 7), (False, 7, 7)):
+            summary, status, _manifest = record(number, summary_value, comment_id)
+            self.assertIsNone(adapter.parse_result(summary.body))
+            self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
 
     def test_profile_exclusions_remain_literal_in_provenance(self):
         text = adapter.provenance('a' * 40, 'b' * 40, 'c' * 64, ['**/`[name](example)/**'])
