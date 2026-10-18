@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import hashlib
 import importlib.util
 import os
@@ -61,7 +62,7 @@ class RuntimeTests(unittest.TestCase):
             "ANTHROPIC_API_KEY": "", "ANTHROPIC_API_KEY_2": "", "OPENAI_API_KEY": "fixture-openai",
         }
         self.output = """review:
-  security_concerns: 'None'
+  security_concerns: 'No'
   relevant_tests: 'No'
   key_issues_to_review:
     - relevant_file: src/file.py
@@ -115,6 +116,16 @@ class RuntimeTests(unittest.TestCase):
         self.provider.publish_persistent_comment.assert_called_once()
         self.provider.publish_comment.assert_not_called()
         self.assertIn(self.head, self.provider.publish_persistent_comment.call_args.args[0])
+        status = self.status.edit.call_args.args[0]
+        encoded = status.split("<!-- agent-review-result:v1 ", 1)[1].split(" -->", 1)[0]
+        evidence = json.loads(base64.b64decode(encoded, validate=True))
+        self.assertEqual(self.head, evidence["head"])
+        self.assertEqual(self.base, evidence["base"])
+        self.assertEqual(self.repo, evidence["repository"])
+        self.assertEqual("default", evidence["depth"])
+        self.assertEqual("src/file.py", evidence["findings"][0]["path"])
+        self.assertEqual(1, evidence["findings"][0]["line"])
+        self.assertEqual("Correctness", evidence["findings"][0]["title"])
         self.provider.github_client.get_repo.assert_called_with(self.repo)
         self.provider.github_client.get_repo.return_value.get_pull.assert_called_with(1)
 
@@ -134,6 +145,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual({"effort": "medium"}, kwargs["output_config"])
         self.assertEqual(16000, kwargs["max_tokens"])
         self.assertNotIn("temperature", kwargs)
+
+    def test_deep_review_reaches_provider_and_has_separate_completion_identity(self):
+        with patch.dict(os.environ, self.env):
+            ordinary = review.review_binding(self.settings, self.repo, "1", self.head, self.base)[0]
+        self.env["REVIEW_DEPTH"] = "deep"
+        with patch.dict(os.environ, self.env):
+            self.settings, _ = review.configure()
+            deep = review.review_binding(self.settings, self.repo, "1", self.head, self.base)[0]
+        self.assertNotEqual(ordinary, deep)
+        kwargs = self.anthropic_request("anthropic/claude-sonnet-5-5")
+        self.assertEqual({"effort": "high"}, kwargs["output_config"])
+        self.assertIn("malformed inputs", str(kwargs["messages"]))
+        summary = self.provider.publish_persistent_comment.call_args.args[0]
+        self.assertIn("Review depth: `deep`", summary)
+
+    def test_unknown_depth_never_admits_inference(self):
+        with patch.dict(os.environ, REVIEW_DEPTH="deep extra"), self.assertRaises(review.ReviewAbort):
+            review.configure()
 
     def test_pinned_handler_haiku_omits_temperature(self):
         kwargs = self.anthropic_request("anthropic/claude-haiku-5-5")

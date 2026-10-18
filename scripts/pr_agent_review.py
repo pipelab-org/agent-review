@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -166,6 +167,13 @@ class CompletionChain:
         raise ReviewAbort("Configured provider credits exhausted")
 
 
+def review_depth():
+    depth = os.environ.get("REVIEW_DEPTH", "default")
+    if depth not in ("default", "deep"):
+        raise ReviewAbort("Invalid review depth")
+    return depth
+
+
 def configure():
     profile, _ = load_profile(Path(os.environ.get("REVIEW_PROFILE_PATH", PROFILE)))
     # Set before importing LiteLLM: its default import can fetch mutable metadata.
@@ -185,6 +193,14 @@ def configure():
             settings.set(f"{section}.{key}", value)
     settings.set("pr_reviewer.extra_instructions",
                  data["pr_reviewer"]["extra_instructions"].rstrip() + "\n\n" + profile["review"]["instructions"])
+    depth = review_depth()
+    if depth == "deep":
+        settings.set("config.reasoning_effort", "high")
+        settings.set("pr_reviewer.extra_instructions",
+                     settings.pr_reviewer.extra_instructions +
+                     "\nTrace changed behavior through callers and failure paths. "
+                     "Check malformed inputs, stale state, concurrency, and rollback. "
+                     "Prioritize concrete security and correctness defects over breadth.")
     settings.set("ignore.glob", profile["ignore"]["glob"])
     # Provider registration supplies routing metadata only. The operator's token
     # ceiling above controls budgeting; it is not the model's advertised context.
@@ -247,7 +263,8 @@ def review_binding(settings, repo, number, head, base):
     models = [settings.config.model, *settings.config.fallback_models]
     binding = {"repository": repo, "number": number, "head": head, "base": base,
                "reviewer": source, "profile_hash": profile_hash, "models": models,
-               "common_config": hashlib.sha256(CONFIG.read_bytes()).hexdigest()}
+               "common_config": hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
+               "depth": review_depth()}
     key = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
     return key, source, profile_sha, profile_hash, profile["ignore"]["glob"]
 
@@ -257,7 +274,37 @@ def provenance(source, profile_sha, profile_hash, exclusions):
     shown_exclusions = json.dumps(exclusions, ensure_ascii=True).replace("`", "\\u0060")
     return (f"Reviewer source `{source}`; caller profile `{profile_sha}` "
             f"(SHA-256 `{profile_hash}`).\n\n"
-            f"Declared exclusions: `{shown_exclusions}`.")
+            f"Declared exclusions: `{shown_exclusions}`.\n\nReview depth: `{review_depth()}`.")
+
+
+def result_findings(data):
+    """Preserve PR-Agent's review fields for consumers without parsing rendered HTML.
+
+    Source: the pinned pr_reviewer_prompts.toml Review/KeyIssues schema. Its
+    security_concerns contract specifies the exact English literal 'No'.
+    """
+    result = data.get("review") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        raise ReviewAbort("Review result has no structured review")
+    issues = result.get("key_issues_to_review")
+    concerns = result.get("security_concerns")
+    if not isinstance(issues, list) or not isinstance(concerns, str) or not concerns.strip():
+        raise ReviewAbort("Review result has incomplete structured findings")
+    findings = []
+    for issue in issues:
+        if (not isinstance(issue, dict)
+                or any(not isinstance(issue.get(key), str) or not issue[key].strip()
+                       for key in ("relevant_file", "issue_header", "issue_content"))
+                or type(issue.get("start_line")) is not int or issue["start_line"] < 1
+                or type(issue.get("end_line")) is not int or issue["end_line"] < issue["start_line"]):
+            raise ReviewAbort("Review result has invalid structured findings")
+        findings.append({"path": issue["relevant_file"], "line": issue["start_line"],
+                         "end_line": issue["end_line"], "title": issue["issue_header"],
+                         "body": issue["issue_content"]})
+    if concerns != "No":
+        findings.append({"path": "unknown", "line": None, "end_line": None,
+                         "title": "Security concerns", "body": concerns})
+    return findings
 
 
 async def review(settings):
@@ -334,6 +381,7 @@ async def review(settings):
             data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
             if not self._validate_review_schema(data):
                 raise ReviewAbort("Provider returned an invalid review schema")
+            self.result_findings = result_findings(data)
             result = super()._prepare_pr_review()
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
@@ -390,6 +438,10 @@ async def review(settings):
             or not isinstance(summary.body, str)):
         raise ReviewAbort("Review summary identity could not be verified")
     digest = hashlib.sha256(summary.body.encode()).hexdigest()
+    evidence = {"repository": repo, "number": int(number), "base": base, "head": head,
+                "depth": review_depth(), "key": key, "summary": summary.id, "digest": digest,
+                "findings": reviewer.result_findings}
+    manifest = base64.b64encode(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).decode()
     usage = router.usage if router.usage_observed else None
     runtime_seconds = int(time.monotonic() - started)
     # Only this post-publication transition permits identical-snapshot reuse.
@@ -399,7 +451,8 @@ async def review(settings):
                 f"Successful calls: {router.calls}; billing rejections: {router.rejections}; "
                 f"runtime: {runtime_seconds} seconds.\n\n"
                 f"Reported token usage: `{json.dumps(usage, sort_keys=True)}`.\n\n"
-                f"[Review summary]({summary.html_url}) · [Actions run]({run_url}).")
+                f"[Review summary]({summary.html_url}) · [Actions run]({run_url}).\n\n"
+                f"<!-- agent-review-result:v1 {manifest} -->")
     print(json.dumps({"models": router.models_used, "successful_calls": router.calls,
                       "billing_rejections": router.rejections, "reported_tokens": usage,
                       "runtime_seconds": runtime_seconds}, sort_keys=True))

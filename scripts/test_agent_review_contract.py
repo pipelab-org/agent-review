@@ -119,7 +119,7 @@ class CallerTests(unittest.TestCase):
                          remote.replace("github.run_attempt == '1' &&", ''),
                          remote.replace("github.event.comment.author_association == 'MEMBER' &&", ''),
                          remote.replace("github.event.comment.user.type == 'User' &&", ''),
-                         remote.replace("'/agent-review'", "'/agent-review deep'"),
+                         remote.replace('["/review","/review deep"]', '["/review","/review deep","/other"]'),
                          remote.replace('types: [created]', 'types: [created, edited]'),
                          remote.replace('pull-requests: write', 'pull-requests: read'),
                          remote.replace('    secrets:\n', '    secrets: inherit\n    ignored:\n'),
@@ -345,7 +345,7 @@ class ReporterTests(unittest.TestCase):
         self.event_path = Path(self.temp.name).resolve() / 'event.json'
         self.event = {'action': 'created', 'repository': {'full_name': 'example/project'},
                       'issue': {'number': 1, 'pull_request': {'url': 'untrusted'}},
-                      'comment': {'body': '/agent-review', 'author_association': 'MEMBER',
+                      'comment': {'body': '/review', 'author_association': 'MEMBER',
                                   'user': {'login': 'luckyPipewrench', 'id': 142104046, 'type': 'User'}}}
         self.env = {'GITHUB_EVENT_PATH': str(self.event_path), 'GITHUB_EVENT_NAME': 'issue_comment',
                     'GITHUB_REPOSITORY': 'example/project', 'GITHUB_ACTOR': 'luckyPipewrench',
@@ -418,7 +418,7 @@ class ReporterTests(unittest.TestCase):
             if change == 'identity':
                 self.event['comment']['user']['id'] = 123
             elif change == 'command':
-                self.event['comment']['body'] += ' deep'
+                self.event['comment']['body'] = '/review deep extra'
             elif change == 'edited':
                 self.event['action'] = 'edited'
             elif change == 'issue':

@@ -26,7 +26,7 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      github.event.comment.body == '/agent-review'
+      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)
     # Local nested calls load from this workflow's own immutable revision.
     # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_iduses
     permissions: {}
@@ -47,7 +47,7 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      github.event.comment.body == '/agent-review'
+      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -62,8 +62,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
+          REVIEW_COMMAND: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
+          # GitHub expression string comparisons ignore case. Shell admission
+          # enforces the exact two commands before any provider work.
+          case "$REVIEW_COMMAND" in
+            /review|'/review deep') ;;
+            *) exit 0 ;;
+          esac
           pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
           if ! jq -e --arg repo "$GITHUB_REPOSITORY" '
             .state == "open" and .head.repo.fork == false and
@@ -140,6 +147,8 @@ jobs:
           REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
           REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
           REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
+          # Select a fixed value after exact-command admission; never interpolate command arguments.
+          REVIEW_DEPTH: ${{ github.event.comment.body == '/review deep' && 'deep' || 'default' }}
           REVIEW_HEAD: ${{ needs.admit.outputs.head }}
           REVIEW_BASE: ${{ needs.admit.outputs.base }}
           LITELLM_LOCAL_MODEL_COST_MAP: 'True'
@@ -162,7 +171,7 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      github.event.comment.body == '/agent-review'
+      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)
       && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
           needs.review.result == 'failure' || needs.review.result == 'cancelled')
@@ -177,6 +186,8 @@ jobs:
       - name: Publish fixed incomplete status for the original eligible request
         env:
           GH_TOKEN: ${{ github.token }}
+          # Select a fixed value after exact-command admission; never interpolate command arguments.
+          REVIEW_DEPTH: ${{ github.event.comment.body == '/review deep' && 'deep' || 'default' }}
           REVIEW_HEAD: ${{ needs.admit.outputs.head }}
           REVIEW_BASE: ${{ needs.admit.outputs.base }}
           ADMISSION_RESULT: ${{ needs.admit.result }}
@@ -202,7 +213,7 @@ jobs:
                       and os.environ["GITHUB_RUN_ATTEMPT"] == "1"
                       and user.get("login") == "luckyPipewrench" and user.get("id") == 142104046
                       and user.get("type") == "User" and comment.get("author_association") == "MEMBER"
-                      and comment.get("body") == "/agent-review" and issue.get("pull_request")):
+                      and comment.get("body") in ("/review", "/review deep") and issue.get("pull_request")):
                   return
               repo, number, run_id = os.environ["GITHUB_REPOSITORY"], issue.get("number"), os.environ["GITHUB_RUN_ID"]
               if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)

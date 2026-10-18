@@ -41,7 +41,7 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      github.event.comment.body == '/agent-review'
+      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)
     permissions:
       contents: read
       issues: write
