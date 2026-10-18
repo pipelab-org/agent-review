@@ -1,12 +1,12 @@
 # agent-review
 
-A maintainer-gated pull request review command for GitHub Actions. A maintainer comments `/agent-review` on a pull request, and a reusable workflow reviews the static diff with a language model, posts findings as resolvable inline threads, and keeps a persistent summary plus a completion record naming the exact commits, reviewer source, profile, models, and token usage.
+A maintainer-gated pull request review command for GitHub Actions. A maintainer comments `/review` on a pull request, and a reusable workflow reviews the static diff with a language model, posts findings as resolvable inline threads, and keeps a persistent summary plus a completion record naming the exact commits, reviewer source, profile, models, and token usage.
 
 Runs [PR-Agent](https://github.com/The-PR-Agent/pr-agent) (MIT) from its published container image.
 
 ## What it does
 
-Only one designated maintainer's original, unedited `/agent-review` comment on an open, same-repository pull request admits provider work. Fork pull requests, closed pull requests, edited comments, arguments, workflow re-runs, bots, and other accounts never reach the model. The command runs from the default branch, so a pull request can't change the workflow that reviews it.
+Only one designated maintainer's original, unedited `/review` comment on an open, same-repository pull request admits provider work. Fork pull requests, closed pull requests, edited comments, unsupported arguments, workflow re-runs, bots, and other accounts never reach the model. `/review deep` uses high reasoning effort and adds checks for callers, failure paths, malformed input, stale state, concurrency, and rollback. Normal and deep completions have separate identities. The command runs from the default branch, so a pull request can't change the workflow that reviews it.
 
 The review engine loads from this repository at a full commit SHA, and a credential-free helper checks that GitHub actually loaded that revision before anything else runs. The calling repository's profile and caller are read as bounded data from the caller's default-branch revision, never from the pull request head, and only Python from this repository executes. The model gets no tools, no environment access, and no authority over credentials or where results are published.
 
@@ -19,7 +19,7 @@ Findings are advice and can be wrong. A completed run doesn't establish review q
 1. Add `.github/workflows/agent-review.yaml`. It must match the maintained caller template exactly, with `uses:` pointing at `pipelab-org/agent-review/.github/workflows/agent-review-reusable.yaml` at a full 40-character merged commit SHA followed by ` # main`. [examples/pipelock/agent-review.yaml](examples/pipelock/agent-review.yaml) is a complete caller; replace the SHA placeholder. Never use a branch or tag reference.
 2. Add `.github/agent-review.toml` with exactly two sections: `[review] instructions` for repository-specific review guidance, and `[ignore] glob` for paths to exclude. Anything else is rejected before inference. [examples/pipelock/agent-review.toml](examples/pipelock/agent-review.toml) is a working profile.
 3. Add at least one provider key as a repository or organization secret: `ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY_2` (used only after the first is rejected for billing), or `OPENAI_API_KEY`. Don't use `secrets: inherit`, environment secrets, or a personal access token. GitHub operations use the caller's own `github.token`.
-4. Merge both files to the default branch, then comment `/agent-review` on a pull request.
+4. Merge both files to the default branch, then comment `/review` on a pull request.
 
 The caller template fixes who can trigger a review: one maintainer account, matched by login and numeric ID, commenting as an organization member. Changing that identity is a change to this repository's validator and reusable workflow, not to a caller.
 

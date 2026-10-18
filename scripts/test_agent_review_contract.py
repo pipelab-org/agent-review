@@ -3,6 +3,7 @@
 
 """Shared caller/profile data contract and host-only failure reporting."""
 
+import base64
 import copy
 import hashlib
 import io
@@ -119,7 +120,7 @@ class CallerTests(unittest.TestCase):
                          remote.replace("github.run_attempt == '1' &&", ''),
                          remote.replace("github.event.comment.author_association == 'MEMBER' &&", ''),
                          remote.replace("github.event.comment.user.type == 'User' &&", ''),
-                         remote.replace("'/agent-review'", "'/agent-review deep'"),
+                         remote.replace('["/review","/review deep"]', '["/review","/review deep","/other"]'),
                          remote.replace('types: [created]', 'types: [created, edited]'),
                          remote.replace('pull-requests: write', 'pull-requests: read'),
                          remote.replace('    secrets:\n', '    secrets: inherit\n    ignored:\n'),
@@ -287,29 +288,91 @@ class LocalCallerTests(unittest.TestCase):
 
 
 class ReuseTests(unittest.TestCase):
+    def bound(self, key, findings, head='a' * 40):
+        evidence = {"repository": "example/project", "number": 1, "base": "b" * 40, "head": head,
+                    "depth": "default", "key": key, "summary": 7, "findings": findings}
+        manifest = adapter.result_manifest(evidence)
+        line = adapter.result_comment(manifest)
+        summary_body = "Complete review\n" + line
+        digest = hashlib.sha256(summary_body.encode()).hexdigest()
+        status_body = (f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\n'
+                       f'Complete\n{line}')
+        summary = NS(id=7, body=summary_body, user=NS(login='github-actions[bot]', type='Bot'))
+        status = NS(id=8, user=NS(login='github-actions[bot]', type='Bot'), body=status_body, html_url='summary')
+        return summary, status
+
     def test_only_bot_owned_terminal_success_is_reusable(self):
         key = 'a' * 64
-        summary = NS(id=7, body='Complete review', user=NS(login='github-actions[bot]', type='Bot'))
-        digest = hashlib.sha256(summary.body.encode()).hexdigest()
-        good = NS(id=8, user=NS(login='github-actions[bot]', type='Bot'),
-                  body=f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\nComplete',
-                  html_url='summary')
-        self.assertIs(good, adapter.completed_review([good, summary], key))
+        finding = {"path": "src/file.py", "line": 1, "end_line": 1, "title": "Bug", "body": "real"}
+        summary, good = self.bound(key, [finding])
+        identity = ("example/project", 1, "a" * 40, "b" * 40, "default")
+        self.assertIs(good, adapter.completed_review([good, summary], key, *identity))
+        bare = copy.deepcopy(good)
+        bare.body = bare.body.split("\n", 1)[0] + "\nComplete"
+        summary_bare = copy.deepcopy(summary)
+        summary_bare.body = "Complete review"
+        digest = hashlib.sha256(summary_bare.body.encode()).hexdigest()
+        bare.body = f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\nComplete'
+        self.assertIsNone(adapter.completed_review([bare, summary_bare], key, *identity))
+        swapped = copy.deepcopy(good)
+        other = adapter.result_comment(adapter.result_manifest(
+            {"repository": "example/project", "number": 1, "base": "b" * 40, "head": "a" * 40,
+             "depth": "default", "key": key, "summary": 7, "findings": []}))
+        swapped.body = swapped.body.replace(adapter.result_comment(adapter.result_manifest(
+            {"repository": "example/project", "number": 1, "base": "b" * 40, "head": "a" * 40,
+             "depth": "default", "key": key, "summary": 7, "findings": [finding]})), other)
+        self.assertIsNone(adapter.completed_review([swapped, summary], key, *identity))
         for field, value in [('login', 'contributor'), ('type', 'User')]:
             bad = copy.deepcopy(good)
             setattr(bad.user, field, value)
-            self.assertIsNone(adapter.completed_review([bad, summary], key))
-        self.assertIsNone(adapter.completed_review([good], key))
+            self.assertIsNone(adapter.completed_review([bad, summary], key, *identity))
+        self.assertIsNone(adapter.completed_review([good], key, *identity))
         for body in [good.body.replace('success', 'running'), good.body.replace('success', 'failed'),
                      good.body.replace(key, 'b' * 64), 'quoted\n' + good.body]:
             bad = copy.deepcopy(good)
             bad.body = body
-            self.assertIsNone(adapter.completed_review([bad, summary], key))
+            self.assertIsNone(adapter.completed_review([bad, summary], key, *identity))
         summary.body = 'A later review replaced this summary'
-        self.assertIsNone(adapter.completed_review([good, summary], key))
+        self.assertIsNone(adapter.completed_review([good, summary], key, *identity))
         summary.body = 'Complete review'
         summary.user = None
-        self.assertIsNone(adapter.completed_review([good, summary], key))
+        self.assertIsNone(adapter.completed_review([good, summary], key, *identity))
+
+    def test_non_integer_identifiers_do_not_suppress_rerun(self):
+        key = 'c' * 64
+        identity = ("example/project", 1, "a" * 40, "b" * 40, "default")
+        good_summary, good = self.bound(key, [])
+        self.assertIs(good, adapter.completed_review([good, good_summary], key, *identity))
+
+        def record(number, summary_value, comment_id):
+            evidence = {"repository": "example/project", "number": number, "base": "b" * 40,
+                        "head": "a" * 40, "depth": "default", "key": key,
+                        "summary": summary_value, "findings": []}
+            manifest = adapter.result_manifest(evidence)
+            line = adapter.result_comment(manifest)
+            body = "Complete review\n" + line
+            digest = hashlib.sha256(body.encode()).hexdigest()
+            summary = NS(id=comment_id, body=body, user=NS(login='github-actions[bot]', type='Bot'))
+            status = NS(id=9, body=(
+                f'<!-- agent-review-status:v1 state=success key={key} summary={comment_id} '
+                f'digest={digest} -->\nComplete\n{line}'),
+                user=NS(login='github-actions[bot]', type='Bot'))
+            return summary, status, manifest
+
+        summary, status, manifest = record(True, 7, 7)
+        self.assertIn('"number":true', base64.b64decode(manifest).decode())
+        self.assertIsNone(adapter.parse_result(summary.body))
+        self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
+        summary, status, manifest = record(1, True, 1)
+        self.assertIn('"summary":true', base64.b64decode(manifest).decode())
+        self.assertIsNone(adapter.parse_result(summary.body))
+        self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
+        for number, summary_value, comment_id in (
+                (1.0, 7, 7), (1, 1.0, 1), ("1", 7, 7), (1, "7", 7),
+                (0, 7, 7), (1, 0, 7), (-1, 7, 7), (False, 7, 7)):
+            summary, status, _manifest = record(number, summary_value, comment_id)
+            self.assertIsNone(adapter.parse_result(summary.body))
+            self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
 
     def test_profile_exclusions_remain_literal_in_provenance(self):
         text = adapter.provenance('a' * 40, 'b' * 40, 'c' * 64, ['**/`[name](example)/**'])
@@ -345,7 +408,7 @@ class ReporterTests(unittest.TestCase):
         self.event_path = Path(self.temp.name).resolve() / 'event.json'
         self.event = {'action': 'created', 'repository': {'full_name': 'example/project'},
                       'issue': {'number': 1, 'pull_request': {'url': 'untrusted'}},
-                      'comment': {'body': '/agent-review', 'author_association': 'MEMBER',
+                      'comment': {'body': '/review', 'author_association': 'MEMBER',
                                   'user': {'login': 'luckyPipewrench', 'id': 142104046, 'type': 'User'}}}
         self.env = {'GITHUB_EVENT_PATH': str(self.event_path), 'GITHUB_EVENT_NAME': 'issue_comment',
                     'GITHUB_REPOSITORY': 'example/project', 'GITHUB_ACTOR': 'luckyPipewrench',
@@ -418,7 +481,7 @@ class ReporterTests(unittest.TestCase):
             if change == 'identity':
                 self.event['comment']['user']['id'] = 123
             elif change == 'command':
-                self.event['comment']['body'] += ' deep'
+                self.event['comment']['body'] = '/review deep extra'
             elif change == 'edited':
                 self.event['action'] = 'edited'
             elif change == 'issue':

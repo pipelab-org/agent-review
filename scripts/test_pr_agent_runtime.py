@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import hashlib
 import importlib.util
 import os
@@ -39,6 +40,11 @@ class RuntimeTests(unittest.TestCase):
         self.provider.get_commit_messages.return_value = "Untrusted commit"
         summary = NS(id=8, body='Published fixture summary', html_url='https://github.com/example/project/pull/1#issuecomment-8',
                      user=NS(login='github-actions[bot]', type='Bot'))
+
+        def edit(body, comment=summary):
+            comment.body = body
+
+        summary.edit = edit
         self.provider.publish_persistent_comment.return_value = summary
         self.summary_publish = self.provider.publish_persistent_comment
         self.provider.get_issue_comments.return_value = []
@@ -61,7 +67,7 @@ class RuntimeTests(unittest.TestCase):
             "ANTHROPIC_API_KEY": "", "ANTHROPIC_API_KEY_2": "", "OPENAI_API_KEY": "fixture-openai",
         }
         self.output = """review:
-  security_concerns: 'None'
+  security_concerns: 'No'
   relevant_tests: 'No'
   key_issues_to_review:
     - relevant_file: src/file.py
@@ -115,6 +121,21 @@ class RuntimeTests(unittest.TestCase):
         self.provider.publish_persistent_comment.assert_called_once()
         self.provider.publish_comment.assert_not_called()
         self.assertIn(self.head, self.provider.publish_persistent_comment.call_args.args[0])
+        status = self.status.edit.call_args.args[0]
+        encoded = status.split("<!-- agent-review-result:v1 ", 1)[1].split(" -->", 1)[0]
+        evidence = json.loads(base64.b64decode(encoded, validate=True))
+        self.assertEqual(self.head, evidence["head"])
+        self.assertEqual(self.base, evidence["base"])
+        self.assertEqual(self.repo, evidence["repository"])
+        self.assertEqual("default", evidence["depth"])
+        self.assertEqual("src/file.py", evidence["findings"][0]["path"])
+        self.assertEqual(1, evidence["findings"][0]["line"])
+        self.assertEqual("Correctness", evidence["findings"][0]["title"])
+        self.assertNotIn("digest", evidence)
+        summary_body = self.provider.publish_persistent_comment.return_value.body
+        self.assertIn(encoded, summary_body)
+        self.assertEqual(hashlib.sha256(summary_body.encode()).hexdigest(),
+                         status.split("digest=", 1)[1].split(" ", 1)[0])
         self.provider.github_client.get_repo.assert_called_with(self.repo)
         self.provider.github_client.get_repo.return_value.get_pull.assert_called_with(1)
 
@@ -134,6 +155,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual({"effort": "medium"}, kwargs["output_config"])
         self.assertEqual(16000, kwargs["max_tokens"])
         self.assertNotIn("temperature", kwargs)
+
+    def test_deep_review_reaches_provider_and_has_separate_completion_identity(self):
+        with patch.dict(os.environ, self.env):
+            ordinary = review.review_binding(self.settings, self.repo, "1", self.head, self.base)[0]
+        self.env["REVIEW_DEPTH"] = "deep"
+        with patch.dict(os.environ, self.env):
+            self.settings, _ = review.configure()
+            deep = review.review_binding(self.settings, self.repo, "1", self.head, self.base)[0]
+        self.assertNotEqual(ordinary, deep)
+        kwargs = self.anthropic_request("anthropic/claude-sonnet-5-5")
+        self.assertEqual({"effort": "high"}, kwargs["output_config"])
+        self.assertIn("malformed inputs", str(kwargs["messages"]))
+        summary = self.provider.publish_persistent_comment.call_args.args[0]
+        self.assertIn("Review depth: `deep`", summary)
+
+    def test_prompt_example_block_scalars_keep_publishable_locations(self):
+        from pr_agent.tools.pr_reviewer import PRReviewer
+
+        sample = """review:
+  relevant_tests: |
+    No
+  key_issues_to_review:
+    - relevant_file: |
+        src/file.py
+      issue_header: |
+        Possible Bug
+      issue_content: |
+        The caller receives the wrong value.
+      start_line: 12
+      end_line: 14
+  security_concerns: |
+    No
+"""
+        findings = review.result_findings(PRReviewer._load_review_yaml(sample))
+        self.assertEqual([{
+            "path": "src/file.py", "line": 12, "end_line": 14,
+            "title": "Possible Bug", "body": "The caller receives the wrong value.",
+        }], findings)
+
+    def test_unknown_depth_never_admits_inference(self):
+        with patch.dict(os.environ, REVIEW_DEPTH="deep extra"), self.assertRaises(review.ReviewAbort):
+            review.configure()
 
     def test_pinned_handler_haiku_omits_temperature(self):
         kwargs = self.anthropic_request("anthropic/claude-haiku-5-5")
@@ -266,9 +329,13 @@ class RuntimeTests(unittest.TestCase):
         with patch.dict(os.environ, self.env):
             key = review.review_binding(self.settings, self.repo, "1", self.head, self.base)[0]
         summary = self.summary_publish.return_value
+        evidence = {"repository": self.repo, "number": 1, "base": self.base, "head": self.head,
+                    "depth": "default", "key": key, "summary": summary.id, "findings": []}
+        line = review.result_comment(review.result_manifest(evidence))
+        summary.body += "\n" + line
         digest = hashlib.sha256(summary.body.encode()).hexdigest()
         record = NS(id=9, user=summary.user, html_url="https://github.com/example/project/pull/1#issuecomment-9",
-                    body=f"<!-- agent-review-status:v1 state=success key={key} summary=8 digest={digest} -->\nDone")
+                    body=f"<!-- agent-review-status:v1 state=success key={key} summary=8 digest={digest} -->\nDone\n{line}")
         self.provider.get_issue_comments.return_value = [record, summary]
         completion = AsyncMock(return_value=self.response())
         self.run_adapter(completion)
@@ -405,7 +472,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual({self.head, self.base}, set(content_refs))
         self.assertIn(("GET", f"{pr_url}/files"), [(m, u) for m, u, _ in requests])
         self.assertEqual(4, sum(m == "POST" and u == f"{root}/issues/1/comments" for m, u, _ in requests))
-        self.assertEqual(3, sum(m == "PATCH" for m, _, _ in requests))
+        # Two completed runs patch the status comment and append the result to the summary.
+        self.assertEqual(5, sum(m == "PATCH" for m, _, _ in requests))
         inline = [data for method, url, data in requests if method == "POST" and url == f"{pr_url}/reviews"]
         self.assertTrue(inline)
         self.assertEqual(self.head, inline[0]["commit_id"])

@@ -32,6 +32,11 @@ OPENAI = "gpt-6-luna"
 
 def admitted(gate, event):
     for term in gate.split("&&"):
+        commands = re.fullmatch(r"\s*contains\(fromJSON\('([^']+)'\), github.event.comment.body\)\s*", term)
+        if commands:
+            if str(event.get("github.event.comment.body")).casefold() not in [value.casefold() for value in json.loads(commands[1])]:
+                return False
+            continue
         match = re.fullmatch(r"\s*(github\.[\w.]+)(?:\s*==\s*(?:'([^']*)'|(\d+)))?\s*", term)
         if not match:
             raise AssertionError("Unexpected admission expression")
@@ -67,11 +72,12 @@ class WorkflowTests(unittest.TestCase):
             "github.event.comment.user.type": "User",
             "github.event.comment.author_association": "MEMBER",
             "github.event.issue.pull_request": {"url": "https://api.github.com/repos/example/project/pulls/1"},
-            "github.event.comment.body": "/agent-review",
+            "github.event.comment.body": "/review",
         }
 
     def test_gate_accepts_only_exact_identity_and_command(self):
         self.assertTrue(admitted(self.gate, self.event))
+        self.assertTrue(admitted(self.gate, dict(self.event, **{"github.event.comment.body": "/review deep"})))
         attacks = {
             "github.event_name": "workflow_dispatch", "github.event.action": "edited",
             "github.actor": "contributor", "github.actor_id": "123",
@@ -86,7 +92,7 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(key=key):
                 event = dict(self.event, **{key: value})
                 self.assertFalse(admitted(self.gate, event))
-        for body in ("/review", "/review deep", "/agent-review deep", "/agent-review\n", " /agent-review", "/agent-review --config.model=other"):
+        for body in ("/agent-review", "/agent-review deep", "/review\n", " /review", "/review --config.model=other", "/review deep\n", "/review  deep", "/review deep extra"):
             with self.subTest(body=body):
                 self.assertFalse(admitted(self.gate, dict(self.event, **{"github.event.comment.body": body})))
 
@@ -95,6 +101,34 @@ class WorkflowTests(unittest.TestCase):
         broken = self.gate.replace("github.event.comment.user.id == 142104046 &&", "")
         self.assertFalse(admitted(self.gate, event))
         self.assertTrue(admitted(broken, event))
+
+    def test_structured_findings_preserve_security_concerns_and_reject_malformed_locations(self):
+        clean = {"review": {"key_issues_to_review": [], "security_concerns": "No"}}
+        self.assertEqual([], review.result_findings(clean))
+        for concern in ("Potential secret exposure", "None", "no"):
+            record = copy.deepcopy(clean)
+            record["review"]["security_concerns"] = concern
+            self.assertEqual(concern, review.result_findings(record)[0]["body"])
+        good = {"relevant_file": "src/file.py", "issue_header": "Incorrect result",
+                "issue_content": "The caller receives the wrong value.", "start_line": 1, "end_line": 2}
+        block = dict(good, relevant_file="src/file.py\n", issue_header="Possible Bug\n",
+                     issue_content="The caller receives the wrong value.\n", start_line=12, end_line=14)
+        record = copy.deepcopy(clean)
+        record["review"]["key_issues_to_review"] = [block]
+        record["review"]["security_concerns"] = "No\n"
+        self.assertEqual([{"path": "src/file.py", "line": 12, "end_line": 14, "title": "Possible Bug",
+                           "body": "The caller receives the wrong value."}], review.result_findings(record))
+        for field, value in (("start_line", True), ("start_line", 0), ("start_line", "1"),
+                             ("end_line", 0), ("relevant_file", ""), ("relevant_file", "\n"),
+                             ("issue_header", " \n"), ("issue_content", None)):
+            issue = dict(good, **{field: value})
+            record = copy.deepcopy(clean)
+            record["review"]["key_issues_to_review"] = [issue]
+            with self.subTest(field=field, value=value), self.assertRaises(review.ReviewAbort):
+                review.result_findings(record)
+        for record in ({}, {"review": {}}, {"review": {"key_issues_to_review": []}}):
+            with self.assertRaises(review.ReviewAbort):
+                review.result_findings(record)
 
     def test_created_comments_only_and_secret_isolation(self):
         caller = yaml.load((ROOT / ".github/workflows/agent-review.yaml").read_text(), Loader=yaml.BaseLoader)
@@ -124,7 +158,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("false", checkout["with"]["persist-credentials"])
         self.assertNotIn("secrets.", json.dumps(checkout))
         self.assertEqual("python trusted-agent-review/scripts/pr_agent_review.py", run["run"])
-        self.assertNotIn("comment.body", json.dumps(run))
+        self.assertEqual("${{ github.event.comment.body == '/review deep' && 'deep' || 'default' }}", run["env"]["REVIEW_DEPTH"])
+        self.assertNotIn("comment.body", run["run"])
 
     def test_container_keeps_hardening_and_uses_hosted_runner_uid(self):
         job = WORKFLOW["jobs"]["review"]
@@ -161,7 +196,7 @@ class WorkflowTests(unittest.TestCase):
             gh.chmod(0o700)
             fixture, output = root / "pr.json", root / "output"
             env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", PR_FIXTURE=str(fixture),
-                       GITHUB_REPOSITORY="example/project", PR_NUMBER="1", GITHUB_OUTPUT=str(output))
+                       GITHUB_REPOSITORY="example/project", PR_NUMBER="1", GITHUB_OUTPUT=str(output), REVIEW_COMMAND="/review")
             for data, expected, succeeds in cases:
                 with self.subTest(pr=data):
                     fixture.write_text(json.dumps(data))
@@ -177,6 +212,12 @@ class WorkflowTests(unittest.TestCase):
                                     capture_output=True, text=True, timeout=10, check=False)
             self.assertNotEqual(0, result.returncode)
             self.assertEqual("", output.read_text())
+            for command in ("/review deep", "/REVIEW", "/REVIEW DEEP", "/agent-review", "/review deep extra", "/review\n"):
+                output.write_text("")
+                result = subprocess.run(["bash", "-c", script], env=dict(env, REVIEW_COMMAND=command),
+                                        capture_output=True, text=True, timeout=10, check=False)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(command == "/review deep", "admitted=true" in output.read_text())
 
     @unittest.skipUnless(shutil.which("jq"), "jq required to exercise the workflow's actual fork predicate")
     def test_actual_jq_fork_predicate(self):

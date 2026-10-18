@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -166,6 +167,13 @@ class CompletionChain:
         raise ReviewAbort("Configured provider credits exhausted")
 
 
+def review_depth():
+    depth = os.environ.get("REVIEW_DEPTH", "default")
+    if depth not in ("default", "deep"):
+        raise ReviewAbort("Invalid review depth")
+    return depth
+
+
 def configure():
     profile, _ = load_profile(Path(os.environ.get("REVIEW_PROFILE_PATH", PROFILE)))
     # Set before importing LiteLLM: its default import can fetch mutable metadata.
@@ -185,6 +193,14 @@ def configure():
             settings.set(f"{section}.{key}", value)
     settings.set("pr_reviewer.extra_instructions",
                  data["pr_reviewer"]["extra_instructions"].rstrip() + "\n\n" + profile["review"]["instructions"])
+    depth = review_depth()
+    if depth == "deep":
+        settings.set("config.reasoning_effort", "high")
+        settings.set("pr_reviewer.extra_instructions",
+                     settings.pr_reviewer.extra_instructions +
+                     "\nTrace changed behavior through callers and failure paths. "
+                     "Check malformed inputs, stale state, concurrency, and rollback. "
+                     "Prioritize concrete security and correctness defects over breadth.")
     settings.set("ignore.glob", profile["ignore"]["glob"])
     # Provider registration supplies routing metadata only. The operator's token
     # ceiling above controls budgeting; it is not the model's advertised context.
@@ -217,6 +233,7 @@ def print_settings(settings, litellm):
 
 
 STATUS_MARKER = "agent-review-status:v1"
+RESULT_MARKER = "agent-review-result:v1"
 
 
 def bot_owned(comment):
@@ -225,17 +242,78 @@ def bot_owned(comment):
             and getattr(user, "type", None) == "Bot")
 
 
-def completed_review(comments, key):
-    """Reuse only a bot's terminal record whose published summary is still intact."""
+def result_manifest(evidence):
+    """Encode findings without a digest field. The digest covers the comment that contains this."""
+    raw = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    return base64.b64encode(raw).decode()
+
+
+def result_comment(manifest):
+    return f"<!-- {RESULT_MARKER} {manifest} -->"
+
+
+def stored_findings_ok(findings):
+    if not isinstance(findings, list):
+        return False
+    for item in findings:
+        if not isinstance(item, dict):
+            return False
+        title, body = item.get("title"), item.get("body")
+        if not isinstance(title, str) or not title.strip() or not isinstance(body, str) or not body.strip():
+            return False
+        if item.get("path") == "unknown" and item.get("line") is None and item.get("end_line") is None:
+            continue
+        path, line, end = item.get("path"), item.get("line"), item.get("end_line")
+        if (not isinstance(path, str) or not path.strip() or path == "unknown"
+                or type(line) is not int or line < 1 or type(end) is not int or end < line):
+            return False
+    return True
+
+
+def exact_positive_int(value):
+    # bool is an int subclass, and JSON true must not compare equal to pull request 1.
+    return type(value) is int and value > 0
+
+
+def parse_result(body):
+    """Use the last marker. Model text can precede the marker the publisher appends."""
+    matches = list(re.finditer(rf"<!-- {RESULT_MARKER} ([A-Za-z0-9+/=]+) -->", body))
+    if not matches:
+        return None
+    token = matches[-1].group(1)
+    try:
+        data = json.loads(base64.b64decode(token, validate=True))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if (not isinstance(data, dict) or not exact_positive_int(data.get("number"))
+            or not exact_positive_int(data.get("summary"))
+            or not stored_findings_ok(data.get("findings"))):
+        return None
+    return token, data
+
+
+def completed_review(comments, key, repository, number, head, base, depth):
+    """Reuse only a bot success record whose summary digest covers the same findings."""
     comments = list(comments)
     summaries = {c.id: c for c in comments if bot_owned(c) and isinstance(c.body, str)}
     pattern = rf"<!-- {STATUS_MARKER} state=success key={key} summary=([1-9][0-9]*) digest=([0-9a-f]{{64}}) -->"
     for comment in summaries.values():
         match = re.fullmatch(pattern, comment.body.split("\n", 1)[0])
-        if match:
-            summary = summaries.get(int(match[1]))
-            if summary is not None and hashlib.sha256(summary.body.encode()).hexdigest() == match[2]:
-                return comment
+        if not match:
+            continue
+        summary = summaries.get(int(match[1]))
+        if summary is None or hashlib.sha256(summary.body.encode()).hexdigest() != match[2]:
+            continue
+        published = parse_result(summary.body)
+        recorded = parse_result(comment.body)
+        if published is None or recorded is None or published[0] != recorded[0]:
+            continue
+        data = published[1]
+        if (data.get("key") != key or data.get("summary") != int(match[1])
+                or data.get("repository") != repository or data.get("number") != int(number)
+                or data.get("head") != head or data.get("base") != base or data.get("depth") != depth):
+            continue
+        return comment
     return None
 
 
@@ -247,7 +325,8 @@ def review_binding(settings, repo, number, head, base):
     models = [settings.config.model, *settings.config.fallback_models]
     binding = {"repository": repo, "number": number, "head": head, "base": base,
                "reviewer": source, "profile_hash": profile_hash, "models": models,
-               "common_config": hashlib.sha256(CONFIG.read_bytes()).hexdigest()}
+               "common_config": hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
+               "depth": review_depth()}
     key = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
     return key, source, profile_sha, profile_hash, profile["ignore"]["glob"]
 
@@ -257,7 +336,43 @@ def provenance(source, profile_sha, profile_hash, exclusions):
     shown_exclusions = json.dumps(exclusions, ensure_ascii=True).replace("`", "\\u0060")
     return (f"Reviewer source `{source}`; caller profile `{profile_sha}` "
             f"(SHA-256 `{profile_hash}`).\n\n"
-            f"Declared exclusions: `{shown_exclusions}`.")
+            f"Declared exclusions: `{shown_exclusions}`.\n\nReview depth: `{review_depth()}`.")
+
+
+def result_findings(data):
+    """Preserve PR-Agent's review fields for consumers without parsing rendered HTML.
+
+    Source: the pinned pr_reviewer_prompts.toml Review/KeyIssues schema. Its
+    security_concerns contract specifies the exact English literal 'No'.
+    """
+    result = data.get("review") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        raise ReviewAbort("Review result has no structured review")
+    issues = result.get("key_issues_to_review")
+    concerns = result.get("security_concerns")
+    if not isinstance(issues, list) or not isinstance(concerns, str) or not concerns.strip():
+        raise ReviewAbort("Review result has incomplete structured findings")
+    findings = []
+    for issue in issues:
+        # The pinned prompt's example uses literal block scalars. PyYAML keeps
+        # the trailing newline, and the publisher strips it before anchoring.
+        text = {}
+        for key in ("relevant_file", "issue_header", "issue_content"):
+            value = issue.get(key) if isinstance(issue, dict) else None
+            text[key] = value.strip() if isinstance(value, str) else ""
+        if (not isinstance(issue, dict) or any(not text[key] for key in text)
+                or type(issue.get("start_line")) is not int or issue["start_line"] < 1
+                or type(issue.get("end_line")) is not int or issue["end_line"] < issue["start_line"]):
+            raise ReviewAbort("Review result has invalid structured findings")
+        findings.append({"path": text["relevant_file"], "line": issue["start_line"],
+                         "end_line": issue["end_line"], "title": text["issue_header"],
+                         "body": text["issue_content"]})
+    # Exact 'No' after the same strip. 'no' and 'None' stay findings.
+    concern = concerns.strip()
+    if concern != "No":
+        findings.append({"path": "unknown", "line": None, "end_line": None,
+                         "title": "Security concerns", "body": concern})
+    return findings
 
 
 async def review(settings):
@@ -334,6 +449,7 @@ async def review(settings):
             data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
             if not self._validate_review_schema(data):
                 raise ReviewAbort("Provider returned an invalid review schema")
+            self.result_findings = result_findings(data)
             result = super()._prepare_pr_review()
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
@@ -341,7 +457,8 @@ async def review(settings):
 
     reviewer = Reviewer(f"https://github.com/{repo}/pull/{number}", ai_handler=Handler)
     reviewer.check_binding()
-    previous = completed_review(reviewer.git_provider.get_issue_comments(), key)
+    previous = completed_review(reviewer.git_provider.get_issue_comments(), key,
+                                repo, int(number), head, base, review_depth())
     if previous is not None:
         reviewer.check_binding(fresh=True)
         reviewer.git_provider.pr.create_issue_comment(
@@ -389,6 +506,20 @@ async def review(settings):
     if (not bot_owned(summary) or type(summary.id) is not int or summary.id <= 0
             or not isinstance(summary.body, str)):
         raise ReviewAbort("Review summary identity could not be verified")
+    # The digest is the hash of the summary after the findings comment is appended.
+    # Keeping the digest inside that comment would make the hash depend on itself.
+    evidence = {"repository": repo, "number": int(number), "base": base, "head": head,
+                "depth": review_depth(), "key": key, "summary": summary.id,
+                "findings": reviewer.result_findings}
+    manifest = result_manifest(evidence)
+    line = result_comment(manifest)
+    edit = getattr(summary, "edit", None)
+    if not callable(edit):
+        raise ReviewAbort("Review summary could not record structured findings")
+    bound = summary.body + "\n" + line
+    edit(bound)
+    if summary.body != bound:
+        summary.body = bound
     digest = hashlib.sha256(summary.body.encode()).hexdigest()
     usage = router.usage if router.usage_observed else None
     runtime_seconds = int(time.monotonic() - started)
@@ -399,7 +530,8 @@ async def review(settings):
                 f"Successful calls: {router.calls}; billing rejections: {router.rejections}; "
                 f"runtime: {runtime_seconds} seconds.\n\n"
                 f"Reported token usage: `{json.dumps(usage, sort_keys=True)}`.\n\n"
-                f"[Review summary]({summary.html_url}) · [Actions run]({run_url}).")
+                f"[Review summary]({summary.html_url}) · [Actions run]({run_url}).\n\n"
+                f"{line}")
     print(json.dumps({"models": router.models_used, "successful_calls": router.calls,
                       "billing_rejections": router.rejections, "reported_tokens": usage,
                       "runtime_seconds": runtime_seconds}, sort_keys=True))
