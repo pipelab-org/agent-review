@@ -197,18 +197,61 @@ jobs:
       image: pragent/pr-agent:0.47.0@sha256:7d98954c29289846a08faf00aaea0f1f1375b1676cd8a2ed303e0af07010af7a
       options: --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges
     steps:
+      # A local reusable call follows the caller's PR merge ref on inline
+      # events. Select executable source before checking out any repository
+      # files; validating the caller later cannot make PR Python trusted.
+      # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review_comment
+      - name: Resolve trusted shared source before checkout
+        id: reply-source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LOADED_REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+
+          def main():
+              sha = os.environ["LOADED_REVIEW_SOURCE_SHA"]
+              if os.environ["GITHUB_REPOSITORY"] == "pipelab-org/agent-review":
+                  root = "https://api.github.com/repos/pipelab-org/agent-review"
+
+                  def read(url):
+                      request = urllib.request.Request(url, headers={
+                          "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                          "Accept": "application/vnd.github+json"})
+                      with urllib.request.urlopen(request) as response:
+                          return json.load(response)
+
+                  branch = read(root)["default_branch"]
+                  sha = read(root + "/commits/" + urllib.parse.quote(branch, safe=""))["sha"]
+              if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                  raise ValueError("Invalid trusted source")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+                  stream.write(f"reviewer_sha={sha}\n")
+
+
+          try:
+              main()
+          except Exception:
+              raise SystemExit("Trusted reply source unavailable; no repository code executed") from None
+          PY
       - name: Check out immutable agent-review source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: pipelab-org/agent-review
-          ref: ${{ needs.source.outputs.reviewer_sha }}
+          ref: ${{ steps.reply-source.outputs.reviewer_sha }}
           path: trusted-agent-review
           persist-credentials: false
       - name: Resolve immutable default-branch policy and validate the loaded caller as data
         id: policy
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+          REVIEW_SOURCE_SHA: ${{ steps.reply-source.outputs.reviewer_sha }}
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: python trusted-agent-review/scripts/agent_review_contract.py --resolve-reply-policy --source-sha "$REVIEW_SOURCE_SHA"
@@ -227,7 +270,7 @@ jobs:
         env:
           # The caller's ref, not this file's: rejects a decoy agent-review.yaml.
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
-          REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+          REVIEW_SOURCE_SHA: ${{ steps.reply-source.outputs.reviewer_sha }}
         run: python trusted-agent-review/scripts/agent_review_contract.py --root trusted-agent-profile --source-sha "$REVIEW_SOURCE_SHA"
       - name: Answer an admitted inline question
         env:
@@ -237,7 +280,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ORG_MEMBERS_TOKEN: ${{ secrets.ORG_MEMBERS_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+          REVIEW_SOURCE_SHA: ${{ steps.reply-source.outputs.reviewer_sha }}
           REVIEW_PROFILE_SHA: ${{ steps.policy.outputs.sha }}
           REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
           # Select a fixed value after exact-command admission; never interpolate command arguments.
