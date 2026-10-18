@@ -20,8 +20,10 @@ from unittest.mock import patch
 
 if __package__:
     from .agent_review_contract import load_profile
+    from . import review_followups as followups
 else:
     from agent_review_contract import load_profile
+    import review_followups as followups
 
 PROFILE = Path(__file__).resolve().parents[1] / ".github" / "agent-review.toml"
 CONFIG = Path(__file__).resolve().parents[1] / ".github" / "pr-agent.toml"
@@ -189,13 +191,17 @@ def configure():
     settings = get_settings()
     data = tomllib.loads(CONFIG.read_text(encoding="utf-8"))
     for section, entries in data.items():
+        if section == "review_depth":
+            continue
         for key, value in entries.items():
             settings.set(f"{section}.{key}", value)
     settings.set("pr_reviewer.extra_instructions",
                  data["pr_reviewer"]["extra_instructions"].rstrip() + "\n\n" + profile["review"]["instructions"])
     depth = review_depth()
+    settings.set("trusted_review_depths", data["review_depth"])
+    for key, value in data["review_depth"][depth].items():
+        settings.set(f"config.{key}", value)
     if depth == "deep":
-        settings.set("config.reasoning_effort", "high")
         settings.set("pr_reviewer.extra_instructions",
                      settings.pr_reviewer.extra_instructions +
                      "\nTrace changed behavior through callers and failure paths. "
@@ -388,7 +394,9 @@ async def review(settings):
     )}
     models = [settings.config.model, *settings.config.fallback_models]
     chain = credential_chain(models, credentials)
-    settings.set("github.user_token", os.environ.pop("GITHUB_TOKEN"))
+    github_token = os.environ.pop("GITHUB_TOKEN")
+    member_token = os.environ.pop("ORG_MEMBERS_TOKEN", "")
+    settings.set("github.user_token", github_token)
     settings.set("github.deployment_type", "user")
     repo = os.environ["GITHUB_REPOSITORY"]
     number = os.environ["PR_NUMBER"]
@@ -421,6 +429,9 @@ async def review(settings):
 
     # Fingerprint the configured chain, not the credential-dependent first route.
     key, source, profile_sha, profile_hash, exclusions = review_binding(settings, repo, number, head, base)
+    binding = followups.context(settings, repo, number, head, base, source, profile_sha,
+                               profile_hash, hashlib.sha256(CONFIG.read_bytes()).hexdigest(), review_depth())
+    key = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
     settings.set("config.model", chain[0][0] if chain else models[0])
     settings.set("config.fallback_models", [])
     record = provenance(source, profile_sha, profile_hash, exclusions)
@@ -431,6 +442,13 @@ async def review(settings):
     notice = f"<!-- agent-review-notice:v1 run={run_id} -->"
 
     router = CompletionChain(chain, complete, settings.pr_reviewer.max_number_of_calls)
+
+    if os.environ.get("GITHUB_EVENT_NAME") == "pull_request_review_comment":
+        if not chain:
+            raise ReviewAbort("No configured provider credential is available")
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        await followups.reply_workflow(settings, router, binding, github_token, member_token, event, os.environ)
+        return
 
     class Handler:
         main_pr_language = ""
@@ -453,21 +471,49 @@ async def review(settings):
             result = super()._prepare_pr_review()
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
-            return result + f"\n\nReviewed base `{base}` and head `{head}`.\n\n{record}"
+            return result + f"\n\nReviewed base `{base}` and head `{head}`.\n\n{record}\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
+
 
     reviewer = Reviewer(f"https://github.com/{repo}/pull/{number}", ai_handler=Handler)
     reviewer.check_binding()
-    previous = completed_review(reviewer.git_provider.get_issue_comments(), key,
-                                repo, int(number), head, base, review_depth())
-    if previous is not None:
+    provider = reviewer.git_provider
+    repo_obj = provider.github_client.get_repo(repo)
+    records = followups.verified_records(repo_obj, provider.pr, binding,
+                lambda a: followups.download_record(a, github_token, settings.config.ai_timeout))
+    scope = followups.scope_for(repo_obj, binding, records)
+    if scope["kind"] == "unchanged":
         reviewer.check_binding(fresh=True)
-        reviewer.git_provider.pr.create_issue_comment(
-            f"{notice}\nThis snapshot already has a completed diff review. "
-            f"[Completed review]({previous.html_url}); no new inference was requested.\n\n"
-            f"[Actions run]({run_url}).")
-        print(f"Reused completed review: {previous.html_url}")
+        provider.pr.create_issue_comment(
+            f"{notice}\nThis snapshot already has a verified completed review chain; no new inference was requested.\n\n"
+            f"Coverage chain ends at Actions run `{scope['parent']}`. [Actions run]({run_url}).")
+        print("Reused verified completed review chain")
         return
-    if not chain:
+    if scope["kind"] == "incremental":
+        try:
+            files = followups.incremental_files(repo_obj, scope["from"], head)
+        except Exception:
+            # Unsupported compare/content shapes or publisher truncation cannot
+            # suppress review. The unchanged provider retains its full PR diff.
+            scope = {"kind": "full", "from": base, "to": head, "parent": None, "full_head": True}
+            files = None
+    else:
+        files = None
+    if files is not None:
+        # The provider's existing ignore and valid-extension policy still applies.
+        from pr_agent.algo.file_filter import filter_ignored
+        from pr_agent.algo.language_handler import is_valid_file
+        files = [f for f in filter_ignored(files) if is_valid_file(f.filename)]
+        provider.diff_files = files
+        provider.get_diff_files = lambda: files
+        provider.get_files = lambda: files
+        provider.get_num_of_files = lambda: len(files)
+        reviewer.vars["num_pr_files"] = len(files)
+        reviewer.vars["extra_instructions"] += (
+            f"\nThis run reviews only the immutable delta from {scope['from']} to {head}. "
+            "Earlier findings and threads remain for the maintainer's sweep; this run cannot claim full-head coverage.")
+        # An empty compare (identical content, e.g. metadata-only commits) needs
+        # no model call. Produce a new immutable chain link below.
+    if not chain and files != []:
         raise ReviewAbort("No configured provider credential is available")
     pr = reviewer.git_provider.pr
     # The review job's repository/PR concurrency serializes this status pattern.
@@ -476,8 +522,39 @@ async def review(settings):
         f"{notice}\n<!-- {STATUS_MARKER} state=running key={key} -->\n"
         f"Diff review started for base `{base}` and head `{head}`.\n\n{record}\n\n"
         f"[Actions run]({run_url}).")
-    published = []
+    published, roots = [], []
     provider = reviewer.git_provider
+    original_create_review = getattr(pr, "create_review", None)
+
+    def _capture_inline(*args, **kwargs):
+        reviewer.check_binding(fresh=True)
+        result = original_create_review(*args, **kwargs)
+        if (not followups.identity(result.user, followups.BOT)
+                or not followups.positive(result.id) or result.commit_id != head):
+            raise ReviewAbort("Inline review publication identity could not be verified")
+        comments = [c for c in pr.get_review_comments() if c.raw_data.get("pull_request_review_id") == result.id]
+        requested = kwargs.get("comments", [])
+        if len(comments) != len(requested):
+            raise ReviewAbort("Inline review publication was partial")
+        for comment, request in zip(comments, requested):
+            if (not followups.identity(comment.user, followups.BOT)
+                    or not followups.positive(comment.id) or comment.body != request["body"]
+                    or comment.path != request["path"] or comment.commit_id != head
+                    or comment.raw_data.get("in_reply_to_id") is not None
+                    or comment.raw_data.get("pull_request_review_id") != result.id):
+                raise ReviewAbort("Inline comment publication could not be verified")
+            roots.append({"id": comment.id, "review_id": result.id, "path": comment.path,
+                          "commit": head, "digest": followups.digest(comment.body)})
+        return result
+
+
+    def capture_inline(*args, **kwargs):
+        try:
+            return _capture_inline(*args, **kwargs)
+        except Exception as error:
+            # Publication/verification errors must bypass upstream's broad
+            # handlers; a partially published review cannot mark success.
+            raise ReviewAbort(f"Inline publication verification failed ({type(error).__name__})") from None
 
     def require_publication(original):
         def publish(*args, **kwargs):
@@ -489,28 +566,39 @@ async def review(settings):
         return publish
 
     try:
-        with (patch.object(provider, "publish_persistent_comment",
-                           require_publication(provider.publish_persistent_comment)),
-              patch.object(provider, "publish_persistent_comment_full",
-                           require_publication(provider.publish_persistent_comment_full))):
-            await reviewer.run()
+        def fresh_summary(body, *args, **kwargs):
+            return provider.publish_comment(body)
+
+        inline_patch = patch.object(pr, "create_review", capture_inline) if original_create_review else patch.object(provider, "_unused_capture", None, create=True)
+        with (patch.object(provider, "publish_persistent_comment", require_publication(fresh_summary)),
+              patch.object(provider, "publish_persistent_comment_full", require_publication(fresh_summary)),
+              inline_patch):
+            if files == []:
+                summary = provider.publish_persistent_comment(
+                    f"No changed reviewable content since `{scope['from']}`. Head `{head}`.\n\n{record}\n\n"
+                    f"Scope: `{json.dumps(scope, sort_keys=True)}`. Previous findings and threads remain in force.")
+                reviewer.result_findings = []
+            else:
+                await reviewer.run()
     except Exception as error:
         # Upstream raises generic exceptions, for example after an unparseable
         # prediction. Report only the class; the message can carry model output.
         raise ReviewAbort(f"PR-Agent review failed ({type(error).__name__})") from None
-    check_complete(reviewer, router.calls, command_failed())
+    if files != []:
+        check_complete(reviewer, router.calls, command_failed())
     if not published:
         raise ReviewAbort("Review summary was not published")
     reviewer.check_binding(fresh=True)
     summary = published[-1]
-    if (not bot_owned(summary) or type(summary.id) is not int or summary.id <= 0
+    if (not followups.identity(getattr(summary, "user", None), followups.BOT) or type(summary.id) is not int or summary.id <= 0
             or not isinstance(summary.body, str)):
         raise ReviewAbort("Review summary identity could not be verified")
     # The digest is the hash of the summary after the findings comment is appended.
     # Keeping the digest inside that comment would make the hash depend on itself.
     evidence = {"repository": repo, "number": int(number), "base": base, "head": head,
                 "depth": review_depth(), "key": key, "summary": summary.id,
-                "findings": reviewer.result_findings}
+                "findings": reviewer.result_findings, "version": 2, "context": binding,
+                "scope": scope, "run_id": int(run_id), "roots": roots}
     manifest = result_manifest(evidence)
     line = result_comment(manifest)
     edit = getattr(summary, "edit", None)
@@ -524,14 +612,17 @@ async def review(settings):
     usage = router.usage if router.usage_observed else None
     runtime_seconds = int(time.monotonic() - started)
     # Only this post-publication transition permits identical-snapshot reuse.
-    status.edit(f"<!-- {STATUS_MARKER} state=success key={key} summary={summary.id} digest={digest} -->\n"
-                f"Completed diff review for base `{base}` and head `{head}`.\n\n{record}\n\n"
+    status.edit(f"<!-- {STATUS_MARKER} state=success key={key} summary={summary.id} digest={digest} -->\n{notice}\n"
+                f"Completed `{scope['kind']}` diff review for base `{base}` and head `{head}`.\n\n{record}\n\n"
+                f"Scope: `{json.dumps(scope, sort_keys=True)}`. Earlier findings and threads remain in force.\n\n"
                 f"Models used: `{json.dumps(router.models_used)}`. "
                 f"Successful calls: {router.calls}; billing rejections: {router.rejections}; "
                 f"runtime: {runtime_seconds} seconds.\n\n"
                 f"Reported token usage: `{json.dumps(usage, sort_keys=True)}`.\n\n"
                 f"[Review summary]({summary.html_url}) · [Actions run]({run_url}).\n\n"
                 f"{line}")
+    if os.environ.get("REVIEW_COMPLETION_PATH"):
+        followups.write_completion(os.environ["REVIEW_COMPLETION_PATH"], dict(evidence, digest=digest))
     print(json.dumps({"models": router.models_used, "successful_calls": router.calls,
                       "billing_rejections": router.rejections, "reported_tokens": usage,
                       "runtime_seconds": runtime_seconds}, sort_keys=True))
@@ -549,7 +640,7 @@ def main():
     except (ReviewAbort, Exception) as error:
         # Provider exception messages can echo requests or credentials. Report a
         # fixed failure class; only our own ReviewAbort messages are safe to show.
-        message = str(error) if isinstance(error, ReviewAbort) else type(error).__name__
+        message = str(error) if isinstance(error, (ReviewAbort, followups.FollowupAbort)) else type(error).__name__
         print(f"Review failed: {message}", file=sys.stderr)
         return 1
     return 0

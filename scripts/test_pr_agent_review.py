@@ -132,10 +132,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_created_comments_only_and_secret_isolation(self):
         caller = yaml.load((ROOT / ".github/workflows/agent-review.yaml").read_text(), Loader=yaml.BaseLoader)
-        self.assertEqual({"issue_comment": {"types": ["created"]}}, caller["on"])
-        self.assertEqual(self.gate, caller["jobs"]["review"]["if"])
+        self.assertEqual({"issue_comment": {"types": ["created"]}, "pull_request_review_comment": {"types": ["created"]}}, caller["on"])
+        self.assertIn(self.gate, caller["jobs"]["review"]["if"])
         self.assertEqual({"workflow_call"}, set(WORKFLOW["on"]))
-        self.assertEqual({"ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_2", "OPENAI_API_KEY"},
+        self.assertEqual({"ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_2", "OPENAI_API_KEY", "ORG_MEMBERS_TOKEN"},
                          set(WORKFLOW["on"]["workflow_call"]["secrets"]))
         self.assertEqual({}, WORKFLOW["permissions"])
         admit = WORKFLOW["jobs"]["admit"]
@@ -146,7 +146,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("needs.admit.outputs.admitted == 'true'", job["if"])
         self.assertRegex(job["container"]["image"], r"^pragent/pr-agent:0\.47\.0@sha256:[0-9a-f]{64}$")
         self.assertNotIn("env", job)
-        checkout, profile, validate, run = job["steps"]
+        checkout, profile, validate, run, artifact = job["steps"]
         self.assertEqual("${{ needs.source.outputs.reviewer_sha }}", checkout["with"]["ref"])
         self.assertEqual("pipelab-org/agent-review", checkout["with"]["repository"])
         self.assertEqual("trusted-agent-review", checkout["with"]["path"])
@@ -168,7 +168,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertCountEqual([
             "--user", "1001:1001", "--cap-drop=ALL", "--security-opt=no-new-privileges",
         ], shlex.split(job["container"]["options"]))
-        self.assertEqual({"contents": "read", "issues": "write", "pull-requests": "write"},
+        self.assertEqual({"actions": "read", "contents": "read", "issues": "write", "pull-requests": "write"},
                          job["permissions"])
 
     @unittest.skipUnless(shutil.which("jq"), "jq required to run the admission step")

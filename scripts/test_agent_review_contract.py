@@ -188,9 +188,30 @@ class CallerTests(unittest.TestCase):
                             contract.main()
                         self.assertEqual(code, raised.exception.code)
 
+    def test_inline_events_bind_exact_merge_ref_and_immutable_default_policy(self):
+        repo = "example/project"
+        with patch.dict(os.environ, GITHUB_EVENT_NAME="pull_request_review_comment"):
+            contract.validate_caller_ref(f"{repo}/.github/workflows/agent-review.yaml@refs/pull/1/merge", repo)
+            for ref in (f"{repo}/.github/workflows/other.yaml@refs/pull/1/merge",
+                        f"{repo}/.github/workflows/agent-review.yaml@refs/heads/feature",
+                        f"{repo}/.github/workflows/agent-review.yaml@refs/pull/1/head"):
+                with self.assertRaises(ValueError): contract.validate_caller_ref(ref, repo)
+        reply = WORKFLOW["jobs"]["reply"]
+        source, checkout, policy, profile, validate, run = reply["steps"]
+        self.assertEqual('reply-source', source['id'])
+        self.assertNotIn("secrets.", json.dumps(policy))
+        self.assertEqual("${{ steps.policy.outputs.sha }}", profile["with"]["ref"])
+        self.assertIn("--resolve-reply-policy", policy["run"])
+        self.assertEqual("${{ github.event.pull_request.head.sha }}", run["env"]["REVIEW_HEAD"])
+        self.assertIn("ORG_MEMBERS_TOKEN", run["env"])
+        self.assertEqual("default", run["env"]["REVIEW_DEPTH"])
+        self.assertEqual("max", reply["concurrency"]["queue"])
+        self.assertEqual("false", reply["concurrency"]["cancel-in-progress"])
+
     def test_every_job_repeats_the_exact_admission_gate(self):
         gate = WORKFLOW['jobs']['admit']['if']
-        self.assertEqual(gate, WORKFLOW['jobs']['source']['if'])
+        reply_gate = WORKFLOW['jobs']['reply']['if']
+        self.assertEqual(f'({gate}) || ({reply_gate})', WORKFLOW['jobs']['source']['if'])
         self.assertTrue(WORKFLOW['jobs']['notify-failure']['if'].startswith('always() && ' + gate + ' && ('))
 
     def test_source_binding_and_queue_precede_provider_work(self):
@@ -202,7 +223,7 @@ class CallerTests(unittest.TestCase):
         job = WORKFLOW['jobs']['review']
         self.assertEqual('max', job['concurrency']['queue'])
         self.assertEqual('false', job['concurrency']['cancel-in-progress'])
-        run = job['steps'][-1]
+        run = job['steps'][-2]
         self.assertEqual('${{ needs.source.outputs.reviewer_sha }}', run['env']['REVIEW_SOURCE_SHA'])
         self.assertEqual('${{ github.workflow_sha }}', run['env']['REVIEW_PROFILE_SHA'])
         self.assertEqual('trusted-agent-profile/.github/agent-review.toml', run['env']['REVIEW_PROFILE_PATH'])
@@ -251,6 +272,73 @@ class SourceBindingTests(unittest.TestCase):
                 code, output = self.bind(**overrides)
                 self.assertNotEqual(0, code)
                 self.assertEqual('', output)
+
+
+class ReplySourceTests(unittest.TestCase):
+    """Inline self-calls cannot select executable Python from the PR merge."""
+
+    def resolve(self, repository, responses=(), loaded=SHA):
+        step = WORKFLOW['jobs']['reply']['steps'][0]
+        self.assertEqual('reply-source', step['id'])
+        script = step['run'].split("python3 - <<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+        calls = []
+
+        def request(req):
+            calls.append(req.full_url)
+            value = responses[len(calls) - 1]
+            if isinstance(value, Exception):
+                raise value
+            return io.BytesIO(json.dumps(value).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'output'
+            env = {'GITHUB_REPOSITORY': repository, 'GITHUB_TOKEN': 'fixture',
+                   'LOADED_REVIEW_SOURCE_SHA': loaded, 'GITHUB_OUTPUT': str(output)}
+            with patch.dict(os.environ, env), patch('urllib.request.urlopen', side_effect=request):
+                try:
+                    exec(compile(script, '<trusted-reply-source>', 'exec'), {})
+                except SystemExit as error:
+                    return str(error), output.read_text() if output.exists() else '', calls
+            return None, output.read_text(), calls
+
+    def test_local_inline_merge_source_is_replaced_before_executable_checkout(self):
+        default = 'b' * 40
+        error, output, calls = self.resolve('pipelab-org/agent-review',
+                                           [{'default_branch': 'release/review'}, {'sha': default}])
+        self.assertIsNone(error)
+        self.assertEqual(f'reviewer_sha={default}\n', output)
+        self.assertNotIn(SHA, output)
+        self.assertEqual(['https://api.github.com/repos/pipelab-org/agent-review',
+                          'https://api.github.com/repos/pipelab-org/agent-review/commits/release%2Freview'], calls)
+
+    def test_remote_caller_retains_immutable_pin_without_api_access(self):
+        self.assertEqual((None, f'reviewer_sha={SHA}\n', []), self.resolve('example/project'))
+
+    def test_missing_failed_or_malformed_default_source_never_exports_a_checkout(self):
+        for responses in ([RuntimeError('private failure detail')], [{}],
+                          [{'default_branch': 'main'}, RuntimeError('private failure detail')],
+                          [{'default_branch': 'main'}, {'sha': 'main'}],
+                          [{'default_branch': 'main'}, {'sha': None}]):
+            with self.subTest(responses=responses):
+                error, output, _ = self.resolve('pipelab-org/agent-review', responses)
+                self.assertEqual('Trusted reply source unavailable; no repository code executed', error)
+                self.assertEqual('', output)
+        error, output, calls = self.resolve('example/project', loaded='main')
+        self.assertIsNotNone(error)
+        self.assertEqual('', output)
+        self.assertEqual([], calls)
+
+    def test_every_reply_source_consumer_uses_the_precheckout_selection(self):
+        steps = WORKFLOW['jobs']['reply']['steps']
+        self.assertNotIn('uses', steps[0])
+        self.assertEqual({'GITHUB_TOKEN', 'LOADED_REVIEW_SOURCE_SHA'}, set(steps[0]['env']))
+        selected = '${{ steps.reply-source.outputs.reviewer_sha }}'
+        self.assertEqual(selected, steps[1]['with']['ref'])
+        self.assertEqual('pipelab-org/agent-review', steps[1]['with']['repository'])
+        consumers = [s['env']['REVIEW_SOURCE_SHA'] for s in steps if 'REVIEW_SOURCE_SHA' in s.get('env', {})]
+        self.assertEqual([selected] * 3, consumers)
+        self.assertEqual('${{ needs.source.outputs.reviewer_sha }}',
+                         WORKFLOW['jobs']['review']['steps'][0]['with']['ref'])
 
 
 class LocalCallerTests(unittest.TestCase):
