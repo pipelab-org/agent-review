@@ -210,7 +210,8 @@ class CallerTests(unittest.TestCase):
 
     def test_every_job_repeats_the_exact_admission_gate(self):
         gate = WORKFLOW['jobs']['admit']['if']
-        self.assertIn(gate, WORKFLOW['jobs']['source']['if'])
+        reply_gate = WORKFLOW['jobs']['reply']['if']
+        self.assertEqual(f'({gate}) || ({reply_gate})', WORKFLOW['jobs']['source']['if'])
         self.assertTrue(WORKFLOW['jobs']['notify-failure']['if'].startswith('always() && ' + gate + ' && ('))
 
     def test_source_binding_and_queue_precede_provider_work(self):
