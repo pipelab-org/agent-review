@@ -343,6 +343,48 @@ class RuntimeTests(unittest.TestCase):
         self.run_adapter(completion)
         completion.assert_awaited_once()
 
+    def test_verified_current_head_artifact_reuses_review_without_inference(self):
+        from scripts.test_review_followups import comments, evidence, run_data
+        f = review.followups
+        with patch.dict(os.environ, self.env):
+            _, source, profile_sha, profile_hash, _ = review.review_binding(
+                self.settings, self.repo, "1", self.head, self.base)
+            ctx = f.context(self.settings, self.repo, 1, self.head, self.base, source,
+                            profile_sha, profile_hash,
+                            hashlib.sha256(review.CONFIG.read_bytes()).hexdigest(), "default")
+        record = evidence()
+        record["context"] = ctx
+        record["key"] = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
+        record["digest"] = f.digest(comments(record)[1][8].body)
+        self.provider.get_issue_comments.return_value = list(comments(record)[1].values())
+        repo = self.provider.github_client.get_repo.return_value
+        artifact = NS(name="agent-review-completion", expired=False)
+        repo.get_workflow_run.return_value = NS(raw_data=run_data(record), get_artifacts=lambda: [artifact])
+        repo.compare.side_effect = lambda old, new: NS(
+            base_commit=NS(sha=old), merge_base_commit=NS(sha=old),
+            status="identical" if old == new else "ahead")
+        completion = AsyncMock(return_value=self.response())
+        with patch.object(f, "download_record", return_value=record) as download:
+            self.run_adapter(completion)
+        download.assert_called_once_with(artifact, "fixture-github", self.settings.config.ai_timeout)
+        repo.get_workflow_run.assert_called_once_with(123)
+        completion.assert_not_awaited()
+        self.provider.publish_code_suggestions.assert_not_called()
+        self.summary_publish.assert_not_called()
+        self.status.edit.assert_not_called()
+        self.provider.pr.create_issue_comment.assert_called_once()
+        notice = self.provider.pr.create_issue_comment.call_args.args[0]
+        self.assertIn("already has a verified completed review chain", notice)
+        self.assertIn("no new inference was requested", notice)
+        self.assertIn("Actions run `123`", notice)
+
+        # The same comments cannot suppress inference if artifact verification fails.
+        self.settings, _ = review.configure()
+        with patch.object(f, "download_record", return_value={}):
+            self.run_adapter(completion)
+        completion.assert_awaited_once()
+        self.summary_publish.assert_called_once()
+
     def test_missing_credentials_and_failed_publication_never_mark_success(self):
         completion = AsyncMock(return_value=self.response())
         self.env["OPENAI_API_KEY"] = ""

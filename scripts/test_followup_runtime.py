@@ -83,11 +83,12 @@ class FollowupRuntimeTests(unittest.TestCase):
             if relative == "/orgs/example/memberships/member":
                 return {}, {"state": "active" if self.membership_active else "pending", "user": self.question["user"], "organization": self.repo_data["owner"]}
         if method == "POST" and relative == prefix + "/pulls/1/comments/10/replies":
-            result = dict(id=12, body=input["body"], user=f.BOT, in_reply_to_id=10,
-                          url=root + "/pulls/comments/12")
+            comment_id = max(c["id"] for c in self.responses) + 1
+            result = dict(id=comment_id, body=input["body"], user=f.BOT, in_reply_to_id=10,
+                          url=root + f"/pulls/comments/{comment_id}")
             self.responses.append(result)
             return {}, result
-        if method == "PATCH" and relative == prefix + "/pulls/comments/12":
+        if method == "PATCH" and relative == prefix + f"/pulls/comments/{self.responses[-1]['id']}":
             self.responses[-1].update(input)
             return {}, self.responses[-1]
         self.fail(f"Unexpected GitHub operation: {method} {relative}")
@@ -121,6 +122,8 @@ class FollowupRuntimeTests(unittest.TestCase):
         self.assertEqual("gpt-6-luna", kwargs["model"])
         self.assertEqual(f.reply_marker(11, 10) + "\n" + self.reply_body, self.responses[-1]["body"])
         self.assertEqual(1, sum(method == "POST" for method, _, _ in self.calls))
+        self.assertTrue(all("/pulls/" in path for method, path, _ in self.calls
+                            if method in ("POST", "PATCH")))
         self.settings, _ = adapter.configure()
         self.run_reply(complete)
         complete.assert_awaited_once()
@@ -192,6 +195,19 @@ class FollowupRuntimeTests(unittest.TestCase):
         complete.assert_awaited_once()
         self.assertIn("Reply incomplete", self.responses[-1]["body"])
         self.assertNotIn("untrusted detail", self.responses[-1]["body"])
+        self.assertIn("Post a new reply to try again", self.responses[-1]["body"])
+        self.settings, _ = adapter.configure()
+        retry = self.completion()
+        self.run_reply(retry)
+        retry.assert_not_awaited()
+        self.assertEqual(1, sum(method == "POST" for method, _, _ in self.calls))
+        self.question["id"] = 13
+        self.question["url"] = self.api_root + "/pulls/comments/13"
+        self.settings, _ = adapter.configure()
+        self.run_reply(retry)
+        retry.assert_awaited_once()
+        self.assertEqual(2, sum(method == "POST" for method, _, _ in self.calls))
+        self.assertEqual(f.reply_marker(13, 10) + "\n" + self.reply_body, self.responses[-1]["body"])
 
     def test_snapshot_change_during_completion_suppresses_answer(self):
         complete = self.completion()
