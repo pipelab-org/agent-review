@@ -233,6 +233,7 @@ def print_settings(settings, litellm):
 
 
 STATUS_MARKER = "agent-review-status:v1"
+RESULT_MARKER = "agent-review-result:v1"
 
 
 def bot_owned(comment):
@@ -241,17 +242,71 @@ def bot_owned(comment):
             and getattr(user, "type", None) == "Bot")
 
 
-def completed_review(comments, key):
-    """Reuse only a bot's terminal record whose published summary is still intact."""
+def result_manifest(evidence):
+    """Encode findings without a digest field. The digest covers the comment that contains this."""
+    raw = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    return base64.b64encode(raw).decode()
+
+
+def result_comment(manifest):
+    return f"<!-- {RESULT_MARKER} {manifest} -->"
+
+
+def stored_findings_ok(findings):
+    if not isinstance(findings, list):
+        return False
+    for item in findings:
+        if not isinstance(item, dict):
+            return False
+        title, body = item.get("title"), item.get("body")
+        if not isinstance(title, str) or not title.strip() or not isinstance(body, str) or not body.strip():
+            return False
+        if item.get("path") == "unknown" and item.get("line") is None and item.get("end_line") is None:
+            continue
+        path, line, end = item.get("path"), item.get("line"), item.get("end_line")
+        if (not isinstance(path, str) or not path.strip() or path == "unknown"
+                or type(line) is not int or line < 1 or type(end) is not int or end < line):
+            return False
+    return True
+
+
+def parse_result(body):
+    """Use the last marker. Model text can precede the marker the publisher appends."""
+    matches = list(re.finditer(rf"<!-- {RESULT_MARKER} ([A-Za-z0-9+/=]+) -->", body))
+    if not matches:
+        return None
+    token = matches[-1].group(1)
+    try:
+        data = json.loads(base64.b64decode(token, validate=True))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not stored_findings_ok(data.get("findings")):
+        return None
+    return token, data
+
+
+def completed_review(comments, key, repository, number, head, base, depth):
+    """Reuse only a bot success record whose summary digest covers the same findings."""
     comments = list(comments)
     summaries = {c.id: c for c in comments if bot_owned(c) and isinstance(c.body, str)}
     pattern = rf"<!-- {STATUS_MARKER} state=success key={key} summary=([1-9][0-9]*) digest=([0-9a-f]{{64}}) -->"
     for comment in summaries.values():
         match = re.fullmatch(pattern, comment.body.split("\n", 1)[0])
-        if match:
-            summary = summaries.get(int(match[1]))
-            if summary is not None and hashlib.sha256(summary.body.encode()).hexdigest() == match[2]:
-                return comment
+        if not match:
+            continue
+        summary = summaries.get(int(match[1]))
+        if summary is None or hashlib.sha256(summary.body.encode()).hexdigest() != match[2]:
+            continue
+        published = parse_result(summary.body)
+        recorded = parse_result(comment.body)
+        if published is None or recorded is None or published[0] != recorded[0]:
+            continue
+        data = published[1]
+        if (data.get("key") != key or data.get("summary") != int(match[1])
+                or data.get("repository") != repository or data.get("number") != int(number)
+                or data.get("head") != head or data.get("base") != base or data.get("depth") != depth):
+            continue
+        return comment
     return None
 
 
@@ -292,18 +347,24 @@ def result_findings(data):
         raise ReviewAbort("Review result has incomplete structured findings")
     findings = []
     for issue in issues:
-        if (not isinstance(issue, dict)
-                or any(not isinstance(issue.get(key), str) or not issue[key].strip()
-                       for key in ("relevant_file", "issue_header", "issue_content"))
+        # The pinned prompt's example uses literal block scalars. PyYAML keeps
+        # the trailing newline, and the publisher strips it before anchoring.
+        text = {}
+        for key in ("relevant_file", "issue_header", "issue_content"):
+            value = issue.get(key) if isinstance(issue, dict) else None
+            text[key] = value.strip() if isinstance(value, str) else ""
+        if (not isinstance(issue, dict) or any(not text[key] for key in text)
                 or type(issue.get("start_line")) is not int or issue["start_line"] < 1
                 or type(issue.get("end_line")) is not int or issue["end_line"] < issue["start_line"]):
             raise ReviewAbort("Review result has invalid structured findings")
-        findings.append({"path": issue["relevant_file"], "line": issue["start_line"],
-                         "end_line": issue["end_line"], "title": issue["issue_header"],
-                         "body": issue["issue_content"]})
-    if concerns != "No":
+        findings.append({"path": text["relevant_file"], "line": issue["start_line"],
+                         "end_line": issue["end_line"], "title": text["issue_header"],
+                         "body": text["issue_content"]})
+    # Exact 'No' after the same strip. 'no' and 'None' stay findings.
+    concern = concerns.strip()
+    if concern != "No":
         findings.append({"path": "unknown", "line": None, "end_line": None,
-                         "title": "Security concerns", "body": concerns})
+                         "title": "Security concerns", "body": concern})
     return findings
 
 
@@ -389,7 +450,8 @@ async def review(settings):
 
     reviewer = Reviewer(f"https://github.com/{repo}/pull/{number}", ai_handler=Handler)
     reviewer.check_binding()
-    previous = completed_review(reviewer.git_provider.get_issue_comments(), key)
+    previous = completed_review(reviewer.git_provider.get_issue_comments(), key,
+                                repo, int(number), head, base, review_depth())
     if previous is not None:
         reviewer.check_binding(fresh=True)
         reviewer.git_provider.pr.create_issue_comment(
@@ -437,11 +499,21 @@ async def review(settings):
     if (not bot_owned(summary) or type(summary.id) is not int or summary.id <= 0
             or not isinstance(summary.body, str)):
         raise ReviewAbort("Review summary identity could not be verified")
-    digest = hashlib.sha256(summary.body.encode()).hexdigest()
+    # The digest is the hash of the summary after the findings comment is appended.
+    # Keeping the digest inside that comment would make the hash depend on itself.
     evidence = {"repository": repo, "number": int(number), "base": base, "head": head,
-                "depth": review_depth(), "key": key, "summary": summary.id, "digest": digest,
+                "depth": review_depth(), "key": key, "summary": summary.id,
                 "findings": reviewer.result_findings}
-    manifest = base64.b64encode(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).decode()
+    manifest = result_manifest(evidence)
+    line = result_comment(manifest)
+    edit = getattr(summary, "edit", None)
+    if not callable(edit):
+        raise ReviewAbort("Review summary could not record structured findings")
+    bound = summary.body + "\n" + line
+    edit(bound)
+    if summary.body != bound:
+        summary.body = bound
+    digest = hashlib.sha256(summary.body.encode()).hexdigest()
     usage = router.usage if router.usage_observed else None
     runtime_seconds = int(time.monotonic() - started)
     # Only this post-publication transition permits identical-snapshot reuse.
@@ -452,7 +524,7 @@ async def review(settings):
                 f"runtime: {runtime_seconds} seconds.\n\n"
                 f"Reported token usage: `{json.dumps(usage, sort_keys=True)}`.\n\n"
                 f"[Review summary]({summary.html_url}) · [Actions run]({run_url}).\n\n"
-                f"<!-- agent-review-result:v1 {manifest} -->")
+                f"{line}")
     print(json.dumps({"models": router.models_used, "successful_calls": router.calls,
                       "billing_rejections": router.rejections, "reported_tokens": usage,
                       "runtime_seconds": runtime_seconds}, sort_keys=True))

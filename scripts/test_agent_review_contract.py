@@ -287,29 +287,55 @@ class LocalCallerTests(unittest.TestCase):
 
 
 class ReuseTests(unittest.TestCase):
+    def bound(self, key, findings, head='a' * 40):
+        evidence = {"repository": "example/project", "number": 1, "base": "b" * 40, "head": head,
+                    "depth": "default", "key": key, "summary": 7, "findings": findings}
+        manifest = adapter.result_manifest(evidence)
+        line = adapter.result_comment(manifest)
+        summary_body = "Complete review\n" + line
+        digest = hashlib.sha256(summary_body.encode()).hexdigest()
+        status_body = (f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\n'
+                       f'Complete\n{line}')
+        summary = NS(id=7, body=summary_body, user=NS(login='github-actions[bot]', type='Bot'))
+        status = NS(id=8, user=NS(login='github-actions[bot]', type='Bot'), body=status_body, html_url='summary')
+        return summary, status
+
     def test_only_bot_owned_terminal_success_is_reusable(self):
         key = 'a' * 64
-        summary = NS(id=7, body='Complete review', user=NS(login='github-actions[bot]', type='Bot'))
-        digest = hashlib.sha256(summary.body.encode()).hexdigest()
-        good = NS(id=8, user=NS(login='github-actions[bot]', type='Bot'),
-                  body=f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\nComplete',
-                  html_url='summary')
-        self.assertIs(good, adapter.completed_review([good, summary], key))
+        finding = {"path": "src/file.py", "line": 1, "end_line": 1, "title": "Bug", "body": "real"}
+        summary, good = self.bound(key, [finding])
+        identity = ("example/project", 1, "a" * 40, "b" * 40, "default")
+        self.assertIs(good, adapter.completed_review([good, summary], key, *identity))
+        bare = copy.deepcopy(good)
+        bare.body = bare.body.split("\n", 1)[0] + "\nComplete"
+        summary_bare = copy.deepcopy(summary)
+        summary_bare.body = "Complete review"
+        digest = hashlib.sha256(summary_bare.body.encode()).hexdigest()
+        bare.body = f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\nComplete'
+        self.assertIsNone(adapter.completed_review([bare, summary_bare], key, *identity))
+        swapped = copy.deepcopy(good)
+        other = adapter.result_comment(adapter.result_manifest(
+            {"repository": "example/project", "number": 1, "base": "b" * 40, "head": "a" * 40,
+             "depth": "default", "key": key, "summary": 7, "findings": []}))
+        swapped.body = swapped.body.replace(adapter.result_comment(adapter.result_manifest(
+            {"repository": "example/project", "number": 1, "base": "b" * 40, "head": "a" * 40,
+             "depth": "default", "key": key, "summary": 7, "findings": [finding]})), other)
+        self.assertIsNone(adapter.completed_review([swapped, summary], key, *identity))
         for field, value in [('login', 'contributor'), ('type', 'User')]:
             bad = copy.deepcopy(good)
             setattr(bad.user, field, value)
-            self.assertIsNone(adapter.completed_review([bad, summary], key))
-        self.assertIsNone(adapter.completed_review([good], key))
+            self.assertIsNone(adapter.completed_review([bad, summary], key, *identity))
+        self.assertIsNone(adapter.completed_review([good], key, *identity))
         for body in [good.body.replace('success', 'running'), good.body.replace('success', 'failed'),
                      good.body.replace(key, 'b' * 64), 'quoted\n' + good.body]:
             bad = copy.deepcopy(good)
             bad.body = body
-            self.assertIsNone(adapter.completed_review([bad, summary], key))
+            self.assertIsNone(adapter.completed_review([bad, summary], key, *identity))
         summary.body = 'A later review replaced this summary'
-        self.assertIsNone(adapter.completed_review([good, summary], key))
+        self.assertIsNone(adapter.completed_review([good, summary], key, *identity))
         summary.body = 'Complete review'
         summary.user = None
-        self.assertIsNone(adapter.completed_review([good, summary], key))
+        self.assertIsNone(adapter.completed_review([good, summary], key, *identity))
 
     def test_profile_exclusions_remain_literal_in_provenance(self):
         text = adapter.provenance('a' * 40, 'b' * 40, 'c' * 64, ['**/`[name](example)/**'])

@@ -111,8 +111,16 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(concern, review.result_findings(record)[0]["body"])
         good = {"relevant_file": "src/file.py", "issue_header": "Incorrect result",
                 "issue_content": "The caller receives the wrong value.", "start_line": 1, "end_line": 2}
+        block = dict(good, relevant_file="src/file.py\n", issue_header="Possible Bug\n",
+                     issue_content="The caller receives the wrong value.\n", start_line=12, end_line=14)
+        record = copy.deepcopy(clean)
+        record["review"]["key_issues_to_review"] = [block]
+        record["review"]["security_concerns"] = "No\n"
+        self.assertEqual([{"path": "src/file.py", "line": 12, "end_line": 14, "title": "Possible Bug",
+                           "body": "The caller receives the wrong value."}], review.result_findings(record))
         for field, value in (("start_line", True), ("start_line", 0), ("start_line", "1"),
-                             ("end_line", 0), ("relevant_file", ""), ("issue_content", None)):
+                             ("end_line", 0), ("relevant_file", ""), ("relevant_file", "\n"),
+                             ("issue_header", " \n"), ("issue_content", None)):
             issue = dict(good, **{field: value})
             record = copy.deepcopy(clean)
             record["review"]["key_issues_to_review"] = [issue]
