@@ -130,7 +130,7 @@ class RecordTests(unittest.TestCase):
         artifact.expired = True
         self.assertEqual({}, f.verified_records(repo, pr, binding(), lambda a: record))
         artifact.expired = False
-        for key, value in (("reviewer", "0" * 40), ("profile_hash", "0" * 64), ("depth", "deep"),
+        for key, value in (("reviewer", "0" * 40), ("profile_sha", "0" * 40), ("profile_hash", "0" * 64), ("depth", "deep"),
                            ("models", ["different"]), ("base", "0" * 40), ("common_config", "0" * 64)):
             with self.subTest(key=key):
                 self.assertEqual({}, f.verified_records(repo, pr, dict(binding(), **{key: value}), lambda a: record))
