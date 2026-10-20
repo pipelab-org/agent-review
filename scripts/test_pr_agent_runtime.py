@@ -293,9 +293,13 @@ class RuntimeTests(unittest.TestCase):
 
     def test_challenge_malformed_partial_and_changed_source_never_publish_success(self):
         bad_quote = decision(); bad_quote["evidence"]["quote"] = "not current source"
-        for output in ("not JSON", '{"decisions": []}', json.dumps({"decisions": [bad_quote]})):
+        wrong_location = decision()
+        wrong_location["evidence"].update(start_line=2, end_line=2, quote="other")
+        for output in ("not JSON", '{"decisions": []}', json.dumps({"decisions": [bad_quote]}),
+                       json.dumps({"decisions": [wrong_location]})):
             with self.subTest(output=output):
                 self.setUp()
+                self.provider.get_diff_files.return_value[0].head_file = "new\nother\n"
                 completion = AsyncMock(side_effect=[self.response(), (output, "stop", self.response()[2])])
                 with self.assertRaises(review.ReviewAbort): self.run_adapter(completion)
                 self.assertEqual(2, completion.await_count)

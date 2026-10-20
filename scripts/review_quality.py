@@ -124,6 +124,10 @@ def adjudicate(data, bundle, answer):
             if (evidence["end_line"] > len(lines) or evidence["quote"] !=
                     "\n".join(lines[evidence["start_line"] - 1:evidence["end_line"]])):
                 raise QualityAbort("Finding evidence does not match the current source")
+            if (decision["candidate"] < len(data["review"]["key_issues_to_review"])
+                    and not (evidence["start_line"] <= candidate["line"]
+                             and candidate["end_line"] <= evidence["end_line"])):
+                raise QualityAbort("Finding evidence does not cover the inline source location")
         elif verdict == "duplicate":
             prior = roots.get(decision["prior_comment_id"]) if type(decision["prior_comment_id"]) is int else None
             if prior is None or prior["path"] != candidate["path"]:

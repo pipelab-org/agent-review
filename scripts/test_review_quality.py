@@ -38,6 +38,7 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(64, len(audit["context_sha256"]))
         for change in (dict(trigger=""), dict(consequence=None), dict(repair=""), dict(title=""),
                        dict(evidence=dict(path="src/file.py", start_line=2, end_line=2, quote="return old")),
+                       dict(evidence=dict(path="src/file.py", start_line=1, end_line=1, quote="def f():")),
                        dict(evidence=dict(path="src/file.py", start_line=True, end_line=2, quote="return new"))):
             d = decision(); d.update(change)
             with self.subTest(change=change), self.assertRaises(q.QualityAbort):
