@@ -21,9 +21,11 @@ from unittest.mock import patch
 if __package__:
     from .agent_review_contract import load_profile
     from . import review_followups as followups
+    from . import review_quality as quality
 else:
     from agent_review_contract import load_profile
     import review_followups as followups
+    import review_quality as quality
 
 PROFILE = Path(__file__).resolve().parents[1] / ".github" / "agent-review.toml"
 CONFIG = Path(__file__).resolve().parents[1] / ".github" / "pr-agent.toml"
@@ -529,20 +531,66 @@ async def review(settings):
             return await router.run(system, user, temperature, img_path)
 
     class Reviewer(PRReviewer):
+        async def _prepare_prediction(self, model):
+            # Reserve the final successful call for challenging all candidates.
+            # The existing aggregate ceiling and incomplete-coverage guard stay.
+            limit = settings.pr_reviewer.max_number_of_calls
+            if limit < 2:
+                raise ReviewAbort("Review budget cannot include a finding challenge")
+            settings.set("pr_reviewer.max_number_of_calls", limit - 1)
+            try:
+                await super()._prepare_prediction(model)
+            finally:
+                settings.set("pr_reviewer.max_number_of_calls", limit)
+            check_complete(self, router.calls, False)
+            data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
+            if not self._validate_review_schema(data):
+                raise ReviewAbort("Provider returned an invalid review schema")
+            self.check_binding(fresh=True)
+            candidates = result_findings(data)
+            self.retained_findings, self.quality_audit = [], {"decisions": []}
+            if not candidates:
+                return
+            try:
+                from pr_agent.algo.file_filter import filter_ignored
+                from pr_agent.algo.language_handler import is_valid_file
+                files = [f for f in filter_ignored(self.git_provider.get_diff_files()) if is_valid_file(f.filename)]
+                bundle = quality.context(self.check_binding(fresh=True), files, candidates)
+                user = json.dumps(bundle, sort_keys=True)
+                from pr_agent.algo.token_budget import AttemptTokenBudget
+                # Check the complete request for every remaining billing-only
+                # route. Never truncate evidence or hide unavailable context.
+                for route, _ in router.chain[router.index:]:
+                    budget = AttemptTokenBudget.for_attempt(route, self.token_handler)
+                    request = budget.prepare_request(self.ai_handler, quality.SYSTEM, user)
+                    if request.input_tokens > budget.input_token_limit(settings.config.max_output_tokens):
+                        raise ReviewAbort("Finding challenge context exceeds the existing token budget")
+                answer, _ = await router.run(quality.SYSTEM, user, settings.config.temperature, None)
+                self.prediction_data, self.retained_findings, self.quality_audit = quality.adjudicate(
+                    data, bundle, followups.strict_json(answer))
+            except (quality.QualityAbort, ValueError, TypeError) as error:
+                raise ReviewAbort("Finding challenge incomplete or invalid") from error
+
         def check_binding(self, fresh=False):
             provider = self.git_provider
             pr = provider.github_client.get_repo(repo).get_pull(int(number)) if fresh else provider.pr
             check_pull_request(pr, repo, head, base)
+            return pr
 
         def _prepare_pr_review(self):
             self.check_binding(fresh=True)
             data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
             if not self._validate_review_schema(data):
                 raise ReviewAbort("Provider returned an invalid review schema")
-            self.result_findings = result_findings(data)
+            self.result_findings = result_findings(data) + getattr(self, "retained_findings", [])
             result = super()._prepare_pr_review()
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
+            retained = getattr(self, "retained_findings", [])
+            if retained:
+                result += "\n\n### Existing findings and held decisions\n\n" + "\n\n".join(
+                    f"**{item['title']}**\n\n{item['body']}" for item in retained)
+                result += "\n\nThese remain unresolved; this run opens no duplicate inline thread."
             return result + f"\n\nReviewed base `{base}` and head `{head}`.\n\n{record}\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
 
 
@@ -642,7 +690,8 @@ async def review(settings):
     evidence = {"repository": repo, "number": int(number), "base": base, "head": head,
                 "depth": review_depth(), "key": key, "summary": summary.id,
                 "findings": reviewer.result_findings, "version": 2, "context": binding,
-                "scope": scope, "run_id": int(run_id), "roots": roots}
+                "scope": scope, "run_id": int(run_id), "roots": roots,
+                "quality": getattr(reviewer, "quality_audit", {"decisions": []})}
     manifest = result_manifest(evidence)
     line = result_comment(manifest)
     edit = getattr(summary, "edit", None)

@@ -14,6 +14,8 @@ Provider fallback happens only on an explicit billing rejection. Timeouts, rate 
 
 Josh or a current organization member can ask a follow-up question in this workflow's verified inline thread. GitHub membership, the unchanged triggering comment, the current PR snapshot, and the original root's workflow artifact must all verify before inference. Replies use the normal model policy and remain static text in the same thread. The model has no tools or configuration access.
 
+Candidate findings receive a separate evidence challenge before publication within the existing call ceiling. Repeated scenarios and held decisions remain visible without another inline thread.
+
 Model choice is operator policy, not a quality guarantee. Findings are advice and can be wrong. A completed run doesn't establish review quality or recall.
 
 ## Adopting it in a repository
