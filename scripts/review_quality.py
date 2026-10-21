@@ -14,6 +14,11 @@ import copy
 import hashlib
 import json
 
+if __package__:
+    from .agent_review_contract import source_lines
+else:
+    from agent_review_contract import source_lines
+
 
 class QualityAbort(Exception):
     pass
@@ -120,8 +125,8 @@ def adjudicate(data, bundle, answer):
                     or type(evidence["end_line"]) is not int or evidence["end_line"] < evidence["start_line"]
                     or not nonempty(evidence["quote"])):
                 raise QualityAbort("Published finding lacks current source evidence")
-            lines = bundle["sources"][evidence["path"]]["content"].splitlines()
-            if (evidence["end_line"] > len(lines) or evidence["quote"] !=
+            lines = source_lines(bundle["sources"][evidence["path"]]["content"])
+            if (evidence["end_line"] > len(lines) or evidence["quote"].replace("\r\n", "\n") !=
                     "\n".join(lines[evidence["start_line"] - 1:evidence["end_line"]])):
                 raise QualityAbort("Finding evidence does not match the current source")
             if (decision["candidate"] < len(data["review"]["key_issues_to_review"])

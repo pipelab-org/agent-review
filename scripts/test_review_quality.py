@@ -44,6 +44,47 @@ class QualityTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(q.QualityAbort):
                 q.adjudicate(self.data, self.bundle, {"decisions": [d]})
 
+    def test_source_separators_cannot_move_inline_evidence(self):
+        # Non-LF boundaries from Python's documented str.splitlines contract.
+        for separator in ("\v", "\f", "\r", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                bundle = copy.deepcopy(self.bundle)
+                bundle["sources"]["src/file.py"]["content"] = "first" + separator + "part\nTARGET\n"
+                d = decision()
+                d["evidence"]["quote"] = "part"
+                with self.assertRaises(q.QualityAbort):
+                    q.adjudicate(self.data, bundle, {"decisions": [d]})
+                d["evidence"]["quote"] = "TARGET"
+                result, _, _ = q.adjudicate(self.data, bundle, {"decisions": [d]})
+                self.assertEqual(2, result["review"]["key_issues_to_review"][0]["start_line"])
+                d["evidence"].update(start_line=1, quote="first" + separator + "part\nTARGET")
+                q.adjudicate(self.data, bundle, {"decisions": [d]})
+
+    def test_crlf_quotes_preserve_physical_lines_and_exact_content(self):
+        bundle = copy.deepcopy(self.bundle)
+        bundle["sources"]["src/file.py"]["content"] = "first\r\nTARGET\r\nlast\r\n"
+        for quote in ("first\r\nTARGET", "first\nTARGET"):
+            with self.subTest(quote=repr(quote)):
+                d = decision()
+                d["evidence"].update(start_line=1, quote=quote)
+                q.adjudicate(self.data, bundle, {"decisions": [d]})
+        for quote in ("first\r\nWRONG", "first\rTARGET", "first\nTARGET\n"):
+            d = decision()
+            d["evidence"].update(start_line=1, quote=quote)
+            with self.subTest(quote=repr(quote)), self.assertRaises(q.QualityAbort):
+                q.adjudicate(self.data, bundle, {"decisions": [d]})
+
+    def test_terminal_newline_does_not_create_an_evidence_line(self):
+        for source in ("first\nTARGET", "first\nTARGET\n", "first\r\nTARGET\r\n"):
+            bundle = copy.deepcopy(self.bundle)
+            bundle["sources"]["src/file.py"]["content"] = source
+            d = decision()
+            d["evidence"]["quote"] = "TARGET"
+            q.adjudicate(self.data, bundle, {"decisions": [d]})
+            d["evidence"].update(end_line=3, quote="TARGET\n")
+            with self.subTest(source=repr(source)), self.assertRaises(q.QualityAbort):
+                q.adjudicate(self.data, bundle, {"decisions": [d]})
+
     def test_repeats_and_holds_remain_findings_without_new_inline_issue(self):
         for verdict in ("duplicate", "acknowledged-decision"):
             d = decision(verdict=verdict)

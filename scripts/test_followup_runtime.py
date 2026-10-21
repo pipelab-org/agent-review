@@ -276,6 +276,24 @@ class FollowupRuntimeTests(unittest.TestCase):
         repo.get_contents.return_value = NS(type="file", encoding="base64", decoded_content=b"\xff")
         with self.assertRaises(UnicodeDecodeError): f.incremental_files(repo, start, HEAD)
 
+    def test_incremental_patch_keeps_source_line_boundaries(self):
+        from unittest.mock import MagicMock
+        repo = MagicMock()
+        start = "1" * 40
+        repo.compare.return_value = NS(base_commit=NS(sha=start), merge_base_commit=NS(sha=start), status="ahead",
+            files=[NS(filename="src/file.py", status="modified", additions=1, deletions=1)])
+        for separator in ("\f", "\u2028", "\r"):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(separator=repr(separator), newline=repr(newline)):
+                    old = ("first" + separator + "part" + newline + "old" + newline).encode()
+                    new = ("first" + separator + "part" + newline + "TARGET" + newline).encode()
+                    repo.get_contents.side_effect = lambda path, ref: NS(type="file", encoding="base64",
+                        decoded_content=new if ref == HEAD else old)
+                    file = f.incremental_files(repo, start, HEAD)[0]
+                    self.assertIn("@@ -1,2 +1,2 @@", file.patch)
+                    self.assertIn(" first" + separator + "part\n-old\n+TARGET\n", file.patch)
+                    self.assertEqual(new.decode(), file.head_file)
+
     def test_immutable_content_builds_existing_patch_objects_without_timestamp_anchor(self):
         from github import Auth, Github
         from github.Requester import Requester
