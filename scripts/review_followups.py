@@ -27,9 +27,9 @@ import zipfile
 from urllib.parse import urlparse
 
 if __package__:
-    from .agent_review_contract import MAX_DATA_BYTES
+    from .agent_review_contract import MAX_DATA_BYTES, source_lines
 else:
-    from agent_review_contract import MAX_DATA_BYTES
+    from agent_review_contract import MAX_DATA_BYTES, source_lines
 
 
 class FollowupAbort(Exception):
@@ -334,7 +334,7 @@ def incremental_files(repo, start, head):
         new = "" if file.status == "removed" else content(file.filename, head)
         # Rebuild the patch from exact contents, so omitted/truncated API patches
         # cannot silently drop changes. Non-UTF8 and unsupported objects fail.
-        patch = "\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(),
+        patch = "\n".join(difflib.unified_diff(source_lines(old), source_lines(new),
                       fromfile=previous or file.filename, tofile=file.filename, lineterm=""))
         if not patch:
             raise FollowupAbort("Metadata-only file changes require full review")

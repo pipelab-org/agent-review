@@ -65,6 +65,13 @@ jobs:
 """
 
 
+def source_lines(text):
+    """Count LF-delimited source lines, accepting CRLF without an extra EOF line."""
+    if not text:
+        return []
+    return text.replace("\r\n", "\n").removesuffix("\n").split("\n")
+
+
 def read_data(path):
     """Read bounded UTF-8 data without following any path-component symlink."""
     path = pathlib.Path(path)
