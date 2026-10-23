@@ -487,6 +487,22 @@ review:
         self.assertEqual(2, completion.await_count)
         self.assertEqual([], self.completion_evidence()["findings"])
 
+    def test_unchanged_consumer_finding_is_in_summary_and_completion_not_inline(self):
+        candidate = self.output.replace("source_requests: []\n", "").replace("src/file.py", "src/consumer.py")
+        self.output = "source_requests: [src/consumer.py]\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
+        repo = self.provider.github_client.get_repo.return_value
+        repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={}, decoded_content=b"broken_consumer()\n")
+        d = decision(); d["evidence"].update(path="src/consumer.py", start_line=1, end_line=1, quote="broken_consumer()")
+        completion = AsyncMock(side_effect=[self.response(), (candidate, "stop", self.response()[2]), self.challenged(d)])
+        self.run_adapter(completion)
+        self.assertEqual(3, completion.await_count)
+        self.provider.publish_code_suggestions.assert_not_called()
+        self.assertIn("Verified findings in related source", self.summary_publish.call_args.args[0])
+        findings = self.completion_evidence()["findings"]
+        self.assertEqual(1, len(findings))
+        self.assertEqual("src/consumer.py", findings[0]["path"])
+        self.assertEqual(1, findings[0]["line"])
+
     def test_challenge_reads_whole_candidate_file_and_rejects_absence_speculation(self):
         self.provider.get_diff_files.return_value[0].head_file = "existing_guard()\nnew\n"
         d = decision(verdict="unsupported")

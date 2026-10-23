@@ -40,8 +40,12 @@ change alone is not a defect. Ignore style and hypothetical hardening suggestion
 Return YAML with the same review mapping: relevant_tests (string),
 security_concerns (exact 'No' when absent), key_issues_to_review (list of mappings
 with relevant_file, issue_header, issue_content, start_line, end_line).
-Each issue must anchor in a changed file and identify a concrete trigger,
-consequence and repair supported by supplied source. An empty list is valid.
+Each issue must identify its real source location and a concrete trigger,
+consequence and repair caused by this diff and supported by supplied source.
+Prefer the changed line when it is the actual defect location. Findings in an
+unchanged requested consumer can use that real location for summary publication;
+do not invent a changed-line anchor. Unrelated pre-existing defects are out of
+scope. An empty list is valid.
 The supplied candidates are the preliminary review's findings: report only
 additional defects and never restate one. The independent publication challenge
 will account for every candidate from both passes; do not interpret an omitted

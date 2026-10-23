@@ -44,6 +44,33 @@ class QualityTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(q.QualityAbort):
                 q.adjudicate(self.data, self.bundle, {"decisions": [d]})
 
+    def test_same_run_duplicate_requires_a_surviving_earlier_finding(self):
+        self.bundle["candidates"].append(dict(self.finding, title="Reworded"))
+        self.data["review"]["key_issues_to_review"].append(dict(self.data["review"]["key_issues_to_review"][0], issue_header="Reworded"))
+        d = dict(decision(1, "duplicate-candidate"), duplicate_candidate=0)
+        result, _, audit = q.adjudicate(self.data, self.bundle, {"decisions": [decision(), d]})
+        self.assertEqual(1, len(result["review"]["key_issues_to_review"]))
+        self.assertEqual("duplicate-candidate", audit["decisions"][1]["verdict"])
+        for prior in (True, -1, 1, 2, None):
+            with self.subTest(prior=prior), self.assertRaises(q.QualityAbort):
+                q.adjudicate(self.data, self.bundle, {"decisions": [decision(), dict(d, duplicate_candidate=prior)]})
+        with self.assertRaises(q.QualityAbort):
+            q.adjudicate(self.data, self.bundle, {"decisions": [decision(verdict="unsupported"), d]})
+
+    def test_requested_unchanged_source_is_verified_and_kept_in_summary(self):
+        self.finding["path"] = "src/consumer.py"
+        self.data["review"]["key_issues_to_review"][0]["relevant_file"] = "src/consumer.py"
+        evidence = {"src/consumer.py": {"content": "def f():\nreturn new\n", "patch": ""}}
+        bundle = q.context(self.pr, self.files, [self.finding], extra_sources=evidence)
+        d = decision(); d["evidence"]["path"] = "src/consumer.py"
+        result, retained, audit = q.adjudicate(self.data, bundle, {"decisions": [d]})
+        self.assertEqual([], result["review"]["key_issues_to_review"])
+        self.assertEqual([], retained)
+        self.assertEqual("src/consumer.py", audit["summary_findings"][0]["path"])
+        d["evidence"]["quote"] = "invented source"
+        with self.assertRaises(q.QualityAbort):
+            q.adjudicate(self.data, bundle, {"decisions": [d]})
+
     def test_source_separators_cannot_move_inline_evidence(self):
         # Non-LF boundaries from Python's documented str.splitlines contract.
         for separator in ("\v", "\f", "\r", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):

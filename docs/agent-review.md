@@ -126,3 +126,9 @@ Consumers must validate every parent back to a completed full review under the s
 An incremental run's findings describe only its delta. It doesn't independently certify a full-head review, close earlier findings, or resolve old threads. Sweep consumers must retain earlier findings across the verified chain and inspect thread resolution separately. Consumers that understand only v1 full-review records must reject incremental v2 records until they implement chain validation.
 
 Before adoption, live proof still needs real provider acceptance, Actions artifact visibility and run metadata, membership permissions, default-branch and merge-ref caller composition, current-head inline publication, and cross-repository operation. Offline fixtures don't establish any of those account-level conditions.
+
+### Related-source findings and repeated candidates
+
+A verified defect caused by the diff can be located in an unchanged requested consumer. Such findings stay in the summary and structured completion with their real source locations; they do not create an inline thread on a fabricated changed line. The same source-quote and failure-scenario checks apply. Unrequested or unavailable source cannot support publication.
+
+The challenge can mark a candidate as `duplicate-candidate` only by naming an earlier candidate that it also publishes. The disposition records the shared failure scenario. Self-references, forward references and references to discarded candidates fail validation. This avoids relying only on exact wording to identify repeats between the two discovery passes.

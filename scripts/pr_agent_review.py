@@ -625,10 +625,7 @@ async def review(settings):
                 self.prediction_data = data
                 candidates = result_findings(data)
                 evidence = bundle["sources"]
-                bundle = quality.context(self.check_binding(fresh=True), files, candidates, content)
-                for path, source in evidence.items():
-                    # Keep the candidate file's patch; only add files the rebuild lacks.
-                    bundle["sources"].setdefault(path, source)
+                bundle = quality.context(self.check_binding(fresh=True), files, candidates, content, evidence)
                 bundle["unavailable_requests"] = unavailable
                 self.quality_audit["discovery"] = {"declared": declared, "requested_paths": paths,
                                                    "source_paths": sorted(evidence),
@@ -668,10 +665,15 @@ async def review(settings):
             data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
             if not self._validate_review_schema(data):
                 raise ReviewAbort("Provider returned an invalid review schema")
-            self.result_findings = result_findings(data) + getattr(self, "retained_findings", [])
+            summary_findings = getattr(self, "quality_audit", {}).get("summary_findings", [])
+            self.result_findings = result_findings(data) + getattr(self, "retained_findings", []) + summary_findings
             result = super()._prepare_pr_review()
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
+            if summary_findings:
+                result += "\n\n### Verified findings in related source\n\n" + "\n\n".join(
+                    f"**{item['title']}** ({item['path']}:{item['line']})\n\n{item['body']}"
+                    for item in summary_findings)
             retained = getattr(self, "retained_findings", [])
             if retained:
                 result += "\n\n### Existing findings and held decisions\n\n" + "\n\n".join(
