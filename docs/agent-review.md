@@ -133,4 +133,4 @@ A verified defect caused by the diff can be located in an unchanged requested co
 
 The challenge can mark a candidate as `duplicate-candidate` only by naming an earlier candidate that it also publishes. The disposition records the shared failure scenario. Self-references, forward references and references to discarded candidates fail validation. A duplicate security concern remains visible as a security concern. This avoids relying only on exact wording to identify repeats between the two discovery passes.
 
-Completion evidence and the bound summary must fit the existing data budget before the status can become successful. Summary-only and retained findings replace the renderer's all-clear labels with a reference to the remaining findings.
+Completion evidence and the bound summary must fit the existing data budget before the status can become successful. Summary-only and retained findings replace the renderer's issue all-clear label with a reference to the remaining findings. Unavailable source is disclosed in the summary and qualifies the assessment; a correctness finding alone does not imply a security concern.

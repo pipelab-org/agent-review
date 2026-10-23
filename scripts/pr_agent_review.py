@@ -641,6 +641,7 @@ async def review(settings):
                 self.prediction_data, self.retained_findings, audit = quality.adjudicate(
                     data, bundle, followups.strict_json(answer))
                 self.quality_audit.update(audit)
+                self.quality_audit["unavailable_sources"] = {p: reason for p, reason in bundle["unavailable_requests"].items() if p not in unavailable}
             except (quality.QualityAbort, discovery.DiscoveryAbort, ValueError, TypeError) as error:
                 raise ReviewAbort("Source discovery or finding challenge incomplete or invalid") from error
 
@@ -675,7 +676,12 @@ async def review(settings):
             if summary_findings or getattr(self, "retained_findings", []):
                 # These exact labels come from the pinned PR-Agent renderer.
                 result = result.replace("No major issues detected", "Findings remain; see the findings below")
-                result = result.replace("No security concerns identified", "See findings below for remaining concerns")
+            audit = getattr(self, "quality_audit", {})
+            unavailable = audit.get("unavailable_sources", {}) or audit.get("discovery", {}).get("unavailable_requests", {})
+            if unavailable:
+                result = result.replace("No major issues detected", "No verified findings; source context was incomplete")
+                result = result.replace("No security concerns identified", "Security assessment limited by unavailable source")
+                result += "\n\n### Source limitations\n\nSome source could not be inspected. Unsupported candidates were not published; this review is limited to the supplied evidence."
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
             if summary_findings:

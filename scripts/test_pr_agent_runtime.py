@@ -558,6 +558,20 @@ review:
         self.assertEqual(2, completion.await_count)
         self.assertEqual([], self.completion_evidence()["findings"])
 
+    def test_missing_candidate_source_is_visible_without_publishing_it(self):
+        candidate = self.output.replace("source_requests: []\n", "").replace("src/file.py", "src/missing.py")
+        self.output = "source_requests: []\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
+        d = decision(verdict="unsupported")
+        d["reason"] = "Source was not supplied."
+        completion = AsyncMock(side_effect=[self.response(), (candidate, "stop", self.response()[2]), self.challenged(d)])
+        self.run_adapter(completion)
+        self.assertEqual([], self.completion_evidence()["findings"])
+        body = self.summary_publish.call_args.args[0]
+        self.assertIn("Source limitations", body)
+        self.assertNotIn("No major issues detected", body)
+        self.assertNotIn("No security concerns identified", body)
+        self.assertIn("src/missing.py", self.completion_evidence()["quality"]["unavailable_sources"])
+
     def test_unchanged_consumer_finding_is_in_summary_and_completion_not_inline(self):
         candidate = self.output.replace("source_requests: []\n", "").replace("src/file.py", "src/consumer.py")
         self.output = "source_requests: [src/consumer.py]\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
@@ -574,7 +588,7 @@ review:
         self.assertEqual("src/consumer.py", findings[0]["path"])
         self.assertEqual(1, findings[0]["line"])
         self.assertNotIn("No major issues detected", self.summary_publish.call_args.args[0])
-        self.assertNotIn("No security concerns identified", self.summary_publish.call_args.args[0])
+        self.assertIn("No security concerns identified", self.summary_publish.call_args.args[0])
         challenge = json.loads(completion.await_args.kwargs["messages"][1]["content"])
         self.assertIn("src/file.py", challenge["diff"])
 
