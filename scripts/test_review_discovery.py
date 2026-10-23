@@ -12,6 +12,20 @@ class DiscoveryTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(discovery.DiscoveryAbort):
                 discovery.requested_paths({"source_requests": value})
 
+    def test_a_leading_dot_slash_is_normalized_and_other_invalid_strings_are_named(self):
+        named = {}
+        self.assertEqual(["src/a.py"], discovery.requested_paths({"source_requests": ["./src/a.py", "src/a.py"]}, named))
+        self.assertEqual({}, named)
+        for value in ("././a", "./", "../a", "/a", "a//b", "a\\b", "src/", ""):
+            named = {}
+            with self.subTest(value=value):
+                self.assertEqual([], discovery.requested_paths({"source_requests": [value]}, named))
+                self.assertEqual({value: "invalid repository-relative file path"}, named)
+        # Only invalid strings are tolerated: an entry that is not a string stays fatal.
+        for value in ([1], [None], [["a"]], [{"p": "a"}], "a"):
+            with self.subTest(value=value), self.assertRaises(discovery.DiscoveryAbort):
+                discovery.requested_paths({"source_requests": value}, {})
+
     def test_source_read_is_revision_bound_and_rejects_nonfiles(self):
         repo = Mock()
         repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={}, decoded_content=b"guard()")

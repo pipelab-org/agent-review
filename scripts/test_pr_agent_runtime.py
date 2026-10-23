@@ -403,6 +403,30 @@ review:
         self.assertEqual(3, completion.await_count)
         source = self.bundles(completion)["challenge"][1]["sources"]["src/file.py"]
         self.assertEqual("@@ -1 +1 @@\n-old\n+new\n", source["patch"])
+        # The discovery call carries every patch; the challenge of a changed-file candidate
+        # needs only that file's own patch, and the rest could exhaust its request budget.
+        self.assertIn("diff", self.bundles(completion)["discovery"][1])
+        self.assertNotIn("diff", self.bundles(completion)["challenge"][1])
+
+    def test_source_supplied_for_a_preliminary_candidate_is_not_also_reported_unavailable(self):
+        # The first pass can name an unchanged file before the model's own source request
+        # for it is read. Once supplied, the model must not be told it was not.
+        first = ("source_requests: [src/consumer.py]\n" + self.output.split("\n", 1)[1]).replace(
+            "src/file.py", "src/consumer.py")
+        repo = self.provider.github_client.get_repo.return_value
+        repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={},
+                                            decoded_content=b"broken_consumer()\n")
+        d = decision(); d["evidence"].update(path="src/consumer.py", start_line=1, end_line=1, quote="broken_consumer()")
+        completion = AsyncMock(side_effect=[(first, "stop", self.response()[2]),
+                                            (self.CLEAN, "stop", self.response()[2]), self.challenged(d)])
+        self.run_adapter(completion)
+        bundles = self.bundles(completion)
+        for name in ("discovery", "challenge"):
+            self.assertIn("src/consumer.py", bundles[name][1]["sources"])
+            self.assertEqual({}, bundles[name][1]["unavailable_requests"])
+        self.assertEqual({}, self.completion_evidence()["quality"]["discovery"]["unavailable_requests"])
+        self.assertEqual("src/consumer.py", self.completion_evidence()["findings"][0]["path"])
+        self.assertIn("src/file.py", bundles["challenge"][1]["diff"])
 
     def test_first_pass_candidates_survive_a_clean_second_pass_into_the_challenge(self):
         completion = self.answering(discovery=self.CLEAN)
@@ -497,6 +521,35 @@ review:
                         self.run_adapter(completion)
                     repo.get_contents.assert_not_called()
                     completion.assert_awaited_once()
+
+    def test_invalid_requests_count_toward_the_same_cap_without_any_read(self):
+        # They are never read, but each is recorded and sent back to the model.
+        from pr_agent.git_providers.github_provider import MAX_FILES_ALLOWED_FULL
+        for count, allowed in ((MAX_FILES_ALLOWED_FULL, True), (MAX_FILES_ALLOWED_FULL + 1, False)):
+            with self.subTest(count=count):
+                self.setUp()
+                repo = self.provider.github_client.get_repo.return_value
+                paths = [f"../bad_{i}" for i in range(count)]
+                self.output = self.output.replace("source_requests: []", f"source_requests: {json.dumps(paths)}")
+                completion = self.answering()
+                if allowed:
+                    self.run_adapter(completion)
+                    self.assertEqual(count, len(self.completion_evidence()["quality"]["discovery"]["unavailable_requests"]))
+                else:
+                    with self.assertRaises(review.ReviewAbort):
+                        self.run_adapter(completion)
+                    completion.assert_awaited_once()
+                repo.get_contents.assert_not_called()
+
+    def test_summary_over_the_data_budget_is_refused_before_any_success_transition(self):
+        # Fits the evidence cap as raw JSON but not once encoded into the summary comment.
+        paths = ["a\\" + "x" * 1050 + str(i) for i in range(50)]
+        self.output = self.output.replace("source_requests: []", f"source_requests: {json.dumps(paths)}")
+        self.settings.config.max_model_tokens = 1000000
+        with self.assertRaisesRegex(review.ReviewAbort, "summary exceeds"):
+            self.run_adapter(self.answering())
+        self.status.edit.assert_not_called()
+        self.assertNotIn("agent-review-result", self.summary_publish.return_value.body)
 
     def test_clean_source_discovery_uses_two_calls_and_no_challenge(self):
         self.output = "source_requests: []\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"

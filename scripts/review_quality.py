@@ -103,14 +103,21 @@ def context(pr, files, findings, content=lambda file: file.head_file, extra_sour
         raise
     except Exception as error:
         raise QualityAbort("Prior review context could not be read") from error
-    return {"description": description, "threads": sorted(threads, key=lambda c: c["id"]),
-            "reviewable_files": sorted(inventory), "sources": sources, "candidates": findings,
-            "unavailable_requests": unavailable, "diff": {f.filename: f.patch for f in files}}
+    bundle = {"description": description, "threads": sorted(threads, key=lambda c: c["id"]),
+              "reviewable_files": sorted(inventory), "sources": sources, "candidates": findings,
+              "unavailable_requests": unavailable}
+    # A finding in unchanged source must show how this diff causes it, which needs the
+    # whole diff. A changed file's own patch is already in sources, so only supply every
+    # patch when such a finding can be published: on a large pull request they alone
+    # can exhaust the request budget before the challenge call.
+    if any(path in sources and path not in inventory for path in paths):
+        bundle["diff"] = {f.filename: f.patch for f in files}
+    return bundle
 
 
 def inline_location(candidate, bundle):
     """Git unified-diff new-side ranges; GitHub inline lines must lie in a hunk."""
-    patch = bundle.get("diff", {}).get(candidate["path"], "")
+    patch = bundle["sources"].get(candidate["path"], {}).get("patch", "")
     for line in source_lines(patch):
         match = re.match(r"^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,([0-9]+))? @@", line)
         if match:

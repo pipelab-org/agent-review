@@ -179,14 +179,26 @@ class QualityTests(unittest.TestCase):
         bundle = copy.deepcopy(self.bundle); bundle["candidates"] *= 2
         with self.assertRaises(q.QualityAbort): q.adjudicate(self.data, bundle, {"decisions": [decision(), decision()]})
 
-    def test_out_of_hunk_finding_uses_summary_and_challenge_has_all_patches(self):
+    def test_out_of_hunk_finding_uses_summary_and_keeps_the_challenge_within_its_budget(self):
         self.files.append(NS(filename="src/caller.py", head_file="changed()", patch="@@ -1 +1 @@\n-old()\n+changed()"))
         self.files[0].patch = "@@ -1 +1 @@\n-old\n+def f():"
         bundle = q.context(self.pr, self.files, [self.finding])
-        self.assertEqual(self.files[1].patch, bundle["diff"]["src/caller.py"])
+        # The candidate's own patch is in sources; every other patch would only spend
+        # request budget (a 47-file pull request overran it with them).
+        self.assertNotIn("diff", bundle)
+        self.assertEqual(self.files[0].patch, bundle["sources"]["src/file.py"]["patch"])
         result, _, audit = q.adjudicate(self.data, bundle, {"decisions": [decision()]})
         self.assertEqual([], result["review"]["key_issues_to_review"])
         self.assertEqual(2, audit["summary_findings"][0]["line"])
+
+    def test_finding_in_unchanged_source_gets_every_patch_to_show_causation(self):
+        self.files.append(NS(filename="src/caller.py", head_file="changed()", patch="@@ -1 +1 @@\n-old()\n+changed()"))
+        self.finding["path"] = "src/consumer.py"
+        bundle = q.context(self.pr, self.files, [self.finding],
+                           extra_sources={"src/consumer.py": {"content": "def f():\nreturn new\n", "patch": ""}})
+        self.assertEqual({f.filename: f.patch for f in self.files}, bundle["diff"])
+        # A candidate whose source was never supplied cannot be published, so it adds no diff.
+        self.assertNotIn("diff", q.context(self.pr, self.files, [self.finding]))
 
     def test_security_duplicate_retains_the_security_concern(self):
         self.bundle["candidates"].append(dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence"))
@@ -195,6 +207,14 @@ class QualityTests(unittest.TestCase):
         result, _, _ = q.adjudicate(self.data, self.bundle, {"decisions": [decision(), d]})
         self.assertIn("Security consequence", result["review"]["security_concerns"])
         self.assertEqual(1, len(result["review"]["key_issues_to_review"]))
+
+    def test_a_held_security_concern_stays_visible_as_a_concern(self):
+        self.bundle["candidates"].append(dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence"))
+        self.data["review"]["security_concerns"] = "Security consequence"
+        d = decision(1, "acknowledged-decision"); d["description_quote"] = self.pr.body
+        result, retained, _ = q.adjudicate(self.data, self.bundle, {"decisions": [decision(), d]})
+        self.assertEqual("Security consequence", result["review"]["security_concerns"])
+        self.assertEqual(1, len(retained))
 
     def test_source_context_read_failure_and_unknown_security_findings(self):
         missing = q.context(self.pr, [], [self.finding])
