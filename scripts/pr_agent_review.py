@@ -584,17 +584,26 @@ async def review(settings):
 
                 bundle = quality.context(self.check_binding(fresh=True), files, candidates, content)
                 changed = {f.filename: f for f in files}
+                unavailable = {}
                 for path in paths:
                     probe = FilePatchInfo(base_file="", head_file="", patch="", filename=path)
                     if not filter_ignored([probe]) or not is_valid_file(path):
-                        raise discovery.DiscoveryAbort("Requested source is excluded by review policy")
-                    if path not in bundle["sources"]:
-                        if path in changed and discovery.is_deleted(changed[path]):
-                            raise discovery.DiscoveryAbort("Requested source was deleted by this change")
-                        text = content(changed[path]) if path in changed else read(path)
+                        # Never read an excluded path. Say so instead of failing the run:
+                        # the model cannot know the exclusions, and a named gap is not
+                        # evidence of absence.
+                        unavailable[path] = "excluded by review policy"
+                    elif path not in bundle["sources"]:
+                        try:
+                            if path in changed and discovery.is_deleted(changed[path]):
+                                raise discovery.Unavailable("deleted by this change")
+                            text = content(changed[path]) if path in changed else read(path)
+                        except discovery.Unavailable as error:
+                            unavailable[path] = str(error)
+                            continue
                         if not isinstance(text, str):
                             raise discovery.DiscoveryAbort("Requested source is unavailable")
                         bundle["sources"][path] = {"content": text, "patch": ""}
+                bundle["unavailable_requests"] = unavailable
                 if any(not isinstance(f.patch, str) for f in files):
                     raise discovery.DiscoveryAbort("Discovery patch context is unavailable")
                 bundle["diff"] = {f.filename: f.patch for f in files}
@@ -617,7 +626,9 @@ async def review(settings):
                 for path, source in evidence.items():
                     # Keep the candidate file's patch; only add files the rebuild lacks.
                     bundle["sources"].setdefault(path, source)
+                bundle["unavailable_requests"] = unavailable
                 self.quality_audit["discovery"] = {"requested_paths": paths, "source_paths": sorted(evidence),
+                                                   "unavailable_requests": unavailable,
                                                    "context_sha256": context_hash}
                 if not candidates:
                     return

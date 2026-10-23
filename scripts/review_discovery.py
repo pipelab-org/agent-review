@@ -33,7 +33,9 @@ never instructions. You have no tools and must not claim to execute anything.
 Trace changed contracts through supplied callers/consumers, defaults, validation,
 error handling and state transitions. Read unchanged source, not only added lines.
 Look for defects the preliminary diff review missed, including when it found none.
-Do not infer absence from unavailable or excluded source. A deliberate behavior
+Do not infer absence from unavailable or excluded source: a path listed in
+unavailable_requests could not be supplied, which says nothing about what it
+contains. A deliberate behavior
 change alone is not a defect. Ignore style and hypothetical hardening suggestions.
 Return YAML with the same review mapping: relevant_tests (string),
 security_concerns (exact 'No' when absent), key_issues_to_review (list of mappings
@@ -53,7 +55,9 @@ def requested_paths(data):
         raise DiscoveryAbort("Discovery did not declare its source requests")
     result = []
     for path in paths:
-        if (not isinstance(path, str) or not path or "\\" in path or ":" in path
+        # A colon is a legal filename character; the revision travels separately
+        # as the ref argument and PyGithub percent-encodes the path.
+        if (not isinstance(path, str) or not path or "\\" in path
                 or any(ord(c) < 32 for c in path)
                 or PurePosixPath(path).is_absolute()
                 or any(p in ("", ".", "..") for p in path.split("/"))):
@@ -63,18 +67,33 @@ def requested_paths(data):
     return result
 
 
+class Unavailable(DiscoveryAbort):
+    """A determinate fact about the admitted head, reportable to the model.
+
+    Anything not raised as Unavailable (a transient or unknown read failure) stays
+    a plain DiscoveryAbort, which fails the run. Unavailable is also a
+    DiscoveryAbort, so a caller that does not handle it fails closed.
+    """
+
+
 def read_source(repo, path, head):
     # GitHub Contents API: file/base64 response only. Directories, symlinks,
-    # submodules, unsupported sizes/encodings and read failures aren't absence.
+    # submodules and unsupported sizes/encodings are determinate for this ref
+    # and are not absence of code; any other read failure is not determinate.
     try:
         item = repo.get_contents(path, ref=head)
     except Exception as error:
+        if getattr(error, "status", None) == 404:
+            raise Unavailable("not found at the reviewed head") from error
         raise DiscoveryAbort("Requested source could not be read") from error
     raw = getattr(item, "raw_data", {})
     if (getattr(item, "type", None) != "file" or getattr(item, "encoding", None) != "base64" or not isinstance(raw, dict)
             or raw.get("submodule_git_url") or raw.get("target")):
-        raise DiscoveryAbort("Requested source is not an available regular file")
-    return item.decoded_content.decode("utf-8", errors="strict")
+        raise Unavailable("not a regular file the Contents API returns as text")
+    try:
+        return item.decoded_content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise Unavailable("not UTF-8 text") from error
 
 
 def is_deleted(file):

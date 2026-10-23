@@ -17,11 +17,27 @@ class DiscoveryTests(unittest.TestCase):
         repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={}, decoded_content=b"guard()")
         self.assertEqual("guard()", discovery.read_source(repo, "src/a.py", "a" * 40))
         repo.get_contents.assert_called_once_with("src/a.py", ref="a" * 40)
-        for item in ([], NS(type="dir"), NS(type="file", encoding="none"),
-                     NS(type="file", encoding="base64", raw_data={"submodule_git_url": "remote"})):
+        for item in ([], NS(type="dir"), NS(type="symlink"), NS(type="file", encoding="none"),
+                     NS(type="file", encoding="base64", raw_data={"target": "elsewhere"}),
+                     NS(type="file", encoding="base64", raw_data={"submodule_git_url": "remote"}),
+                     NS(type="file", encoding="base64", raw_data={}, decoded_content=b"\xff")):
             repo.get_contents.return_value = item
-            with self.assertRaises(discovery.DiscoveryAbort):
+            with self.assertRaises(discovery.Unavailable):
                 discovery.read_source(repo, "src/a.py", "a" * 40)
+        for failure in (OSError("network"), type("Failure", (Exception,), {"status": 500})(), Exception("unknown")):
+            repo.get_contents.side_effect = failure
+            with self.assertRaises(discovery.DiscoveryAbort) as raised:
+                discovery.read_source(repo, "src/a.py", "a" * 40)
+            self.assertNotIsInstance(raised.exception, discovery.Unavailable)
+        repo.get_contents.side_effect = type("NotFound", (Exception,), {"status": 404})()
+        with self.assertRaises(discovery.Unavailable):
+            discovery.read_source(repo, "src/a.py", "a" * 40)
+
+    def test_a_colon_is_a_legal_filename_character_but_urls_stay_invalid(self):
+        self.assertEqual(["docs/a:b.md"], discovery.requested_paths({"source_requests": ["docs/a:b.md"]}))
+        for value in ("https://api.vendor.example/a", "file:///etc/passwd", "//host/share"):
+            with self.subTest(value=value), self.assertRaises(discovery.DiscoveryAbort):
+                discovery.requested_paths({"source_requests": [value]})
 
     def test_unloaded_head_content_is_read_but_loaded_and_deleted_files_are_not(self):
         read = Mock(return_value="from head")

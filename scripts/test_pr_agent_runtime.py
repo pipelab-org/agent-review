@@ -292,23 +292,60 @@ review:
             bundle = json.loads(call.kwargs["messages"][1]["content"])
             self.assertEqual("existing_guard()\n", bundle["sources"]["src/consumer.py"]["content"])
 
-    def test_missing_or_excluded_requested_source_never_produces_clean_success(self):
-        for excluded in (False, True):
-            with self.subTest(excluded=excluded):
+    def test_transient_or_unknown_source_read_failure_never_produces_success(self):
+        from github import GithubException
+        for failure in (OSError("fixture read failure"), GithubException(403, {"message": "rate limited"}),
+                        GithubException(500, {"message": "server error"})):
+            with self.subTest(failure=repr(failure)):
                 self.setUp()
                 self.output = self.output.replace("source_requests: []", "source_requests: [src/consumer.py]")
-                repo = self.provider.github_client.get_repo.return_value
-                repo.get_contents.side_effect = OSError("fixture read failure")
-                if excluded:
-                    self.settings.set("ignore.glob", ["**/consumer.py"])
+                self.provider.github_client.get_repo.return_value.get_contents.side_effect = failure
                 completion = AsyncMock(return_value=self.response())
                 with self.assertRaises(review.ReviewAbort):
                     self.run_adapter(completion)
                 completion.assert_awaited_once()
                 self.summary_publish.assert_not_called()
                 self.status.edit.assert_not_called()
-                if excluded:
+
+    def test_determinately_unavailable_requests_are_named_to_the_model_not_fatal(self):
+        from github import GithubException
+        from pr_agent.algo.types import EDIT_TYPE
+        directory = NS(type="dir", encoding=None, raw_data={})
+
+        def delete_file(repo):
+            file = self.provider.get_diff_files.return_value[0]
+            file.head_file, file.edit_type, file.patch = "", EDIT_TYPE.DELETED, "@@ -1 +0,0 @@\n-old\n"
+
+        cases = {
+            "not found": ("src/consumer.py", "not found at the reviewed head", lambda repo: setattr(
+                repo.get_contents, "side_effect", GithubException(404, {"message": "Not Found"}))),
+            "directory": ("src/consumer.py", "not a regular file the Contents API returns as text", lambda repo: setattr(
+                repo.get_contents, "return_value", [directory])),
+            "not text": ("src/consumer.py", "not UTF-8 text", lambda repo: setattr(
+                repo.get_contents, "return_value", NS(type="file", encoding="base64", raw_data={},
+                                                      decoded_content=b"\xff\xfe"))),
+            "excluded": ("src/consumer.py", "excluded by review policy",
+                         lambda repo: self.settings.set("ignore.glob", ["**/consumer.py"])),
+            "deleted": ("src/file.py", "deleted by this change", delete_file),
+        }
+        for name, (path, reason, arrange) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                repo = self.provider.github_client.get_repo.return_value
+                arrange(repo)
+                self.output = self.output.replace("source_requests: []", f"source_requests: [{path}]")
+                if name == "deleted":
+                    # The deleted file carries no candidate, so the run needs no anchor.
+                    self.output = f"source_requests: [{path}]\n" + self.CLEAN
+                completion = self.answering()
+                self.run_adapter(completion)
+                if name == "excluded":
                     repo.get_contents.assert_not_called()
+                bundles = self.bundles(completion)
+                for call in ("discovery",) + (("challenge",) if "challenge" in bundles else ()):
+                    self.assertEqual({path: reason}, bundles[call][1]["unavailable_requests"])
+                    self.assertNotIn(path, bundles[call][1]["sources"])
+                self.assertEqual({path: reason}, self.completion_evidence()["quality"]["discovery"]["unavailable_requests"])
 
     CLEAN = "review:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
 
@@ -357,18 +394,6 @@ review:
             self.assertEqual("loaded_at_head()\n", bundles[name][1]["sources"]["src/file.py"]["content"])
         discovery = self.completion_evidence()["quality"]["discovery"]
         self.assertEqual(hashlib.sha256(bundles["discovery"][0].encode()).hexdigest(), discovery["context_sha256"])
-
-    def test_deleted_changed_file_is_never_presented_as_empty_source(self):
-        from pr_agent.algo.types import EDIT_TYPE
-        file = self.provider.get_diff_files.return_value[0]
-        file.head_file, file.edit_type, file.patch = "", EDIT_TYPE.DELETED, "@@ -1 +0,0 @@\n-old\n"
-        self.output = "source_requests: [src/file.py]\n" + self.CLEAN
-        completion = self.answering()
-        with self.assertRaises(review.ReviewAbort):
-            self.run_adapter(completion)
-        self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
-        completion.assert_awaited_once()
-        self.status.edit.assert_not_called()
 
     def test_requested_changed_file_keeps_its_patch_when_second_pass_adds_a_candidate(self):
         candidate = self.output
