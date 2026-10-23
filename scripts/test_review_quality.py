@@ -57,6 +57,28 @@ class QualityTests(unittest.TestCase):
         with self.assertRaises(q.QualityAbort):
             q.adjudicate(self.data, self.bundle, {"decisions": [decision(verdict="unsupported"), d]})
 
+    def test_same_run_duplicate_index_must_be_an_exact_integer(self):
+        # True and False equal 1 and 0 and 1.0 and 0.0 hash like them, so only an
+        # exact type check stops them from naming candidates 1 and 0. Candidate 2
+        # lets True/1.0 resolve to a real earlier index, which a range check cannot catch.
+        for _ in range(2):
+            self.bundle["candidates"].append(dict(self.finding, title="Reworded"))
+            self.data["review"]["key_issues_to_review"].append(
+                dict(self.data["review"]["key_issues_to_review"][0], issue_header="Reworded"))
+
+        def decisions(candidate, prior):
+            kept = [decision(i) for i in range(3) if i != candidate]
+            kept.insert(candidate, dict(decision(candidate, "duplicate-candidate"), duplicate_candidate=prior))
+            return {"decisions": kept}
+
+        for candidate, prior in ((1, 0), (2, 1)):
+            with self.subTest(candidate=candidate, prior=prior):
+                result, _, _ = q.adjudicate(self.data, self.bundle, decisions(candidate, prior))
+                self.assertEqual(2, len(result["review"]["key_issues_to_review"]))
+        for candidate, prior in ((1, False), (2, True), (2, 1.0), (1, 0.0), (2, "1")):
+            with self.subTest(candidate=candidate, prior=prior), self.assertRaises(q.QualityAbort):
+                q.adjudicate(self.data, self.bundle, decisions(candidate, prior))
+
     def test_requested_unchanged_source_is_verified_and_kept_in_summary(self):
         self.finding["path"] = "src/consumer.py"
         self.data["review"]["key_issues_to_review"][0]["relevant_file"] = "src/consumer.py"
