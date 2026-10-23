@@ -175,7 +175,7 @@ def adjudicate(data, bundle, answer):
                 raise QualityAbort("Duplicate candidate must name an earlier candidate")
         elif verdict == "duplicate":
             prior = roots.get(decision["prior_comment_id"]) if type(decision["prior_comment_id"]) is int else None
-            if prior is None or prior["path"] != candidate["path"]:
+            if prior is None or (candidate["path"] != "unknown" and prior["path"] != candidate["path"]):
                 raise QualityAbort("Duplicate finding has no matching prior thread")
         elif verdict == "acknowledged-decision":
             quote = decision["description_quote"]

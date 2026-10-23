@@ -216,6 +216,18 @@ class QualityTests(unittest.TestCase):
         self.assertEqual("Security consequence", result["review"]["security_concerns"])
         self.assertEqual(1, len(retained))
 
+    def test_security_duplicate_retains_concern_and_requires_existing_root(self):
+        candidate = dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence")
+        bundle = q.context(self.pr, self.files, [candidate])
+        data = dict(review=dict(key_issues_to_review=[], security_concerns="Security consequence"))
+        d = dict(decision(verdict="duplicate"), prior_comment_id=10)
+        result, retained, _ = q.adjudicate(data, bundle, {"decisions": [d]})
+        self.assertEqual("Security consequence", result["review"]["security_concerns"])
+        self.assertEqual("unknown", retained[0]["path"])
+        for root in (11, 999, True, None):
+            with self.subTest(root=root), self.assertRaises(q.QualityAbort):
+                q.adjudicate(data, bundle, {"decisions": [dict(d, prior_comment_id=root)]})
+
     def test_source_context_read_failure_and_unknown_security_findings(self):
         missing = q.context(self.pr, [], [self.finding])
         self.assertIn("src/file.py", missing["unavailable_requests"])

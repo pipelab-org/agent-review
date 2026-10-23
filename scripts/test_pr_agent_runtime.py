@@ -572,6 +572,20 @@ review:
         self.assertNotIn("No security concerns identified", body)
         self.assertIn("src/missing.py", self.completion_evidence()["quality"]["unavailable_sources"])
 
+    def test_security_finding_with_missing_source_does_not_claim_no_findings(self):
+        from github import GithubException
+        self.provider.github_client.get_repo.return_value.get_contents.side_effect = GithubException(404, {})
+        self.output = "source_requests: [src/gone.py]\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'Token is logged'\n  key_issues_to_review: []\n"
+        d = decision()
+        d["evidence"].update(start_line=1, end_line=1, quote="new")
+        completion = AsyncMock(side_effect=[self.response(), self.response(), self.challenged(d)])
+        self.run_adapter(completion)
+        body = self.summary_publish.call_args.args[0]
+        self.assertNotIn("No verified findings", body)
+        self.assertIn("Findings remain", body)
+        self.assertTrue(self.completion_evidence()["findings"])
+        self.assertEqual({}, self.completion_evidence()["quality"]["unavailable_sources"])
+
     def test_an_unavailable_request_alone_keeps_a_clean_summary_from_reading_as_an_all_clear(self):
         # With no candidate there is no challenge, so only the discovery audit knows the
         # requested file was not read; the summary must still say so.

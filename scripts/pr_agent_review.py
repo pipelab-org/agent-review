@@ -679,7 +679,7 @@ async def review(settings):
             audit = getattr(self, "quality_audit", {})
             unavailable = audit.get("unavailable_sources", {}) or audit.get("discovery", {}).get("unavailable_requests", {})
             if unavailable:
-                result = result.replace("No major issues detected", "No verified findings; source context was incomplete")
+                result = result.replace("No major issues detected", "Findings remain; see the findings below" if self.result_findings else "No verified findings; source context was incomplete")
                 result = result.replace("No security concerns identified", "Security assessment limited by unavailable source")
                 result += "\n\n### Source limitations\n\nSome source could not be inspected. Unsupported candidates were not published; this review is limited to the supplied evidence."
             if not result:
