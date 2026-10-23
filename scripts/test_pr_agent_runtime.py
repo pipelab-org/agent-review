@@ -404,6 +404,30 @@ review:
         self.summary_publish.assert_not_called()
         self.status.edit.assert_not_called()
 
+    def test_source_request_count_is_bounded_by_the_providers_own_full_content_limit(self):
+        # Untrusted PR text can steer the model's requests; each one is a GitHub
+        # API read made with the workflow token before any budget check can run.
+        from pr_agent.git_providers.github_provider import MAX_FILES_ALLOWED_FULL
+        repo = self.provider.github_client.get_repo.return_value
+        repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={}, decoded_content=b"x\n")
+        for count, allowed in ((MAX_FILES_ALLOWED_FULL, True), (MAX_FILES_ALLOWED_FULL + 1, False)):
+            with self.subTest(count=count):
+                self.setUp()
+                repo = self.provider.github_client.get_repo.return_value
+                repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={},
+                                                    decoded_content=b"x\n")
+                paths = [f"src/consumer_{i}.py" for i in range(count)]
+                self.output = self.output.replace("source_requests: []", f"source_requests: {json.dumps(paths)}")
+                completion = self.answering()
+                if allowed:
+                    self.run_adapter(completion)
+                    self.assertEqual(count, repo.get_contents.call_count)
+                else:
+                    with self.assertRaises(review.ReviewAbort):
+                        self.run_adapter(completion)
+                    repo.get_contents.assert_not_called()
+                    completion.assert_awaited_once()
+
     def test_clean_source_discovery_uses_two_calls_and_no_challenge(self):
         self.output = "source_requests: []\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
         completion = AsyncMock(return_value=self.response())

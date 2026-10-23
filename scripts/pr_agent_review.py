@@ -564,6 +564,12 @@ async def review(settings):
                 from pr_agent.algo.file_filter import filter_ignored
                 from pr_agent.algo.language_handler import is_valid_file
                 from pr_agent.algo.types import FilePatchInfo
+                from pr_agent.git_providers.github_provider import MAX_FILES_ALLOWED_FULL
+                # Requests can be steered by untrusted PR text and each is a GitHub read
+                # with the workflow token. Reuse the provider's own per-review limit on
+                # full-content reads instead of choosing a new number.
+                if len(paths) > MAX_FILES_ALLOWED_FULL:
+                    raise discovery.DiscoveryAbort("Too many source requests")
                 files = [f for f in filter_ignored(self.git_provider.get_diff_files()) if is_valid_file(f.filename)]
                 reads = {}
 
