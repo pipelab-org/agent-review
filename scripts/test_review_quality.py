@@ -44,6 +44,55 @@ class QualityTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(q.QualityAbort):
                 q.adjudicate(self.data, self.bundle, {"decisions": [d]})
 
+    def test_same_run_duplicate_requires_a_surviving_earlier_finding(self):
+        self.bundle["candidates"].append(dict(self.finding, title="Reworded"))
+        self.data["review"]["key_issues_to_review"].append(dict(self.data["review"]["key_issues_to_review"][0], issue_header="Reworded"))
+        d = dict(decision(1, "duplicate-candidate"), duplicate_candidate=0)
+        result, _, audit = q.adjudicate(self.data, self.bundle, {"decisions": [decision(), d]})
+        self.assertEqual(1, len(result["review"]["key_issues_to_review"]))
+        self.assertEqual("duplicate-candidate", audit["decisions"][1]["verdict"])
+        for prior in (True, -1, 1, 2, None):
+            with self.subTest(prior=prior), self.assertRaises(q.QualityAbort):
+                q.adjudicate(self.data, self.bundle, {"decisions": [decision(), dict(d, duplicate_candidate=prior)]})
+        with self.assertRaises(q.QualityAbort):
+            q.adjudicate(self.data, self.bundle, {"decisions": [decision(verdict="unsupported"), d]})
+
+    def test_same_run_duplicate_index_must_be_an_exact_integer(self):
+        # True and False equal 1 and 0 and 1.0 and 0.0 hash like them, so only an
+        # exact type check stops them from naming candidates 1 and 0. Candidate 2
+        # lets True/1.0 resolve to a real earlier index, which a range check cannot catch.
+        for _ in range(2):
+            self.bundle["candidates"].append(dict(self.finding, title="Reworded"))
+            self.data["review"]["key_issues_to_review"].append(
+                dict(self.data["review"]["key_issues_to_review"][0], issue_header="Reworded"))
+
+        def decisions(candidate, prior):
+            kept = [decision(i) for i in range(3) if i != candidate]
+            kept.insert(candidate, dict(decision(candidate, "duplicate-candidate"), duplicate_candidate=prior))
+            return {"decisions": kept}
+
+        for candidate, prior in ((1, 0), (2, 1)):
+            with self.subTest(candidate=candidate, prior=prior):
+                result, _, _ = q.adjudicate(self.data, self.bundle, decisions(candidate, prior))
+                self.assertEqual(2, len(result["review"]["key_issues_to_review"]))
+        for candidate, prior in ((1, False), (2, True), (2, 1.0), (1, 0.0), (2, "1")):
+            with self.subTest(candidate=candidate, prior=prior), self.assertRaises(q.QualityAbort):
+                q.adjudicate(self.data, self.bundle, decisions(candidate, prior))
+
+    def test_requested_unchanged_source_is_verified_and_kept_in_summary(self):
+        self.finding["path"] = "src/consumer.py"
+        self.data["review"]["key_issues_to_review"][0]["relevant_file"] = "src/consumer.py"
+        evidence = {"src/consumer.py": {"content": "def f():\nreturn new\n", "patch": ""}}
+        bundle = q.context(self.pr, self.files, [self.finding], extra_sources=evidence)
+        d = decision(); d["evidence"]["path"] = "src/consumer.py"
+        result, retained, audit = q.adjudicate(self.data, bundle, {"decisions": [d]})
+        self.assertEqual([], result["review"]["key_issues_to_review"])
+        self.assertEqual([], retained)
+        self.assertEqual("src/consumer.py", audit["summary_findings"][0]["path"])
+        d["evidence"]["quote"] = "invented source"
+        with self.assertRaises(q.QualityAbort):
+            q.adjudicate(self.data, bundle, {"decisions": [d]})
+
     def test_source_separators_cannot_move_inline_evidence(self):
         # Non-LF boundaries from Python's documented str.splitlines contract.
         for separator in ("\v", "\f", "\r", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
@@ -130,8 +179,60 @@ class QualityTests(unittest.TestCase):
         bundle = copy.deepcopy(self.bundle); bundle["candidates"] *= 2
         with self.assertRaises(q.QualityAbort): q.adjudicate(self.data, bundle, {"decisions": [decision(), decision()]})
 
+    def test_out_of_hunk_finding_uses_summary_and_keeps_the_challenge_within_its_budget(self):
+        self.files.append(NS(filename="src/caller.py", head_file="changed()", patch="@@ -1 +1 @@\n-old()\n+changed()"))
+        self.files[0].patch = "@@ -1 +1 @@\n-old\n+def f():"
+        bundle = q.context(self.pr, self.files, [self.finding])
+        # The candidate's own patch is in sources; every other patch would only spend
+        # request budget (a 47-file pull request overran it with them).
+        self.assertNotIn("diff", bundle)
+        self.assertEqual(self.files[0].patch, bundle["sources"]["src/file.py"]["patch"])
+        result, _, audit = q.adjudicate(self.data, bundle, {"decisions": [decision()]})
+        self.assertEqual([], result["review"]["key_issues_to_review"])
+        self.assertEqual(2, audit["summary_findings"][0]["line"])
+
+    def test_finding_in_unchanged_source_gets_every_patch_to_show_causation(self):
+        self.files.append(NS(filename="src/caller.py", head_file="changed()", patch="@@ -1 +1 @@\n-old()\n+changed()"))
+        self.finding["path"] = "src/consumer.py"
+        bundle = q.context(self.pr, self.files, [self.finding],
+                           extra_sources={"src/consumer.py": {"content": "def f():\nreturn new\n", "patch": ""}})
+        self.assertEqual({f.filename: f.patch for f in self.files}, bundle["diff"])
+        # A candidate whose source was never supplied cannot be published, so it adds no diff.
+        self.assertNotIn("diff", q.context(self.pr, self.files, [self.finding]))
+
+    def test_security_duplicate_retains_the_security_concern(self):
+        self.bundle["candidates"].append(dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence"))
+        self.data["review"]["security_concerns"] = "Security consequence"
+        d = dict(decision(1, "duplicate-candidate"), duplicate_candidate=0)
+        result, _, _ = q.adjudicate(self.data, self.bundle, {"decisions": [decision(), d]})
+        self.assertIn("Security consequence", result["review"]["security_concerns"])
+        self.assertEqual(1, len(result["review"]["key_issues_to_review"]))
+
+    def test_a_held_security_concern_stays_visible_as_a_concern(self):
+        self.bundle["candidates"].append(dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence"))
+        self.data["review"]["security_concerns"] = "Security consequence"
+        d = decision(1, "acknowledged-decision"); d["description_quote"] = self.pr.body
+        result, retained, _ = q.adjudicate(self.data, self.bundle, {"decisions": [decision(), d]})
+        self.assertEqual("Security consequence", result["review"]["security_concerns"])
+        self.assertEqual(1, len(retained))
+
+    def test_security_duplicate_retains_concern_and_requires_existing_root(self):
+        candidate = dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence")
+        bundle = q.context(self.pr, self.files, [candidate])
+        data = dict(review=dict(key_issues_to_review=[], security_concerns="Security consequence"))
+        d = dict(decision(verdict="duplicate"), prior_comment_id=10)
+        result, retained, _ = q.adjudicate(data, bundle, {"decisions": [d]})
+        self.assertEqual("Security consequence", result["review"]["security_concerns"])
+        self.assertEqual("unknown", retained[0]["path"])
+        for root in (11, 999, True, None):
+            with self.subTest(root=root), self.assertRaises(q.QualityAbort):
+                q.adjudicate(data, bundle, {"decisions": [dict(d, prior_comment_id=root)]})
+
     def test_source_context_read_failure_and_unknown_security_findings(self):
-        with self.assertRaises(q.QualityAbort): q.context(self.pr, [], [self.finding])
+        missing = q.context(self.pr, [], [self.finding])
+        self.assertIn("src/file.py", missing["unavailable_requests"])
+        with self.assertRaises(q.QualityAbort):
+            q.adjudicate(self.data, missing, {"decisions": [decision()]})
         self.pr.get_review_comments = lambda: (_ for _ in ()).throw(OSError())
         with self.assertRaises(q.QualityAbort): q.context(self.pr, self.files, [self.finding])
         self.pr.get_review_comments = lambda: []

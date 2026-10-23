@@ -1,6 +1,6 @@
 # agent-review
 
-A maintainer-gated pull request review command for GitHub Actions. A maintainer comments `/review` on a pull request, and a reusable workflow reviews the static diff with a language model, posts findings as resolvable inline threads, and preserves each summary plus a completion record naming the exact commits, reviewer source, profile, models, and token usage.
+A maintainer-gated pull request review command for GitHub Actions. A maintainer comments `/review` on a pull request, and a reusable workflow reviews the diff together with the current source of changed files and of repository files the model requests, posts findings as resolvable inline threads where a changed line can anchor them, keeps the rest in the summary, and preserves each summary plus a completion record naming the exact commits, reviewer source, profile, models, and token usage.
 
 Runs [PR-Agent](https://github.com/The-PR-Agent/pr-agent) (MIT) from its published container image.
 

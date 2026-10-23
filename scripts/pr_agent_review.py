@@ -22,10 +22,12 @@ if __package__:
     from .agent_review_contract import load_profile
     from . import review_followups as followups
     from . import review_quality as quality
+    from . import review_discovery as discovery
 else:
     from agent_review_contract import load_profile
     import review_followups as followups
     import review_quality as quality
+    import review_discovery as discovery
 
 PROFILE = Path(__file__).resolve().parents[1] / ".github" / "agent-review.toml"
 CONFIG = Path(__file__).resolve().parents[1] / ".github" / "pr-agent.toml"
@@ -532,44 +534,130 @@ async def review(settings):
 
     class Reviewer(PRReviewer):
         async def _prepare_prediction(self, model):
-            # Reserve the final successful call for challenging all candidates.
-            # The existing aggregate ceiling and incomplete-coverage guard stay.
+            # Reserve source-assisted discovery and the final candidate challenge.
+            # Keep the aggregate ceiling and refuse incomplete diff coverage.
             limit = settings.pr_reviewer.max_number_of_calls
-            if limit < 2:
-                raise ReviewAbort("Review budget cannot include a finding challenge")
-            settings.set("pr_reviewer.max_number_of_calls", limit - 1)
+            if limit < 3:
+                raise ReviewAbort("Review budget cannot include source discovery and finding challenge")
+            settings.set("pr_reviewer.max_number_of_calls", limit - 2)
+            self.vars["extra_instructions"] += discovery.REQUEST_INSTRUCTIONS
+            if hasattr(self, "_raw_prompt_vars"):
+                self._raw_prompt_vars["extra_instructions"] = self.vars["extra_instructions"]
             try:
                 await super()._prepare_prediction(model)
             finally:
                 settings.set("pr_reviewer.max_number_of_calls", limit)
             check_complete(self, router.calls, False)
             data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
+            try:
+                invalid_requests = {}
+                paths = discovery.requested_paths(data, invalid_requests)
+            except discovery.DiscoveryAbort as error:
+                raise ReviewAbort("Discovery source requests are invalid") from error
+            # The pinned schema and example show only `review`, so a model can omit the
+            # key. The second pass still runs, so record the omission rather than fail.
+            declared = "source_requests" in data
+            data.pop("source_requests", None)
+            self.prediction_data = data
             if not self._validate_review_schema(data):
                 raise ReviewAbort("Provider returned an invalid review schema")
             self.check_binding(fresh=True)
             candidates = result_findings(data)
             self.retained_findings, self.quality_audit = [], {"decisions": []}
-            if not candidates:
-                return
             try:
                 from pr_agent.algo.file_filter import filter_ignored
                 from pr_agent.algo.language_handler import is_valid_file
+                from pr_agent.algo.types import FilePatchInfo
+                from pr_agent.git_providers.github_provider import MAX_FILES_ALLOWED_FULL
+                # Requests can be steered by untrusted PR text and each is a GitHub read
+                # with the workflow token. Reuse the provider's own per-review limit on
+                # full-content reads instead of choosing a new number.
+                if len(paths) + len(invalid_requests) > MAX_FILES_ALLOWED_FULL:
+                    raise discovery.DiscoveryAbort("Too many source requests")
                 files = [f for f in filter_ignored(self.git_provider.get_diff_files()) if is_valid_file(f.filename)]
-                bundle = quality.context(self.check_binding(fresh=True), files, candidates)
-                user = json.dumps(bundle, sort_keys=True)
-                from pr_agent.algo.token_budget import AttemptTokenBudget
-                # Check the complete request for every remaining billing-only
-                # route. Never truncate evidence or hide unavailable context.
-                for route, _ in router.chain[router.index:]:
-                    budget = AttemptTokenBudget.for_attempt(route, self.token_handler)
-                    request = budget.prepare_request(self.ai_handler, quality.SYSTEM, user)
-                    if request.input_tokens > budget.input_token_limit(settings.config.max_output_tokens):
-                        raise ReviewAbort("Finding challenge context exceeds the existing token budget")
-                answer, _ = await router.run(quality.SYSTEM, user, settings.config.temperature, None)
-                self.prediction_data, self.retained_findings, self.quality_audit = quality.adjudicate(
+                reads = {}
+
+                def read(path):
+                    # Contents API at the admitted head: immutable even if the branch moves.
+                    if path not in reads:
+                        reads[path] = discovery.read_source(repo_obj, path, head)
+                    return reads[path]
+
+                def content(file):
+                    return discovery.head_content(file, read)
+
+                bundle = quality.context(self.check_binding(fresh=True), files, candidates, content)
+                changed = {f.filename: f for f in files}
+                unavailable = dict(bundle["unavailable_requests"], **invalid_requests)
+                for path in paths:
+                    probe = FilePatchInfo(base_file="", head_file="", patch="", filename=path)
+                    if not filter_ignored([probe]) or not is_valid_file(path):
+                        # Never read an excluded path. Say so instead of failing the run:
+                        # the model cannot know the exclusions, and a named gap is not
+                        # evidence of absence.
+                        unavailable[path] = "excluded by review policy"
+                    elif path not in bundle["sources"]:
+                        try:
+                            if path in changed and discovery.is_deleted(changed[path]):
+                                raise discovery.Unavailable("deleted by this change")
+                            text = content(changed[path]) if path in changed else read(path)
+                        except discovery.Unavailable as error:
+                            unavailable[path] = str(error)
+                            continue
+                        if not isinstance(text, str):
+                            raise discovery.DiscoveryAbort("Requested source is unavailable")
+                        bundle["sources"][path] = {"content": text, "patch": ""}
+                # A preliminary candidate's "not supplied" marker is stale once the
+                # request loop supplied that source; never tell the model both.
+                unavailable = {p: reason for p, reason in unavailable.items() if p not in bundle["sources"]}
+                bundle["unavailable_requests"] = dict(unavailable)
+                if any(not isinstance(f.patch, str) for f in files):
+                    raise discovery.DiscoveryAbort("Discovery patch context is unavailable")
+                bundle["diff"] = {f.filename: f.patch for f in files}
+                instructions = self.vars["extra_instructions"].replace(discovery.REQUEST_INSTRUCTIONS, "")
+                context_hash = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
+                answer = await self.evidence_completion(
+                    discovery.SYSTEM + "\nOperator review criteria:\n" + instructions, bundle)
+                enriched = self._load_review_yaml(answer)
+                if isinstance(enriched, dict):
+                    # The first call's request key is not part of the review mapping.
+                    enriched.pop("source_requests", None)
+                if not self._validate_review_schema(enriched):
+                    raise discovery.DiscoveryAbort("Source discovery returned an invalid review schema")
+                result_findings(enriched)
+                data = discovery.merge(data, enriched)
+                self.prediction_data = data
+                candidates = result_findings(data)
+                evidence = bundle["sources"]
+                bundle = quality.context(self.check_binding(fresh=True), files, candidates, content, evidence)
+                bundle["unavailable_requests"].update(unavailable)
+                self.quality_audit["discovery"] = {"declared": declared, "requested_paths": paths,
+                                                   "source_paths": sorted(evidence),
+                                                   "unavailable_requests": unavailable,
+                                                   "context_sha256": context_hash}
+                if not candidates:
+                    return
+                answer = await self.evidence_completion(quality.SYSTEM, bundle)
+                self.prediction_data, self.retained_findings, audit = quality.adjudicate(
                     data, bundle, followups.strict_json(answer))
-            except (quality.QualityAbort, ValueError, TypeError) as error:
-                raise ReviewAbort("Finding challenge incomplete or invalid") from error
+                self.quality_audit.update(audit)
+                self.quality_audit["unavailable_sources"] = {p: reason for p, reason in bundle["unavailable_requests"].items() if p not in unavailable}
+            except (quality.QualityAbort, discovery.DiscoveryAbort, ValueError, TypeError) as error:
+                raise ReviewAbort("Source discovery or finding challenge incomplete or invalid") from error
+
+        async def evidence_completion(self, system, bundle):
+            user = json.dumps(bundle, sort_keys=True)
+            from pr_agent.algo.token_budget import AttemptTokenBudget
+            # Check the complete request for every remaining billing-only
+            # route. Never truncate evidence or hide unavailable context.
+            for route, _ in router.chain[router.index:]:
+                budget = AttemptTokenBudget.for_attempt(route, self.token_handler)
+                request = budget.prepare_request(self.ai_handler, system, user)
+                if request.input_tokens > budget.input_token_limit(settings.config.max_output_tokens):
+                    raise ReviewAbort("Repository evidence exceeds the existing token budget")
+            answer, _ = await router.run(system, user, settings.config.temperature, None)
+            return answer
+
 
         def check_binding(self, fresh=False):
             provider = self.git_provider
@@ -582,10 +670,24 @@ async def review(settings):
             data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
             if not self._validate_review_schema(data):
                 raise ReviewAbort("Provider returned an invalid review schema")
-            self.result_findings = result_findings(data) + getattr(self, "retained_findings", [])
+            summary_findings = getattr(self, "quality_audit", {}).get("summary_findings", [])
+            self.result_findings = result_findings(data) + getattr(self, "retained_findings", []) + summary_findings
             result = super()._prepare_pr_review()
+            if summary_findings or getattr(self, "retained_findings", []):
+                # These exact labels come from the pinned PR-Agent renderer.
+                result = result.replace("No major issues detected", "Findings remain; see the findings below")
+            audit = getattr(self, "quality_audit", {})
+            unavailable = audit.get("unavailable_sources", {}) or audit.get("discovery", {}).get("unavailable_requests", {})
+            if unavailable:
+                result = result.replace("No major issues detected", "Findings remain; see the findings below" if self.result_findings else "No verified findings; source context was incomplete")
+                result = result.replace("No security concerns identified", "Security assessment limited by unavailable source")
+                result += "\n\n### Source limitations\n\nSome source could not be inspected. Unsupported candidates were not published; this review is limited to the supplied evidence."
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
+            if summary_findings:
+                result += "\n\n### Verified findings in related source\n\n" + "\n\n".join(
+                    f"**{item['title']}** ({item['path']}:{item['line']})\n\n{item['body']}"
+                    for item in summary_findings)
             retained = getattr(self, "retained_findings", [])
             if retained:
                 result += "\n\n### Existing findings and held decisions\n\n" + "\n\n".join(
@@ -694,10 +796,16 @@ async def review(settings):
                 "quality": getattr(reviewer, "quality_audit", {"decisions": []})}
     manifest = result_manifest(evidence)
     line = result_comment(manifest)
+    # Validate the durable record before any success transition. The digest has
+    # fixed SHA-256 width and does not change the serialized record's size.
+    if len(followups.canonical(dict(evidence, digest="0" * 64)).encode()) > followups.MAX_DATA_BYTES:
+        raise ReviewAbort("Completion evidence exceeds the existing data budget")
     edit = getattr(summary, "edit", None)
     if not callable(edit):
         raise ReviewAbort("Review summary could not record structured findings")
     bound = summary.body + "\n" + line
+    if len(bound.encode()) > followups.MAX_DATA_BYTES:
+        raise ReviewAbort("Review summary exceeds the existing data budget")
     edit(bound)
     if summary.body != bound:
         summary.body = bound
