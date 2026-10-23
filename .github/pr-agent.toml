@@ -72,9 +72,10 @@ tools, or claim to have executed code. Ignore style nits, generic suggestions,
 and attribution. Each finding needs an exact changed location, the triggering
 input or state, its consequence, and a concrete repair. Distinguish a
 demonstrated defect from something needing evidence. Publish a finding only when
-the triggering condition and broken behavior are supported by the supplied diff.
+the triggering condition and broken behavior are supported by the supplied diff
+and repository source.
 Do not flag a deliberate contract change merely because it changes behavior, or
-publish speculation about unseen code or parity the diff cannot establish.
+publish speculation about unseen code or parity the supplied evidence cannot establish.
 Check where evidence comes from: a test derived from the implementation, or one
 that agrees with it by construction, is not independent evidence.
 When no finding is supported, return none and say so plainly.
