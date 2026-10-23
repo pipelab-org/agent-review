@@ -411,6 +411,33 @@ review:
         self.assertEqual(1, len(self.bundles(completion)["challenge"][1]["candidates"]))
         self.assertEqual(1, len(self.completion_evidence()["findings"]))
 
+    def test_omitted_source_request_key_still_runs_discovery_and_is_recorded_as_undeclared(self):
+        self.output = self.output.replace("source_requests: []\n", "")
+        completion = self.answering()
+        self.run_adapter(completion)
+        self.assertEqual(3, completion.await_count)
+        discovery = self.completion_evidence()["quality"]["discovery"]
+        self.assertFalse(discovery["declared"])
+        self.assertEqual([], discovery["requested_paths"])
+        self.assertTrue(self.bundles(completion)["discovery"][1]["diff"])
+
+    def test_declared_source_request_key_is_recorded_as_declared(self):
+        completion = self.answering()
+        self.run_adapter(completion)
+        self.assertTrue(self.completion_evidence()["quality"]["discovery"]["declared"])
+
+    def test_malformed_source_requests_fail_before_any_read_or_second_call(self):
+        for value in ("src/consumer.py", "null", "[../escape]", "[{path: src/a.py}]"):
+            with self.subTest(value=value):
+                self.setUp()
+                self.output = self.output.replace("source_requests: []", f"source_requests: {value}")
+                completion = self.answering()
+                with self.assertRaises(review.ReviewAbort):
+                    self.run_adapter(completion)
+                completion.assert_awaited_once()
+                self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
+                self.status.edit.assert_not_called()
+
     def test_second_pass_may_echo_the_source_request_key(self):
         # run_adapter's fixture hook strips an exact "source_requests: []"; vary it.
         completion = self.answering(discovery=self.output.replace("source_requests: []", "source_requests: [ ]"))
@@ -927,6 +954,50 @@ review:
         self.assertEqual(123, evidence["scope"]["parent"])
         repo.get_contents.assert_any_call("src/file.py", ref=old_head)
         repo.get_contents.assert_any_call("src/file.py", ref=self.head)
+
+    def test_incremental_discovery_reads_unchanged_requested_source_at_the_admitted_head(self):
+        from scripts.test_review_followups import evidence
+        old_head = "1" * 40
+        repo = self.provider.github_client.get_repo.return_value
+        repo.compare.side_effect = lambda old, new: NS(
+            base_commit=NS(sha=old), merge_base_commit=NS(sha=old), status="ahead",
+            files=[NS(filename="src/file.py", status="modified", additions=1, deletions=1)])
+        reads = []
+
+        def contents(path, ref):
+            reads.append((path, ref))
+            text = {"src/file.py": b"delta_new\n" if ref == self.head else b"delta_old\n",
+                    "src/outside_delta.py": b"outside_delta_guard()\n"}[path]
+            return NS(type="file", encoding="base64", raw_data={}, decoded_content=text)
+
+        repo.get_contents.side_effect = contents
+        self.output = self.output.replace("source_requests: []", "source_requests: [src/outside_delta.py]")
+        completion = self.answering()
+        with patch.object(review.followups, "verified_records", return_value={123: evidence(old_head)}):
+            self.run_adapter(completion, real_diff=True)
+        bundle = self.bundles(completion)["discovery"][1]
+        self.assertEqual(["src/file.py"], list(bundle["diff"]))
+        self.assertEqual("outside_delta_guard()\n", bundle["sources"]["src/outside_delta.py"]["content"])
+        self.assertIn(("src/outside_delta.py", self.head), reads)
+        self.assertNotIn(("src/outside_delta.py", old_head), reads)
+        self.assertEqual("incremental", self.completion_evidence()["scope"]["kind"])
+
+    def test_head_that_moves_during_discovery_stops_before_the_challenge(self):
+        async def answer(**kwargs):
+            system = kwargs["messages"][0]["content"]
+            if system.startswith(review.discovery.SYSTEM):
+                self.provider.pr.head.sha = "f" * 40
+                return "source_requests: []\n" + self.CLEAN, "stop", self.response()[2]
+            if system == review.quality.SYSTEM:
+                self.fail("The challenge ran against a moved head")
+            return self.response()
+
+        completion = AsyncMock(side_effect=answer)
+        with self.assertRaises(review.ReviewAbort):
+            self.run_adapter(completion)
+        self.assertEqual(2, completion.await_count)
+        self.summary_publish.assert_not_called()
+        self.status.edit.assert_not_called()
 
     def test_identical_commit_content_extends_chain_without_credentials_or_inference(self):
         from scripts.test_review_followups import evidence

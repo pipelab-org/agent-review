@@ -50,9 +50,14 @@ preliminary candidate as a resolved finding.
 
 
 def requested_paths(data):
-    paths = data.get("source_requests") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        raise DiscoveryAbort("Discovery output is not a mapping")
+    if "source_requests" not in data:
+        # An omitted key requests nothing. It is recorded as undeclared, never as [].
+        return []
+    paths = data["source_requests"]
     if not isinstance(paths, list):
-        raise DiscoveryAbort("Discovery did not declare its source requests")
+        raise DiscoveryAbort("Discovery source requests are not a list")
     result = []
     for path in paths:
         # A colon is a legal filename character; the revision travels separately

@@ -553,7 +553,10 @@ async def review(settings):
                 paths = discovery.requested_paths(data)
             except discovery.DiscoveryAbort as error:
                 raise ReviewAbort("Discovery source requests are invalid") from error
-            data.pop("source_requests")
+            # The pinned schema and example show only `review`, so a model can omit the
+            # key. The second pass still runs, so record the omission rather than fail.
+            declared = "source_requests" in data
+            data.pop("source_requests", None)
             self.prediction_data = data
             if not self._validate_review_schema(data):
                 raise ReviewAbort("Provider returned an invalid review schema")
@@ -627,7 +630,8 @@ async def review(settings):
                     # Keep the candidate file's patch; only add files the rebuild lacks.
                     bundle["sources"].setdefault(path, source)
                 bundle["unavailable_requests"] = unavailable
-                self.quality_audit["discovery"] = {"requested_paths": paths, "source_paths": sorted(evidence),
+                self.quality_audit["discovery"] = {"declared": declared, "requested_paths": paths,
+                                                   "source_paths": sorted(evidence),
                                                    "unavailable_requests": unavailable,
                                                    "context_sha256": context_hash}
                 if not candidates:

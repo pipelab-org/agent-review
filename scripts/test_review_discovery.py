@@ -33,6 +33,12 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(discovery.Unavailable):
             discovery.read_source(repo, "src/a.py", "a" * 40)
 
+    def test_omitted_key_requests_nothing_but_a_non_mapping_is_invalid(self):
+        self.assertEqual([], discovery.requested_paths({}))
+        for value in (None, [], "source_requests: []"):
+            with self.subTest(value=value), self.assertRaises(discovery.DiscoveryAbort):
+                discovery.requested_paths(value)
+
     def test_a_colon_is_a_legal_filename_character_but_urls_stay_invalid(self):
         self.assertEqual(["docs/a:b.md"], discovery.requested_paths({"source_requests": ["docs/a:b.md"]}))
         for value in ("https://api.vendor.example/a", "file:///etc/passwd", "//host/share"):
