@@ -572,6 +572,23 @@ review:
         self.assertNotIn("No security concerns identified", body)
         self.assertIn("src/missing.py", self.completion_evidence()["quality"]["unavailable_sources"])
 
+    def test_an_unavailable_request_alone_keeps_a_clean_summary_from_reading_as_an_all_clear(self):
+        # With no candidate there is no challenge, so only the discovery audit knows the
+        # requested file was not read; the summary must still say so.
+        from github import GithubException
+        self.provider.github_client.get_repo.return_value.get_contents.side_effect = GithubException(
+            404, {"message": "Not Found"})
+        self.output = "source_requests: [src/gone.py]\n" + self.CLEAN
+        completion = self.answering()
+        self.run_adapter(completion)
+        self.assertEqual(2, completion.await_count)
+        body = self.summary_publish.call_args.args[0]
+        self.assertIn("Source limitations", body)
+        self.assertNotIn("No major issues detected", body)
+        self.assertNotIn("No security concerns identified", body)
+        self.assertEqual({"src/gone.py": "not found at the reviewed head"},
+                         self.completion_evidence()["quality"]["discovery"]["unavailable_requests"])
+
     def test_unchanged_consumer_finding_is_in_summary_and_completion_not_inline(self):
         candidate = self.output.replace("source_requests: []\n", "").replace("src/file.py", "src/consumer.py")
         self.output = "source_requests: [src/consumer.py]\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
