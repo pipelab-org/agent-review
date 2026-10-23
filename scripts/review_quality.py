@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 
 if __package__:
     from .agent_review_contract import source_lines
@@ -83,8 +84,7 @@ def context(pr, files, findings, content=lambda file: file.head_file, extra_sour
     for path, source in (extra_sources or {}).items():
         if path not in sources:
             sources[path] = source
-    if paths - sources.keys():
-        raise QualityAbort("Candidate is outside the supplied reviewable files")
+    unavailable = {path: "candidate source was not supplied" for path in paths - sources.keys()}
     threads = []
     try:
         for comment in pr.get_review_comments():
@@ -104,7 +104,20 @@ def context(pr, files, findings, content=lambda file: file.head_file, extra_sour
     except Exception as error:
         raise QualityAbort("Prior review context could not be read") from error
     return {"description": description, "threads": sorted(threads, key=lambda c: c["id"]),
-            "reviewable_files": sorted(inventory), "sources": sources, "candidates": findings}
+            "reviewable_files": sorted(inventory), "sources": sources, "candidates": findings,
+            "unavailable_requests": unavailable, "diff": {f.filename: f.patch for f in files}}
+
+
+def inline_location(candidate, bundle):
+    """Git unified-diff new-side ranges; GitHub inline lines must lie in a hunk."""
+    patch = bundle.get("diff", {}).get(candidate["path"], "")
+    for line in source_lines(patch):
+        match = re.match(r"^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,([0-9]+))? @@", line)
+        if match:
+            start, count = int(match[1]), int(match[2] or "1")
+            if start <= candidate["line"] <= candidate["end_line"] < start + count:
+                return True
+    return False
 
 
 def nonempty(value):
@@ -176,7 +189,7 @@ def adjudicate(data, bundle, answer):
         if decision["verdict"] == "publish":
             body = (f"Trigger: {decision['trigger']}\n\nConsequence: {decision['consequence']}"
                     f"\n\nRepair: {decision['repair']}\n\nEvidence: {decision['reason']}")
-            if candidate["path"] != "unknown" and candidate["path"] not in bundle["reviewable_files"]:
+            if candidate["path"] != "unknown" and not inline_location(candidate, bundle):
                 summary_findings.append(dict(candidate, title=decision["title"], body=body))
             elif index < len(issues):
                 issue = issues[index]
@@ -184,9 +197,15 @@ def adjudicate(data, bundle, answer):
                 kept.append(issue)
             else:
                 concern = decision["title"] + "\n\n" + body
+        elif decision["verdict"] == "duplicate-candidate" and index >= len(issues):
+            # Deduplication must not turn a security concern into an all-clear.
+            target = indexed[decision["duplicate_candidate"]]
+            concern = "Security concern also reported as: " + target["title"] + "\n\n" + candidate["body"]
         elif decision["verdict"] in ("duplicate", "acknowledged-decision"):
             # These remain findings in the summary AND structured completion.
             # Not opening another thread never means accepting a held decision.
+            if index >= len(issues):
+                concern = candidate["body"]
             retained.append(dict(candidate, title="Existing unresolved finding: " + candidate["title"],
                                  body=candidate["body"] + "\n\n" + decision["reason"]))
     result["review"]["key_issues_to_review"] = kept

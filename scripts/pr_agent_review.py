@@ -550,7 +550,8 @@ async def review(settings):
             check_complete(self, router.calls, False)
             data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
             try:
-                paths = discovery.requested_paths(data)
+                invalid_requests = {}
+                paths = discovery.requested_paths(data, invalid_requests)
             except discovery.DiscoveryAbort as error:
                 raise ReviewAbort("Discovery source requests are invalid") from error
             # The pinned schema and example show only `review`, so a model can omit the
@@ -571,7 +572,7 @@ async def review(settings):
                 # Requests can be steered by untrusted PR text and each is a GitHub read
                 # with the workflow token. Reuse the provider's own per-review limit on
                 # full-content reads instead of choosing a new number.
-                if len(paths) > MAX_FILES_ALLOWED_FULL:
+                if len(paths) + len(invalid_requests) > MAX_FILES_ALLOWED_FULL:
                     raise discovery.DiscoveryAbort("Too many source requests")
                 files = [f for f in filter_ignored(self.git_provider.get_diff_files()) if is_valid_file(f.filename)]
                 reads = {}
@@ -587,7 +588,7 @@ async def review(settings):
 
                 bundle = quality.context(self.check_binding(fresh=True), files, candidates, content)
                 changed = {f.filename: f for f in files}
-                unavailable = {}
+                unavailable = dict(bundle["unavailable_requests"], **invalid_requests)
                 for path in paths:
                     probe = FilePatchInfo(base_file="", head_file="", patch="", filename=path)
                     if not filter_ignored([probe]) or not is_valid_file(path):
@@ -606,7 +607,7 @@ async def review(settings):
                         if not isinstance(text, str):
                             raise discovery.DiscoveryAbort("Requested source is unavailable")
                         bundle["sources"][path] = {"content": text, "patch": ""}
-                bundle["unavailable_requests"] = unavailable
+                bundle["unavailable_requests"].update(unavailable)
                 if any(not isinstance(f.patch, str) for f in files):
                     raise discovery.DiscoveryAbort("Discovery patch context is unavailable")
                 bundle["diff"] = {f.filename: f.patch for f in files}
@@ -626,7 +627,7 @@ async def review(settings):
                 candidates = result_findings(data)
                 evidence = bundle["sources"]
                 bundle = quality.context(self.check_binding(fresh=True), files, candidates, content, evidence)
-                bundle["unavailable_requests"] = unavailable
+                bundle["unavailable_requests"].update(unavailable)
                 self.quality_audit["discovery"] = {"declared": declared, "requested_paths": paths,
                                                    "source_paths": sorted(evidence),
                                                    "unavailable_requests": unavailable,
@@ -668,6 +669,10 @@ async def review(settings):
             summary_findings = getattr(self, "quality_audit", {}).get("summary_findings", [])
             self.result_findings = result_findings(data) + getattr(self, "retained_findings", []) + summary_findings
             result = super()._prepare_pr_review()
+            if summary_findings or getattr(self, "retained_findings", []):
+                # These exact labels come from the pinned PR-Agent renderer.
+                result = result.replace("No major issues detected", "Findings remain; see the findings below")
+                result = result.replace("No security concerns identified", "See findings below for remaining concerns")
             if not result:
                 raise ReviewAbort("Provider returned an invalid review")
             if summary_findings:
@@ -782,10 +787,16 @@ async def review(settings):
                 "quality": getattr(reviewer, "quality_audit", {"decisions": []})}
     manifest = result_manifest(evidence)
     line = result_comment(manifest)
+    # Validate the durable record before any success transition. The digest has
+    # fixed SHA-256 width and does not change the serialized record's size.
+    if len(followups.canonical(dict(evidence, digest="0" * 64)).encode()) > followups.MAX_DATA_BYTES:
+        raise ReviewAbort("Completion evidence exceeds the existing data budget")
     edit = getattr(summary, "edit", None)
     if not callable(edit):
         raise ReviewAbort("Review summary could not record structured findings")
     bound = summary.body + "\n" + line
+    if len(bound.encode()) > followups.MAX_DATA_BYTES:
+        raise ReviewAbort("Review summary exceeds the existing data budget")
     edit(bound)
     if summary.body != bound:
         summary.body = bound

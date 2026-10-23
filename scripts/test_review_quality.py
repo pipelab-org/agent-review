@@ -179,8 +179,28 @@ class QualityTests(unittest.TestCase):
         bundle = copy.deepcopy(self.bundle); bundle["candidates"] *= 2
         with self.assertRaises(q.QualityAbort): q.adjudicate(self.data, bundle, {"decisions": [decision(), decision()]})
 
+    def test_out_of_hunk_finding_uses_summary_and_challenge_has_all_patches(self):
+        self.files.append(NS(filename="src/caller.py", head_file="changed()", patch="@@ -1 +1 @@\n-old()\n+changed()"))
+        self.files[0].patch = "@@ -1 +1 @@\n-old\n+def f():"
+        bundle = q.context(self.pr, self.files, [self.finding])
+        self.assertEqual(self.files[1].patch, bundle["diff"]["src/caller.py"])
+        result, _, audit = q.adjudicate(self.data, bundle, {"decisions": [decision()]})
+        self.assertEqual([], result["review"]["key_issues_to_review"])
+        self.assertEqual(2, audit["summary_findings"][0]["line"])
+
+    def test_security_duplicate_retains_the_security_concern(self):
+        self.bundle["candidates"].append(dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence"))
+        self.data["review"]["security_concerns"] = "Security consequence"
+        d = dict(decision(1, "duplicate-candidate"), duplicate_candidate=0)
+        result, _, _ = q.adjudicate(self.data, self.bundle, {"decisions": [decision(), d]})
+        self.assertIn("Security consequence", result["review"]["security_concerns"])
+        self.assertEqual(1, len(result["review"]["key_issues_to_review"]))
+
     def test_source_context_read_failure_and_unknown_security_findings(self):
-        with self.assertRaises(q.QualityAbort): q.context(self.pr, [], [self.finding])
+        missing = q.context(self.pr, [], [self.finding])
+        self.assertIn("src/file.py", missing["unavailable_requests"])
+        with self.assertRaises(q.QualityAbort):
+            q.adjudicate(self.data, missing, {"decisions": [decision()]})
         self.pr.get_review_comments = lambda: (_ for _ in ()).throw(OSError())
         with self.assertRaises(q.QualityAbort): q.context(self.pr, self.files, [self.finding])
         self.pr.get_review_comments = lambda: []

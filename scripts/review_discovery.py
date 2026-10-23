@@ -53,7 +53,7 @@ preliminary candidate as a resolved finding.
 """
 
 
-def requested_paths(data):
+def requested_paths(data, unavailable=None):
     if not isinstance(data, dict):
         raise DiscoveryAbort("Discovery output is not a mapping")
     if "source_requests" not in data:
@@ -64,13 +64,19 @@ def requested_paths(data):
         raise DiscoveryAbort("Discovery source requests are not a list")
     result = []
     for path in paths:
+        original = path
+        if isinstance(path, str) and path.startswith("./"):
+            path = path[2:]
         # A colon is a legal filename character; the revision travels separately
         # as the ref argument and PyGithub percent-encodes the path.
         if (not isinstance(path, str) or not path or "\\" in path
                 or any(ord(c) < 32 for c in path)
                 or PurePosixPath(path).is_absolute()
                 or any(p in ("", ".", "..") for p in path.split("/"))):
-            raise DiscoveryAbort("Invalid repository source request")
+            if unavailable is None or not isinstance(original, str):
+                raise DiscoveryAbort("Invalid repository source request")
+            unavailable[original] = "invalid repository-relative file path"
+            continue
         if path not in result:
             result.append(path)
     return result

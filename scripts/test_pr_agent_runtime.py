@@ -427,7 +427,7 @@ review:
         self.assertTrue(self.completion_evidence()["quality"]["discovery"]["declared"])
 
     def test_malformed_source_requests_fail_before_any_read_or_second_call(self):
-        for value in ("src/consumer.py", "null", "[../escape]", "[{path: src/a.py}]"):
+        for value in ("src/consumer.py", "null", "[{path: src/a.py}]"):
             with self.subTest(value=value):
                 self.setUp()
                 self.output = self.output.replace("source_requests: []", f"source_requests: {value}")
@@ -437,6 +437,24 @@ review:
                 completion.assert_awaited_once()
                 self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
                 self.status.edit.assert_not_called()
+
+    def test_invalid_path_is_named_without_reading_it(self):
+        self.output = self.output.replace("source_requests: []", "source_requests: [../escape, src/]")
+        completion = self.answering()
+        self.run_adapter(completion)
+        self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
+        bundle = json.loads(completion.await_args_list[1].kwargs["messages"][1]["content"])
+        self.assertEqual({"../escape", "src/"}, set(bundle["unavailable_requests"]))
+
+    def test_oversized_completion_never_marks_success(self):
+        self.output = self.output.replace("source_requests: []", "source_requests: [" + "x" * 70000 + "]")
+        from github import GithubException
+        self.provider.github_client.get_repo.return_value.get_contents.side_effect = GithubException(404, {})
+        self.settings.config.max_model_tokens = 1000000
+        completion = self.answering()
+        with self.assertRaises(review.ReviewAbort):
+            self.run_adapter(completion)
+        self.status.edit.assert_not_called()
 
     def test_second_pass_may_echo_the_source_request_key(self):
         # run_adapter's fixture hook strips an exact "source_requests: []"; vary it.
@@ -502,6 +520,10 @@ review:
         self.assertEqual(1, len(findings))
         self.assertEqual("src/consumer.py", findings[0]["path"])
         self.assertEqual(1, findings[0]["line"])
+        self.assertNotIn("No major issues detected", self.summary_publish.call_args.args[0])
+        self.assertNotIn("No security concerns identified", self.summary_publish.call_args.args[0])
+        challenge = json.loads(completion.await_args.kwargs["messages"][1]["content"])
+        self.assertIn("src/file.py", challenge["diff"])
 
     def test_challenge_reads_whole_candidate_file_and_rejects_absence_speculation(self):
         self.provider.get_diff_files.return_value[0].head_file = "existing_guard()\nnew\n"
