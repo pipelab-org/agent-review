@@ -23,6 +23,19 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaises(discovery.DiscoveryAbort):
                 discovery.read_source(repo, "src/a.py", "a" * 40)
 
+    def test_unloaded_head_content_is_read_but_loaded_and_deleted_files_are_not(self):
+        read = Mock(return_value="from head")
+        deleted = NS(name="DELETED")
+        cases = (("loaded", NS(head_file="loaded", edit_type=NS(name="MODIFIED")), "loaded", 0),
+                 ("unloaded", NS(head_file="", filename="a.py", edit_type=NS(name="MODIFIED")), "from head", 1),
+                 ("unknown type", NS(head_file="", filename="a.py"), "from head", 1),
+                 ("deleted", NS(head_file="", filename="a.py", edit_type=deleted), "", 0))
+        for name, file, expected, reads in cases:
+            read.reset_mock()
+            with self.subTest(name):
+                self.assertEqual(expected, discovery.head_content(file, read))
+                self.assertEqual(reads, read.call_count)
+
     def test_later_empty_output_cannot_silently_discard_initial_candidates(self):
         first = {"review": {"key_issues_to_review": [{"issue_header": "original"}], "security_concerns": "Original concern"}}
         second = {"review": {"key_issues_to_review": [], "security_concerns": "No"}}

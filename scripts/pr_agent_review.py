@@ -565,25 +565,41 @@ async def review(settings):
                 from pr_agent.algo.language_handler import is_valid_file
                 from pr_agent.algo.types import FilePatchInfo
                 files = [f for f in filter_ignored(self.git_provider.get_diff_files()) if is_valid_file(f.filename)]
-                bundle = quality.context(self.check_binding(fresh=True), files, candidates)
+                reads = {}
+
+                def read(path):
+                    # Contents API at the admitted head: immutable even if the branch moves.
+                    if path not in reads:
+                        reads[path] = discovery.read_source(repo_obj, path, head)
+                    return reads[path]
+
+                def content(file):
+                    return discovery.head_content(file, read)
+
+                bundle = quality.context(self.check_binding(fresh=True), files, candidates, content)
                 changed = {f.filename: f for f in files}
                 for path in paths:
                     probe = FilePatchInfo(base_file="", head_file="", patch="", filename=path)
                     if not filter_ignored([probe]) or not is_valid_file(path):
                         raise discovery.DiscoveryAbort("Requested source is excluded by review policy")
                     if path not in bundle["sources"]:
-                        content = (changed[path].head_file if path in changed else
-                                   discovery.read_source(repo_obj, path, head))
-                        if not isinstance(content, str):
+                        if path in changed and discovery.is_deleted(changed[path]):
+                            raise discovery.DiscoveryAbort("Requested source was deleted by this change")
+                        text = content(changed[path]) if path in changed else read(path)
+                        if not isinstance(text, str):
                             raise discovery.DiscoveryAbort("Requested source is unavailable")
-                        bundle["sources"][path] = {"content": content, "patch": ""}
+                        bundle["sources"][path] = {"content": text, "patch": ""}
                 if any(not isinstance(f.patch, str) for f in files):
                     raise discovery.DiscoveryAbort("Discovery patch context is unavailable")
                 bundle["diff"] = {f.filename: f.patch for f in files}
                 instructions = self.vars["extra_instructions"].replace(discovery.REQUEST_INSTRUCTIONS, "")
+                context_hash = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
                 answer = await self.evidence_completion(
                     discovery.SYSTEM + "\nOperator review criteria:\n" + instructions, bundle)
                 enriched = self._load_review_yaml(answer)
+                if isinstance(enriched, dict):
+                    # The first call's request key is not part of the review mapping.
+                    enriched.pop("source_requests", None)
                 if not self._validate_review_schema(enriched):
                     raise discovery.DiscoveryAbort("Source discovery returned an invalid review schema")
                 result_findings(enriched)
@@ -591,9 +607,12 @@ async def review(settings):
                 self.prediction_data = data
                 candidates = result_findings(data)
                 evidence = bundle["sources"]
-                bundle = quality.context(self.check_binding(fresh=True), files, candidates)
-                bundle["sources"].update(evidence)
-                self.quality_audit["discovery"] = {"requested_paths": paths, "source_paths": sorted(evidence)}
+                bundle = quality.context(self.check_binding(fresh=True), files, candidates, content)
+                for path, source in evidence.items():
+                    # Keep the candidate file's patch; only add files the rebuild lacks.
+                    bundle["sources"].setdefault(path, source)
+                self.quality_audit["discovery"] = {"requested_paths": paths, "source_paths": sorted(evidence),
+                                                   "context_sha256": context_hash}
                 if not candidates:
                     return
                 answer = await self.evidence_completion(quality.SYSTEM, bundle)

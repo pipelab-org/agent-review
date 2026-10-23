@@ -40,8 +40,10 @@ security_concerns (exact 'No' when absent), key_issues_to_review (list of mappin
 with relevant_file, issue_header, issue_content, start_line, end_line).
 Each issue must anchor in a changed file and identify a concrete trigger,
 consequence and repair supported by supplied source. An empty list is valid.
-The independent publication challenge will account for every candidate from both
-passes; do not interpret an omitted preliminary candidate as a resolved finding.
+The supplied candidates are the preliminary review's findings: report only
+additional defects and never restate one. The independent publication challenge
+will account for every candidate from both passes; do not interpret an omitted
+preliminary candidate as a resolved finding.
 """
 
 
@@ -73,6 +75,24 @@ def read_source(repo, path, head):
             or raw.get("submodule_git_url") or raw.get("target")):
         raise DiscoveryAbort("Requested source is not an available regular file")
     return item.decoded_content.decode("utf-8", errors="strict")
+
+
+def is_deleted(file):
+    return getattr(getattr(file, "edit_type", None), "name", None) == "DELETED"
+
+
+def head_content(file, read):
+    """Current head text of a changed file, never a provider's silent empty string.
+
+    The pinned GitHub provider sets head_file to "" without any flag when it did
+    not load the file (past MAX_FILES_ALLOWED_FULL, or a failed read). That is not
+    evidence the file is empty, so read the exact head instead. A deleted file has
+    no head content to read.
+    """
+    content = file.head_file
+    if content == "" and not is_deleted(file):
+        content = read(file.filename)
+    return content
 
 
 def merge(first, second):

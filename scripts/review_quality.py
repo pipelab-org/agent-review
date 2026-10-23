@@ -55,8 +55,11 @@ Do not invent candidates or remove one without an explicit disposition.
 """
 
 
-def context(pr, files, findings):
-    """Use live repository data, without treating any comment as suppression proof."""
+def context(pr, files, findings, content=lambda file: file.head_file):
+    """Use live repository data, without treating any comment as suppression proof.
+
+    content resolves a changed file's current text; the default trusts the provider.
+    """
     sources = {}
     paths = {f["path"] for f in findings if f["path"] != "unknown"}
     if any(f["path"] == "unknown" for f in findings):
@@ -65,9 +68,10 @@ def context(pr, files, findings):
     for file in files:
         inventory.append(file.filename)
         if file.filename in paths:
-            if not isinstance(file.head_file, str) or not isinstance(file.patch, str):
+            text = content(file)
+            if not isinstance(text, str) or not isinstance(file.patch, str):
                 raise QualityAbort("Current candidate source is unavailable")
-            sources[file.filename] = {"content": file.head_file, "patch": file.patch}
+            sources[file.filename] = {"content": text, "patch": file.patch}
     if paths - sources.keys():
         raise QualityAbort("Candidate is outside the supplied reviewable files")
     threads = []

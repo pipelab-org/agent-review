@@ -12,6 +12,7 @@ import json
 import hashlib
 import importlib.util
 import os
+import re
 import socket
 import unittest
 from types import SimpleNamespace as NS
@@ -308,6 +309,100 @@ review:
                 self.status.edit.assert_not_called()
                 if excluded:
                     repo.get_contents.assert_not_called()
+
+    CLEAN = "review:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
+
+    def answering(self, first=None, discovery=None):
+        """Initial, discovery and challenge responses; discovery omits source_requests by default."""
+        first = self.output if first is None else first
+        discovery = re.sub(r"^source_requests:.*\n", "", first) if discovery is None else discovery
+
+        async def answer(**kwargs):
+            system = kwargs["messages"][0]["content"]
+            if system.startswith(review.discovery.SYSTEM):
+                return discovery, "stop", self.response()[2]
+            if system == review.quality.SYSTEM:
+                return self.response()
+            return first, "stop", self.response()[2]
+
+        return AsyncMock(side_effect=answer)
+
+    def bundles(self, completion):
+        """Raw text and decoded evidence sent to the discovery pass and the challenge."""
+        found = {}
+        for call in completion.await_args_list:
+            system, user = (m["content"] for m in call.kwargs["messages"][:2])
+            name = ("discovery" if system.startswith(review.discovery.SYSTEM)
+                    else "challenge" if system == review.quality.SYSTEM else None)
+            if name:
+                found[name] = (user, json.loads(user))
+        return found
+
+    def test_changed_file_whose_head_content_was_not_loaded_is_read_at_exact_head(self):
+        # The pinned GitHub provider returns "" rather than an error for files it
+        # did not load (past MAX_FILES_ALLOWED_FULL, or any failed read). "" is
+        # not evidence that the file is empty.
+        from pr_agent.algo.types import EDIT_TYPE
+        file = self.provider.get_diff_files.return_value[0]
+        file.head_file, file.edit_type = "", EDIT_TYPE.MODIFIED
+        self.output = self.output.replace("source_requests: []", "source_requests: [src/file.py]")
+        repo = self.provider.github_client.get_repo.return_value
+        repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={},
+                                            decoded_content=b"loaded_at_head()\n")
+        completion = self.answering()
+        self.run_adapter(completion)
+        repo.get_contents.assert_called_once_with("src/file.py", ref=self.head)
+        bundles = self.bundles(completion)
+        for name in ("discovery", "challenge"):
+            self.assertEqual("loaded_at_head()\n", bundles[name][1]["sources"]["src/file.py"]["content"])
+        discovery = self.completion_evidence()["quality"]["discovery"]
+        self.assertEqual(hashlib.sha256(bundles["discovery"][0].encode()).hexdigest(), discovery["context_sha256"])
+
+    def test_deleted_changed_file_is_never_presented_as_empty_source(self):
+        from pr_agent.algo.types import EDIT_TYPE
+        file = self.provider.get_diff_files.return_value[0]
+        file.head_file, file.edit_type, file.patch = "", EDIT_TYPE.DELETED, "@@ -1 +0,0 @@\n-old\n"
+        self.output = "source_requests: [src/file.py]\n" + self.CLEAN
+        completion = self.answering()
+        with self.assertRaises(review.ReviewAbort):
+            self.run_adapter(completion)
+        self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
+        completion.assert_awaited_once()
+        self.status.edit.assert_not_called()
+
+    def test_requested_changed_file_keeps_its_patch_when_second_pass_adds_a_candidate(self):
+        candidate = self.output
+        completion = self.answering(first="source_requests: [src/file.py]\n" + self.CLEAN,
+                                    discovery=candidate.replace("source_requests: []\n", ""))
+        self.run_adapter(completion)
+        self.assertEqual(3, completion.await_count)
+        source = self.bundles(completion)["challenge"][1]["sources"]["src/file.py"]
+        self.assertEqual("@@ -1 +1 @@\n-old\n+new\n", source["patch"])
+
+    def test_first_pass_candidates_survive_a_clean_second_pass_into_the_challenge(self):
+        completion = self.answering(discovery=self.CLEAN)
+        self.run_adapter(completion)
+        self.assertEqual(3, completion.await_count)
+        self.assertEqual(1, len(self.bundles(completion)["challenge"][1]["candidates"]))
+        self.assertEqual(1, len(self.completion_evidence()["findings"]))
+
+    def test_second_pass_may_echo_the_source_request_key(self):
+        # run_adapter's fixture hook strips an exact "source_requests: []"; vary it.
+        completion = self.answering(discovery=self.output.replace("source_requests: []", "source_requests: [ ]"))
+        self.run_adapter(completion)
+        self.assertEqual(3, completion.await_count)
+
+    def test_oversized_requested_source_refuses_before_the_discovery_call(self):
+        self.output = self.output.replace("source_requests: []", "source_requests: [src/consumer.py]")
+        repo = self.provider.github_client.get_repo.return_value
+        repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={},
+                                            decoded_content=b"x = 1\n" * self.settings.config.max_model_tokens)
+        completion = self.answering()
+        with self.assertRaises(review.ReviewAbort):
+            self.run_adapter(completion)
+        completion.assert_awaited_once()
+        self.summary_publish.assert_not_called()
+        self.status.edit.assert_not_called()
 
     def test_clean_source_discovery_uses_two_calls_and_no_challenge(self):
         self.output = "source_requests: []\nreview:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\n"
