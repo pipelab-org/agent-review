@@ -564,6 +564,7 @@ async def review(settings):
             self.check_binding(fresh=True)
             candidates = result_findings(data)
             self.retained_findings, self.quality_audit = [], {"decisions": []}
+            stage = "source context"
             try:
                 from pr_agent.algo.file_filter import filter_ignored
                 from pr_agent.algo.language_handler import is_valid_file
@@ -616,19 +617,25 @@ async def review(settings):
                 bundle["diff"] = {f.filename: f.patch for f in files}
                 instructions = self.vars["extra_instructions"].replace(discovery.REQUEST_INSTRUCTIONS, "")
                 context_hash = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
+                from pr_agent.tools.pr_reviewer import PRReview
+                stage = "source discovery response"
                 answer = await self.evidence_completion(
-                    discovery.SYSTEM + "\nOperator review criteria:\n" + instructions, bundle)
+                    discovery.SYSTEM + "\nOperator review criteria:\n" + instructions
+                    + discovery.output_contract(PRReview.model_json_schema()), bundle)
                 enriched = self._load_review_yaml(answer)
                 if isinstance(enriched, dict):
                     # The first call's request key is not part of the review mapping.
                     enriched.pop("source_requests", None)
+                stage = "source discovery schema"
                 if not self._validate_review_schema(enriched):
                     raise discovery.DiscoveryAbort("Source discovery returned an invalid review schema")
                 result_findings(enriched)
+                stage = "source discovery merge"
                 data = discovery.merge(data, enriched)
                 self.prediction_data = data
                 candidates = result_findings(data)
                 evidence = bundle["sources"]
+                stage = "finding challenge context"
                 bundle = quality.context(self.check_binding(fresh=True), files, candidates, content, evidence)
                 bundle["unavailable_requests"].update(unavailable)
                 self.quality_audit["discovery"] = {"declared": declared, "requested_paths": paths,
@@ -637,13 +644,15 @@ async def review(settings):
                                                    "context_sha256": context_hash}
                 if not candidates:
                     return
+                stage = "finding challenge response"
                 answer = await self.evidence_completion(quality.SYSTEM, bundle)
+                stage = "finding challenge decisions"
                 self.prediction_data, self.retained_findings, audit = quality.adjudicate(
                     data, bundle, followups.strict_json(answer))
                 self.quality_audit.update(audit)
                 self.quality_audit["unavailable_sources"] = {p: reason for p, reason in bundle["unavailable_requests"].items() if p not in unavailable}
             except (quality.QualityAbort, discovery.DiscoveryAbort, ValueError, TypeError) as error:
-                raise ReviewAbort("Source discovery or finding challenge incomplete or invalid") from error
+                raise ReviewAbort(f"Review incomplete or invalid at {stage}") from error
 
         async def evidence_completion(self, system, bundle):
             user = json.dumps(bundle, sort_keys=True)

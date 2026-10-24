@@ -7,6 +7,7 @@ Source contracts: pinned PR-Agent Review/KeyIssues YAML and GitHub Contents API
 at an immutable ref. No model-selected URLs, commands, revisions or repositories.
 """
 import copy
+import json
 from pathlib import PurePosixPath
 
 
@@ -37,9 +38,18 @@ Do not infer absence from unavailable or excluded source: a path listed in
 unavailable_requests could not be supplied, which says nothing about what it
 contains. A deliberate behavior
 change alone is not a defect. Ignore style and hypothetical hardening suggestions.
-Return YAML with the same review mapping: relevant_tests (string),
-security_concerns (exact 'No' when absent), key_issues_to_review (list of mappings
-with relevant_file, issue_header, issue_content, start_line, end_line).
+Return only YAML with a top-level review mapping matching the supplied runtime
+schema. relevant_tests must be the quoted string "Yes" or "No", never an
+explanation or a YAML boolean. security_concerns must be a string, exactly "No"
+when absent. Quote string scalars (including issue text containing colons), or
+use YAML block scalars for prose. key_issues_to_review is a list of mappings with
+relevant_file, issue_header, issue_content, start_line and end_line; line numbers
+are integers. Do not add source_requests or other fields outside the schema.
+Minimal no-additional-findings response:
+review:
+  relevant_tests: "No"
+  security_concerns: "No"
+  key_issues_to_review: []
 Each issue must identify its real source location and a concrete trigger,
 consequence and repair caused by this diff and supported by supplied source.
 Prefer the changed line when it is the actual defect location. Findings in an
@@ -51,6 +61,14 @@ additional defects and never restate one. The independent publication challenge
 will account for every candidate from both passes; do not interpret an omitted
 preliminary candidate as a resolved finding.
 """
+
+
+def output_contract(schema):
+    """Use the installed PRReview schema rather than a parallel field definition."""
+    return ("\nOutput format is required regardless of the review criteria above. Return only YAML "
+            "with a top-level review mapping; use quoted strings for Yes and No.\n"
+            "Runtime output schema (JSON Schema; response remains YAML):\n"
+            + json.dumps(schema, sort_keys=True))
 
 
 def requested_paths(data, unavailable=None):
