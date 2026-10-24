@@ -273,6 +273,7 @@ review:
         system = completion.await_args_list[1].kwargs["messages"][0]["content"]
         schema = system.split("Runtime output schema (JSON Schema; response remains YAML):\n", 1)[1].split("\nOperator review criteria:", 1)[0]
         self.assertEqual(PRReview.model_json_schema(), json.loads(schema))
+        self.assertLess(system.index("Operator review criteria:"), system.index("Runtime output schema"))
         self.assertEqual([], self.completion_evidence()["findings"])
 
     def test_invalid_discovery_schema_is_named_without_output_or_paid_retry(self):
@@ -332,7 +333,7 @@ review:
                 self.output = self.output.replace("source_requests: []", "source_requests: [src/consumer.py]")
                 self.provider.github_client.get_repo.return_value.get_contents.side_effect = failure
                 completion = AsyncMock(return_value=self.response())
-                with self.assertRaises(review.ReviewAbort):
+                with self.assertRaisesRegex(review.ReviewAbort, "^Review incomplete or invalid at source context$"):
                     self.run_adapter(completion)
                 completion.assert_awaited_once()
                 self.summary_publish.assert_not_called()
@@ -697,7 +698,8 @@ review:
                 self.setUp()
                 self.provider.get_diff_files.return_value[0].head_file = "new\nother\n"
                 completion = AsyncMock(side_effect=[self.response(), self.response(), (output, "stop", self.response()[2])])
-                with self.assertRaises(review.ReviewAbort): self.run_adapter(completion)
+                with self.assertRaisesRegex(review.ReviewAbort, "^Review incomplete or invalid at finding challenge decisions$"):
+                    self.run_adapter(completion)
                 self.assertEqual(3, completion.await_count)
                 self.summary_publish.assert_not_called()
                 self.provider.publish_code_suggestions.assert_not_called()

@@ -620,8 +620,8 @@ async def review(settings):
                 from pr_agent.tools.pr_reviewer import PRReview
                 stage = "source discovery response"
                 answer = await self.evidence_completion(
-                    discovery.SYSTEM + discovery.output_contract(PRReview.model_json_schema())
-                    + "\nOperator review criteria:\n" + instructions, bundle)
+                    discovery.SYSTEM + "\nOperator review criteria:\n" + instructions
+                    + discovery.output_contract(PRReview.model_json_schema()), bundle)
                 enriched = self._load_review_yaml(answer)
                 if isinstance(enriched, dict):
                     # The first call's request key is not part of the review mapping.
@@ -629,7 +629,6 @@ async def review(settings):
                 stage = "source discovery schema"
                 if not self._validate_review_schema(enriched):
                     raise discovery.DiscoveryAbort("Source discovery returned an invalid review schema")
-                stage = "source discovery findings"
                 result_findings(enriched)
                 stage = "source discovery merge"
                 data = discovery.merge(data, enriched)

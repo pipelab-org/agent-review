@@ -65,7 +65,10 @@ preliminary candidate as a resolved finding.
 
 def output_contract(schema):
     """Use the installed PRReview schema rather than a parallel field definition."""
-    return "\nRuntime output schema (JSON Schema; response remains YAML):\n" + json.dumps(schema, sort_keys=True)
+    return ("\nOutput format is required regardless of the review criteria above. Return only YAML "
+            "with a top-level review mapping; use quoted strings for Yes and No.\n"
+            "Runtime output schema (JSON Schema; response remains YAML):\n"
+            + json.dumps(schema, sort_keys=True))
 
 
 def requested_paths(data, unavailable=None):
