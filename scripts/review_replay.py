@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import hashlib
 import io
 import ipaddress
@@ -285,7 +286,7 @@ class Egress:
     """Defense in depth behind the provider. Fixture mode permits no network at all."""
 
     def __init__(self, hosts):
-        self.hosts, self.denied, self.resolved = frozenset(hosts), [], set()
+        self.hosts, self.denied = frozenset(hosts), []
 
     def deny(self, what):
         self.denied.append(what)
@@ -296,9 +297,9 @@ class Egress:
         for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
             value = os.environ.get(name)
             if value and self.hosts:
-                parsed = urlparse(value if "//" in value else "//" + value)
-                if parsed.hostname:
-                    found.add(parsed.hostname)
+                parsed = urlparse(value if "://" in value else "http://" + value)
+                if parsed.hostname and parsed.scheme in ("http", "https"):
+                    found.add((parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)))
         return found
 
     @contextlib.contextmanager
@@ -306,30 +307,39 @@ class Egress:
         import httpx
         import requests
         guard = self
-        permitted = guard.hosts | guard.proxies()
+        proxies = guard.proxies()
+        # Permission belongs to one checked HTTPX transport request, not the process.
+        # ContextVar also follows the async transport's DNS worker context.
+        active_request = contextvars.ContextVar("replay_gateway_request", default=None)
         getaddrinfo, connect, connect_ex = socket.getaddrinfo, socket.socket.connect, socket.socket.connect_ex
         client_send, async_send = httpx.Client.send, httpx.AsyncClient.send
+        single_send = httpx.Client._send_single_request
+        async_single_send = httpx.AsyncClient._send_single_request
 
-        def host_ok(host):
-            return host in permitted
-
-        def resolve(host, *args, **kwargs):
-            if not host_ok(host):
-                guard.deny(f"resolve {host}")
-            result = getaddrinfo(host, *args, **kwargs)
-            guard.resolved.update((item[4][0], item[4][1]) for item in result)
+        def resolve(host, port, *args, **kwargs):
+            state = active_request.get()
+            host = host.decode("ascii") if isinstance(host, bytes) else host
+            if state is None or (host, int(port)) not in state["destinations"]:
+                guard.deny("resolve outside gateway request")
+            result = getaddrinfo(host, port, *args, **kwargs)
+            state["resolved"].update((item[4][0], item[4][1]) for item in result)
             return result
 
         def check_address(address):
-            # Only an address returned for a permitted name may be connected to.
+            state = active_request.get()
+            if state is None:
+                guard.deny("connect outside gateway request")
             if not isinstance(address, tuple) or len(address) < 2:
                 guard.deny("non-IP socket")
             try:
                 ip = str(ipaddress.ip_address(address[0]))
             except ValueError:
                 guard.deny("connect by name")
-            if ip not in {resolved[0] for resolved in guard.resolved}:
-                guard.deny("connect to unresolved address")
+            # Numeric proxy addresses can skip getaddrinfo in asyncio/AnyIO.
+            numeric = {(host, port) for host, port in state["destinations"]
+                       if host == ip}
+            if (ip, address[1]) not in state["resolved"] | numeric:
+                guard.deny("connect to unresolved address or port")
 
         def guarded_connect(sock, address):
             check_address(address)
@@ -340,7 +350,8 @@ class Egress:
             return connect_ex(sock, address)
 
         def check_request(request):
-            if request.url.scheme != "https" or not host_ok(request.url.host):
+            if (request.url.scheme != "https" or request.url.host not in guard.hosts
+                    or request.url.port not in (None, 443)):
                 guard.deny(f"http {request.url.host}")
 
         def sync_send(client, request, *args, **kwargs):
@@ -351,6 +362,25 @@ class Egress:
             check_request(request)
             return await async_send(client, request, *args, **kwargs)
 
+        @contextlib.contextmanager
+        def transport_request(request):
+            # HTTPX's pinned single-request seam runs for each redirect and auth resend.
+            check_request(request)
+            token = active_request.set({"destinations": proxies | {(request.url.host, 443)},
+                                        "resolved": set()})
+            try:
+                yield
+            finally:
+                active_request.reset(token)
+
+        def sync_single(client, request):
+            with transport_request(request):
+                return single_send(client, request)
+
+        async def async_single(client, request):
+            with transport_request(request):
+                return await async_single_send(client, request)
+
         def no_requests(*args, **kwargs):
             guard.deny("requests")
 
@@ -359,6 +389,8 @@ class Egress:
               patch.object(socket.socket, "connect_ex", guarded_connect_ex),
               patch.object(httpx.Client, "send", sync_send),
               patch.object(httpx.AsyncClient, "send", async_guarded),
+              patch.object(httpx.Client, "_send_single_request", sync_single),
+              patch.object(httpx.AsyncClient, "_send_single_request", async_single),
               patch.object(requests.Session, "send", no_requests)):
             yield self
 

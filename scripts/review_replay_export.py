@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 if __package__:
@@ -25,11 +26,12 @@ else:
 # GIT_DIR would silently export a different repository than --repo.
 AMBIENT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
-           "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_REPLACE_REF_BASE")
+           "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_REPLACE_REF_BASE",
+           "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS", "GIT_LITERAL_PATHSPECS")
 # Settings that would otherwise be written into the snapshot (color escapes, blank-line
 # context). The diff flags restate git-diff's documented defaults: unified=3,
 # inter-hunk-context=0, the default algorithm and the indent heuristic.
-GIT = ["git", "--no-replace-objects", "-c", "color.ui=false", "-c", "core.fsmonitor=false",
+GIT = ["git", "--no-replace-objects", "--literal-pathspecs", "-c", "color.ui=false", "-c", "core.fsmonitor=false",
        "-c", "diff.suppressBlankEmpty=false"]
 DIFF = ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color", "--unified=3",
         "--inter-hunk-context=0", "--indent-heuristic", "--diff-algorithm=default"]
@@ -39,7 +41,11 @@ HUNK = re.compile(r"(?m)^@@ -")
 def export(repo, repository, number, base, head, absent=()):
     if not all(snapshots.followups.full_sha(s) for s in (base, head)):
         raise snapshots.SnapshotError("Export needs full base and head commit SHAs")
-    env = {k: v for k, v in os.environ.items() if k not in AMBIENT}
+    env = {k: v for k, v in os.environ.items() if k not in AMBIENT and not k.startswith("GIT_CONFIG")}
+    # git(1): GIT_ALLOW_PROTOCOL overrides protocol.*.allow, including remote helpers.
+    # An empty list refuses every transport, even on Git predating GIT_NO_LAZY_FETCH.
+    # Partial-clone missing objects must fail instead of fetching behind this reader.
+    env.update(GIT_ALLOW_PROTOCOL="", GIT_NO_LAZY_FETCH="1")
 
     def git(*args):
         result = subprocess.run([*GIT, "-C", str(repo), *args], env=env,
@@ -93,7 +99,10 @@ def export(repo, repository, number, base, head, absent=()):
     raw, offset, blobs = result.stdout, 0, {}
     for oid in oids:
         end = raw.index(b"\n", offset)
-        actual, kind, size = raw[offset:end].split()
+        fields = raw[offset:end].split()
+        if len(fields) != 3:
+            raise snapshots.SnapshotError("Required Git blobs are unavailable")
+        actual, kind, size = fields
         if actual.decode() != oid or kind != b"blob":
             raise snapshots.SnapshotError("Git blob identity mismatch")
         offset = end + 1
@@ -120,7 +129,25 @@ def export(repo, repository, number, base, head, absent=()):
         if status not in ("A", "D", "M"):
             raise snapshots.SnapshotError("Changed file status is unsupported")
         before, after = content(old, path), content(new, path)
-        patch = git(*DIFF, base, head, "--", path).decode("utf-8")
+        # git-diff(1) --no-index compares captured bytes outside the source repository.
+        # Attributes and custom drivers there must not change the historical evidence.
+        with tempfile.TemporaryDirectory(prefix="review-replay-diff-") as directory:
+            left, right = Path(directory) / "before", Path(directory) / "after"
+            left.write_bytes(before.encode("utf-8"))
+            right.write_bytes(after.encode("utf-8"))
+            diff_env = dict(env, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                            GIT_ATTR_NOSYSTEM="1")
+            diff_env.pop("GIT_ATTR_SOURCE", None)
+            result = subprocess.run(
+                [*GIT, "-C", directory, "-c", "core.attributesFile=" + os.devnull,
+                 *DIFF, "--no-index", "--text", "--",
+                 os.devnull if status == "A" else str(left),
+                 os.devnull if status == "D" else str(right)],
+                env=diff_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # --no-index implies --exit-code: 1 means differences, not an error.
+            if result.returncode not in (0, 1):
+                raise snapshots.SnapshotError("Captured Git diff failed")
+            patch = result.stdout.decode("utf-8")
         # Header lines, which can contain "@@" in a file name, never start with it.
         start = HUNK.search(patch)
         if start is None:

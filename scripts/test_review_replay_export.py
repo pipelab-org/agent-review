@@ -157,6 +157,58 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             self.export()
 
+    def test_repository_attributes_cannot_change_captured_hunks(self):
+        before = "TAG marker\n" + "".join(f"line {n}\n" for n in range(15))
+        (self.repo/"code.py").write_text(before)
+        self.git("commit", "-qam", "Long fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        (self.repo/"code.py").write_text(before.replace("line 10", "CHANGED"))
+        self.git("commit", "-qam", "Edit")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        expected = self.export()["files"][0]["patch"]
+        (self.repo/".git"/"info").mkdir(exist_ok=True)
+        attributes = self.repo/".git"/"info"/"attributes"
+        attributes.write_text("*.py diff=custom\n")
+        self.git("config", "diff.custom.xfuncname", "^TAG")
+        plain = self.git("diff", self.base, self.head, "--", "code.py")
+        self.assertNotEqual(expected, plain[plain.index("@@"):])
+        self.assertEqual(expected, self.export()["files"][0]["patch"])
+        # A local binary attribute must not suppress a UTF-8 source hunk either.
+        attributes.write_text("*.py -diff\n")
+        self.assertEqual(expected, self.export()["files"][0]["patch"])
+
+    def test_partial_clone_never_fetches_missing_objects(self):
+        self.git("config", "uploadpack.allowFilter", "true")
+        with tempfile.TemporaryDirectory() as directory:
+            clone = Path(directory) / "partial"
+            subprocess.check_call(["git", "clone", "-q", "--filter=blob:none", "--no-checkout",
+                                   self.repo.as_uri(), str(clone)])
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(clone), *args],
+                                               stderr=subprocess.DEVNULL).decode()
+            missing = git("rev-list", "--objects", "--all", "--missing=print")
+            self.assertIn("?", missing)  # real promisor objects, not a mocked subprocess
+            git("config", "protocol.file.allow", "always")
+            with patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_NO_LAZY_FETCH": "0"}):
+                with self.assertRaises(SnapshotError):
+                    exporter.export(clone, "example/project", 1, self.base, self.head)
+            self.assertEqual(missing, git("rev-list", "--objects", "--all", "--missing=print"))
+            # The origin works: ordinary Git lazily retrieves a missing blob.
+            self.assertEqual("value = 2\n", git("show", self.head + ":code.py"))
+            self.assertNotEqual(missing, git("rev-list", "--objects", "--all", "--missing=print"))
+
+    def test_paths_are_literal_even_if_they_are_git_pathspecs(self):
+        for name in ("*.py", ":(glob)*", "ordinary.py"):
+            (self.repo/name).write_text("unique " + name + "\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Add pathspec-shaped names")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        data = self.export()
+        for name in ("*.py", ":(glob)*", "ordinary.py"):
+            with self.subTest(path=name):
+                item = next(f for f in data["files"] if f["filename"] == name)
+                self.assertEqual("@@ -0,0 +1 @@\n+unique " + name + "\n", item["patch"])
+
     def test_absence_cannot_hide_existing_source(self):
         for path in ["consumer.py", "../outside"]:
             with self.subTest(path=path), self.assertRaises(SnapshotError):
