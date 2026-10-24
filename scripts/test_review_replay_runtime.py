@@ -148,6 +148,12 @@ class ReplayRunTests(ReplayTestCase):
         self.assertFalse(doc["comparable"])
         self.assertFalse(doc["inference"]["quality_evidence"])
 
+    def test_plain_provider_data_compares_by_fields_like_the_namespaces_it_replaces(self):
+        first = replay.Obj(None, x=1, y=2)
+        self.assertEqual(first, replay.Obj(replay.Store(), y=2, x=1))
+        self.assertNotEqual(first, replay.Obj(None, x=1))
+        self.assertIn("'x': 1", repr(first))
+
     def test_configured_models_effort_budgets_and_single_attempt_are_preserved(self):
         doc = self.run_replay([text("source_requests: []\n" + CLEAN), text(CLEAN)])
         config = doc["reviewer"]["configuration"]

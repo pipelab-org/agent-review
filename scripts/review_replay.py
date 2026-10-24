@@ -106,6 +106,18 @@ class Obj(Strict):
         self._store = store
         self.__dict__.update(fields)
 
+    # SimpleNamespace semantics, which this replaces: compared and shown by its fields.
+    def _fields(self):
+        return {k: v for k, v in self.__dict__.items() if k != "_store"}
+
+    def __eq__(self, other):
+        return isinstance(other, Obj) and self._fields() == other._fields()
+
+    __hash__ = None
+
+    def __repr__(self):
+        return f"Obj({self._fields()!r})"
+
 
 class Comment(Strict):
     def __init__(self, store, body, *, id=None, user=None, **fields):
