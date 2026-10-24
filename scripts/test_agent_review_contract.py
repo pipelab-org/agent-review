@@ -202,6 +202,7 @@ class CallerTests(unittest.TestCase):
         reply = WORKFLOW["jobs"]["reply"]
         source, checkout, policy, profile, validate, run, outcome = reply["steps"]
         self.assertEqual("agent-review-outcome", outcome["with"]["name"])
+        self.assertEqual(("true", "true"), (outcome["continue-on-error"], outcome["with"]["overwrite"]))
         self.assertEqual('reply-source', source['id'])
         self.assertNotIn("secrets.", json.dumps(policy))
         self.assertEqual("${{ steps.policy.outputs.sha }}", profile["with"]["ref"])
@@ -550,6 +551,8 @@ class ReporterTests(unittest.TestCase):
         self.assertEqual('always()', upload['if'])
         self.assertTrue(upload['uses'].startswith('actions/upload-artifact@'))
         self.assertEqual('agent-review-notifier-outcome', upload['with']['name'])
+        # Diagnostics survive a re-run and cannot turn a run red themselves.
+        self.assertEqual(('true', 'true'), (upload['continue-on-error'], upload['with']['overwrite']))
         self.assertEqual(job['steps'][0]['env']['REVIEW_OUTCOME_PATH'], upload['with']['path'])
 
     def test_failure_is_visible_and_existing_per_run_bot_notice_is_updated(self):

@@ -1,10 +1,12 @@
 # Copyright 2026 Pipelock contributors
 # SPDX-License-Identifier: Apache-2.0
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from scripts import review_replay_export as exporter
 from scripts.review_replay_snapshot import SnapshotError
 
@@ -51,6 +53,109 @@ class ExportTests(unittest.TestCase):
     def test_external_diff_program_is_never_executed(self):
         self.git("config", "diff.external", "a-command-that-must-not-run")
         self.assertEqual(1, len(self.export()["files"]))
+
+    def test_no_repository_program_or_hook_runs_during_export(self):
+        marker = self.repo.parent / (self.repo.name + "-ran")
+        run = f"touch {marker}"
+        self.git("config", "core.fsmonitor", f"{run}; echo")
+        self.git("config", "diff.evil.textconv", f"sh -c '{run}; cat' --")
+        self.git("config", "diff.evil.command", f"{run}; true")
+        (self.repo/".gitattributes").write_text("*.py diff=evil\n")
+        hook = self.repo/".git"/"hooks"/"post-checkout"
+        hook.write_text(f"#!/bin/sh\n{run}\n")
+        hook.chmod(0o755)
+        with patch.dict(os.environ, {"GIT_EXTERNAL_DIFF": run}):
+            self.assertEqual(1, len(self.export()["files"]))
+        self.assertFalse(marker.exists())
+
+    def test_ambient_git_settings_do_not_change_the_patch(self):
+        (self.repo/"code.py").write_text("".join(f"line {i}\n" for i in range(12)))
+        self.git("commit", "-qam", "Longer fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        (self.repo/"code.py").write_text("".join(f"line {i}\n" if i != 6 else "\nchanged\n" for i in range(12)))
+        self.git("commit", "-qam", "Edit the middle")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        expected = self.export()["files"][0]["patch"]
+        self.assertIn(" line 3\n", expected)
+        for key, value in (("color.ui", "always"), ("diff.context", "0"), ("diff.suppressBlankEmpty", "true"),
+                           ("diff.algorithm", "patience"), ("diff.interHunkContext", "9"),
+                           ("diff.indentHeuristic", "false")):
+            self.git("config", key, value)
+        self.assertEqual(expected, self.export()["files"][0]["patch"])
+        self.assertNotIn("\x1b", expected)
+        # An inherited repository selector never redirects the export to another repository.
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        subprocess.check_call(["git", "init", "-q", other.name])
+        with patch.dict(os.environ, {"GIT_DIR": str(Path(other.name) / ".git")}):
+            self.assertEqual(expected, self.export()["files"][0]["patch"])
+
+    def test_every_repository_diff_setting_that_changes_output_is_pinned(self):
+        text = lambda lines: "".join(line + "\n" for line in lines)  # noqa: E731
+        before = {
+            # Inputs found by search where each setting alone changes git's own output.
+            "algorithm.txt": ["a", "if (a) {", "a", "{", "  y;", "{", "", "b", "b", "{", "", "  x;"],
+            "indent.txt": ["a", "if (a) {", "if (a) {", "{", "{", "{", "{", "  x;", "{", "a", "{"],
+            "blank.txt": ["p", "", "q", "r", "s", "t"],
+            "hunks.txt": [f"l{i}" for i in range(20)],
+        }
+        after = {
+            "algorithm.txt": ["a", "if (a) {", "}", "if (a) {", "a", "{", "  y;", "{", "c", "", "{", "",
+                              "  x;", "  x;", "b", "b", "{", "", "  x;"],
+            "indent.txt": ["a", "if (a) {", "  x;", "", "if (a) {", "", "}", "if (a) {", "{", "{", "{", "{", "{",
+                           "  x;", "{", "a", "{"],
+            "blank.txt": ["p", "", "q", "R", "s", "t"],
+            "hunks.txt": [f"l{i}" if i not in (2, 10) else "changed" for i in range(20)],
+        }
+        settings = {"algorithm.txt": ("diff.algorithm", "patience"), "indent.txt": ("diff.indentHeuristic", "false"),
+                    "blank.txt": ("diff.suppressBlankEmpty", "true"), "hunks.txt": ("diff.interHunkContext", "9")}
+        for name, lines in before.items():
+            (self.repo/name).write_text(text(lines))
+        self.git("add", ".")
+        self.git("commit", "-qm", "Diff fixtures")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        for name, lines in after.items():
+            (self.repo/name).write_text(text(lines))
+        self.git("commit", "-qam", "Edit the diff fixtures")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        expected = {f["filename"]: f["patch"] for f in self.export()["files"]}
+        for name, (key, value) in settings.items():
+            with self.subTest(setting=key):
+                self.git("config", key, value)
+                # The setting really does change plain git's output for this input ...
+                plain = self.git("diff", "--no-color", self.base, self.head, "--", name)
+                self.assertNotEqual(expected[name], plain[plain.index("@@"):])
+                # ... and cannot change the snapshot.
+                self.assertEqual(expected[name], {f["filename"]: f["patch"] for f in self.export()["files"]}[name])
+                self.git("config", "--unset", key)
+
+    def test_a_file_name_containing_hunk_markers_cannot_start_the_patch_inside_its_header(self):
+        (self.repo/"odd@@name.py").write_text("one\n")
+        self.git("add", "odd@@name.py")
+        self.git("commit", "-qm", "Add a marker-like name")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        patch = {f["filename"]: f["patch"] for f in self.export()["files"]}["odd@@name.py"]
+        self.assertEqual("@@ -0,0 +1 @@\n+one\n", patch)
+
+    @unittest.skipIf(os.name == "nt", "a backslash cannot appear in a Windows file name")
+    def test_unrequestable_unchanged_paths_are_skipped_but_changed_ones_refuse_export(self):
+        (self.repo/"back\\slash.txt").write_text("legal on Linux, never a valid source request\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Add a path model requests cannot name")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        (self.repo/"code.py").write_text("value = 3\n")
+        self.git("commit", "-qam", "Change something else")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        data = self.export()
+        self.assertEqual(["code.py"], [f["filename"] for f in data["files"]])
+        self.assertNotIn("back\\slash.txt", data["sources"])
+        with self.assertRaises(SnapshotError):
+            self.export(absent=["back\\slash.txt"])
+        (self.repo/"back\\slash.txt").write_text("changed\n")
+        self.git("commit", "-qam", "Change the unrequestable path")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        with self.assertRaises(SnapshotError):
+            self.export()
 
     def test_absence_cannot_hide_existing_source(self):
         for path in ["consumer.py", "../outside"]:

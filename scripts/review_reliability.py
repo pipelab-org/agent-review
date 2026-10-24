@@ -242,7 +242,6 @@ class Observer:
 
     def reset(self, budget=None):
         self.phase = "configuration"
-        self.failed_phase = None
         self.errors, self.rate_limited, self.first, self.last = 0, 0, None, None
         self.throttled_reads, self.waits, self.waited = 0, 0, 0.0
         self.decision = None
@@ -297,15 +296,37 @@ def advance(name):
     OBSERVER.phase = name
 
 
+PHASE_TAG = "_review_failed_phase"
+
+
+def _tag(error, name):
+    # The phase belongs to the exception, not to the run: a failure the adapter
+    # recovers from (a billing rejection that falls back to the next credential) must
+    # not mislabel a later, unrelated failure. The innermost phase crossed wins.
+    try:
+        if PHASE_TAG not in error.__dict__:
+            setattr(error, PHASE_TAG, name)
+    except (AttributeError, TypeError):
+        pass
+
+
+def failing_phase(error):
+    """The phase recorded on the newest exception in the chain that crossed one, else None."""
+    for item in _chain(error):
+        name = getattr(item, "__dict__", {}).get(PHASE_TAG)
+        if name in PHASES:
+            return name
+    return None
+
+
 @contextlib.contextmanager
 def phase(name):
     """A nested phase. The innermost phase that an exception crosses is the failing one."""
     previous, OBSERVER.phase = OBSERVER.phase, name
     try:
         yield
-    except BaseException:
-        if OBSERVER.failed_phase is None:
-            OBSERVER.failed_phase = name
+    except BaseException as error:
+        _tag(error, name)
         raise
     finally:
         OBSERVER.phase = previous
@@ -333,6 +354,8 @@ def _github_shape(error):
 
 def throttled(error):
     """True when anything in the exception chain is a GitHub rate-limit response."""
+    if failing_phase(error) == "inference":
+        return False  # a model provider's throttle is never a GitHub one
     for item in _chain(error):
         shape = _github_shape(item)
         if shape and classify(*shape) in RATE_CATEGORIES:
@@ -347,14 +370,17 @@ def _name(error):
 
 def diagnostic(error, failed_phase=None):
     """The allowlisted description of one failure."""
+    phase_name = failed_phase if failed_phase in PHASES else failing_phase(error) or OBSERVER.phase
+    entry = {"phase": phase_name if phase_name in PHASES else "configuration"}
     found = None
-    for item in _chain(error):
+    # Only the model call runs in the inference phase, so a numeric status on anything
+    # it raised belongs to the model provider (litellm wraps aiohttp errors that carry
+    # .status and .headers), never to GitHub.
+    for item in _chain(error) if entry["phase"] != "inference" else ():
         shape = _github_shape(item)
         if shape:
             found = (item, shape)
             break
-    phase_name = failed_phase if failed_phase in PHASES else OBSERVER.failed_phase or OBSERVER.phase
-    entry = {"phase": phase_name if phase_name in PHASES else "configuration"}
     if found:
         item, (status, headers, message) = found
         entry.update(category=classify(status, headers, message), status=status,
@@ -379,9 +405,12 @@ def diagnostic(error, failed_phase=None):
         # A model provider's HTTP status is a number, not its message. Kept apart from
         # GitHub's `status` so a provider 429 is never read as a GitHub rate limit.
         for item in _chain(error):
-            status = getattr(item, "status_code", None)
-            if type(status) is int and 100 <= status <= 599:
-                entry["provider_status"] = status
+            for attribute in ("status_code", "status"):
+                status = getattr(item, attribute, None)
+                if type(status) is int and 100 <= status <= 599:
+                    entry["provider_status"] = status
+                    break
+            if "provider_status" in entry:
                 break
     return entry
 

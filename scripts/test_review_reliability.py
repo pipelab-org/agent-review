@@ -161,6 +161,7 @@ class BudgetTests(unittest.TestCase):
             self.assertLess(wait + calls * timeout, workflow["jobs"][job]["timeout-minutes"] * 60, job)
         self.assertEqual(1, config["github"]["seconds_between_writes"])
         self.assertEqual(0, config["github"]["api_retries"])
+        self.assertEqual(1, config["github"]["ratelimit_retries"])
 
 
 class EndpointKindTests(unittest.TestCase):
@@ -189,9 +190,57 @@ class DiagnosticTests(unittest.TestCase):
             with reliability.phase("review"):
                 with reliability.phase("inference"):
                     raise RuntimeError(SECRET)
-        self.assertEqual("inference", reliability.OBSERVER.failed_phase)
         self.assertEqual("context", reliability.OBSERVER.phase)
-        self.assertEqual("inference", reliability.diagnostic(RuntimeError())["phase"])
+
+    def test_a_recovered_failure_does_not_mislabel_a_later_one(self):
+        # The billing fallback catches a rejection that crossed the inference phase.
+        reliability.advance("review")
+        try:
+            with reliability.phase("inference"):
+                raise RuntimeError("recovered by the next credential slot")
+        except RuntimeError:
+            pass
+        reliability.advance("completion")
+        later = review.ReviewAbort("Completion evidence is incomplete")
+        self.assertEqual("completion", reliability.diagnostic(later)["phase"])
+        try:
+            with reliability.phase("publication"):
+                raise OSError("write failed")
+        except OSError as error:
+            self.assertEqual("publication", reliability.diagnostic(error)["phase"])
+        # The innermost phase an exception crosses is its phase, even through a wrapper.
+        try:
+            with reliability.phase("review"):
+                try:
+                    with reliability.phase("inference"):
+                        raise RuntimeError(SECRET)
+                except RuntimeError:
+                    raise review.ReviewAbort("Provider failed; ambiguous requests are never retried") from None
+        except review.ReviewAbort as error:
+            self.assertEqual("review", reliability.failing_phase(error))
+            self.assertEqual("review", reliability.diagnostic(error)["phase"])
+        self.assertIsNone(reliability.failing_phase(RuntimeError()))
+
+    def test_a_status_on_a_model_call_error_is_never_read_as_github(self):
+        # litellm wraps aiohttp errors that carry .status and .headers like GitHub's own.
+        class ClientResponseError(Exception):
+            status, headers, message = 429, {"retry-after": "5"}, SECRET
+
+        try:
+            with reliability.phase("inference"):
+                try:
+                    raise ClientResponseError()
+                except Exception:
+                    raise RuntimeError("provider wrapper") from None
+        except RuntimeError as error:
+            caught = error
+        entry = reliability.diagnostic(caught)
+        self.assertEqual(("inference", 429), (entry["phase"], entry["provider_status"]))
+        for key in ("status", "rate_limit", "decision"):
+            self.assertNotIn(key, entry)
+        self.assertNotIn("rate_limit", entry["category"])
+        self.assertFalse(reliability.throttled(caught))
+        self.assertNotIn(SECRET, json.dumps(entry))
 
     def test_github_error_is_found_through_the_adapters_wrapping(self):
         reliability.advance("provider_init")
@@ -716,6 +765,25 @@ class PinnedRuntimeInstallTests(unittest.TestCase):
         self.assertEqual(original_client, GithubProvider._get_github_client)
         self.assertIs(original_error, Requester.__dict__["createException"].__func__)
         self.assertEqual(levels, {name: logging.getLogger(name).level for name in levels})
+
+    def test_the_provider_does_not_repeat_a_throttled_diff_read_on_its_own(self):
+        # Upstream wraps get_diff_files in retry_call(tries=GITHUB.RATELIMIT_RETRIES, default 5,
+        # sleeping 2-16 s between tries). Each try re-reads the pull request from a GitHub that
+        # just refused, outside the wait budget and after the policy decided to stop.
+        from pr_agent.git_providers.github_provider import GithubProvider
+        from pr_agent.servers.utils import RateLimitExceeded
+        calls = []
+
+        def throttled_read(provider):
+            calls.append(1)
+            raise RateLimitExceeded("Rate limit exceeded for GitHub API.")
+
+        provider = GithubProvider.__new__(GithubProvider)
+        with (patch.object(GithubProvider, "_get_diff_files", throttled_read),
+              patch("retry.api.time.sleep") as slept, self.assertRaises(RateLimitExceeded)):
+            provider.get_diff_files()
+        self.assertEqual(1, len(calls))
+        slept.assert_not_called()
 
     def test_throttled_provider_init_stops_before_any_model_call_and_leaves_an_outcome(self):
         from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler  # noqa: F401

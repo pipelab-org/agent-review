@@ -30,7 +30,6 @@ import os
 import socket
 import sys
 from pathlib import Path
-from types import SimpleNamespace as NS
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -99,11 +98,20 @@ class Strict:
         raise ReplayUnsupported(f"{type(self).__name__}.{name}")
 
 
+class Obj(Strict):
+    """Plain data the provider hands out. Reading a field it lacks is an unmodeled access,
+    so upstream code that catches the AttributeError still invalidates comparison."""
+
+    def __init__(self, store, **fields):
+        self._store = store
+        self.__dict__.update(fields)
+
+
 class Comment(Strict):
     def __init__(self, store, body, *, id=None, user=None, **fields):
         self._store = store
         self.id, self.body = (store.new_id() if id is None else id), body
-        self.user = user if user is not None else NS(**followups.BOT)
+        self.user = user if user is not None else Obj(store, **followups.BOT)
         self.html_url = f"replay:comment/{self.id}"
         self.raw_data = {}
         self.history = [body]
@@ -146,7 +154,7 @@ class Repo(Strict):
         else:
             self._store.uncaptured.append(path)
             raise Uncaptured("path is not in the snapshot")
-        return NS(type="file", encoding="base64", raw_data={}, decoded_content=text.encode("utf-8"))
+        return Obj(self._store, type="file", encoding="base64", raw_data={}, decoded_content=text.encode("utf-8"))
 
 
 class Pull(Strict):
@@ -156,13 +164,13 @@ class Pull(Strict):
         self.number, self.title, self.body = snapshot.number, data["title"], data["description"]
         self.state = "open"  # replay presents the snapshot as an open same-repository PR
         self.html_url = f"replay:pull/{snapshot.number}"
-        self.head = NS(sha=snapshot.head, ref=data["branch"],
-                       repo=NS(full_name=snapshot.repository, fork=False))
-        self.base = NS(sha=snapshot.base, ref="base", repo=NS(full_name=snapshot.repository))
+        self.head = Obj(store, sha=snapshot.head, ref=data["branch"],
+                        repo=Obj(store, full_name=snapshot.repository, fork=False))
+        self.base = Obj(store, sha=snapshot.base, ref="base", repo=Obj(store, full_name=snapshot.repository))
         self.comments_list = []
 
     def get_commits(self):
-        return [NS(commit=NS(message=m)) for m in self.snapshot.data["commits"]]
+        return [Obj(self._store, commit=Obj(self._store, message=m)) for m in self.snapshot.data["commits"]]
 
     def get_issue_comments(self):
         # Prior completion records would let the adapter short-circuit to reuse. A replay
@@ -173,7 +181,7 @@ class Pull(Strict):
         return self.get_review_comments()
 
     def get_review_comments(self):
-        threads = [Comment(self._store, t["body"], id=t["id"], user=NS(login="snapshot-author", id=0, type="User"),
+        threads = [Comment(self._store, t["body"], id=t["id"], user=Obj(self._store, login="snapshot-author", id=0, type="User"),
                            path=t["path"], commit_id=self.snapshot.head, raw_data={
                                "in_reply_to_id": t["in_reply_to_id"], "pull_request_review_id": None})
                    for t in self.snapshot.data["discussion"]["threads"]]
@@ -193,7 +201,7 @@ class Pull(Strict):
         self._store.reviews.append({"review_id": review_id, "comments": [
             {k: v for k, v in item.items() if k in ("path", "body", "line", "side", "start_line", "start_side")}
             for item in kwargs.get("comments", [])]})
-        return NS(id=review_id, user=NS(**followups.BOT), commit_id=self.snapshot.head)
+        return Obj(self._store, id=review_id, user=Obj(self._store, **followups.BOT), commit_id=self.snapshot.head)
 
 
 class Client(Strict):
@@ -221,8 +229,8 @@ def provider_class():
             self.base_url_html = "replay:"
             self.issue_main = None
             self.max_comment_chars = 65000
-            self.last_commit_id = NS(sha=snapshot.head)
-            self.incremental = NS(is_incremental=False)
+            self.last_commit_id = Obj(store, sha=snapshot.head)
+            self.incremental = Obj(store, is_incremental=False)
             self.unreviewed_files_map = {}
             self.diff_files = None
             self.git_files = snapshot.file_patch_infos()
@@ -588,7 +596,9 @@ def main(argv=None):
         Path(args.output).write_text(text, encoding="utf-8")
     else:
         sys.stdout.write(text)
-    return 0 if document["adapter_outcome"] == "completed" else 1
+    # A completed run that read something uncaptured, modeled nothing for it or was denied
+    # a request is not a result to compare, so it must not look like success to a script.
+    return 0 if document["adapter_outcome"] == "completed" and document["comparable"] else 1
 
 
 if __name__ == "__main__":

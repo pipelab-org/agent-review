@@ -11,6 +11,8 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -19,13 +21,28 @@ if __package__:
 else:
     import review_replay_snapshot as snapshots
 
+# Variables that select a repository or change how a diff is produced. An inherited
+# GIT_DIR would silently export a different repository than --repo.
+AMBIENT = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+           "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_REPLACE_REF_BASE")
+# Settings that would otherwise be written into the snapshot (color escapes, blank-line
+# context). The diff flags restate git-diff's documented defaults: unified=3,
+# inter-hunk-context=0, the default algorithm and the indent heuristic.
+GIT = ["git", "--no-replace-objects", "-c", "color.ui=false", "-c", "core.fsmonitor=false",
+       "-c", "diff.suppressBlankEmpty=false"]
+DIFF = ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color", "--unified=3",
+        "--inter-hunk-context=0", "--indent-heuristic", "--diff-algorithm=default"]
+HUNK = re.compile(r"(?m)^@@ -")
+
 
 def export(repo, repository, number, base, head, absent=()):
     if not all(snapshots.followups.full_sha(s) for s in (base, head)):
         raise snapshots.SnapshotError("Export needs full base and head commit SHAs")
+    env = {k: v for k, v in os.environ.items() if k not in AMBIENT}
 
     def git(*args):
-        result = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), *args],
+        result = subprocess.run([*GIT, "-C", str(repo), *args], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode:
             raise snapshots.SnapshotError("Required Git objects are unavailable")
@@ -35,6 +52,10 @@ def export(repo, repository, number, base, head, absent=()):
         if git("cat-file", "-t", sha).strip() != b"commit":
             raise snapshots.SnapshotError("Export identity must name a commit")
 
+    # A path the model-request validator rejects can never be requested, so an unchanged
+    # one is simply not capturable; one the change touches cannot be replayed.
+    unlisted = set()
+
     def tree(sha):
         result = {}
         for entry in git("ls-tree", "-r", "-z", sha).split(b"\0"):
@@ -42,9 +63,13 @@ def export(repo, repository, number, base, head, absent=()):
                 continue
             metadata, raw_path = entry.split(b"\t", 1)
             mode, kind, oid = metadata.split()
-            path = raw_path.decode("utf-8")
-            if not snapshots.repo_path(path):
-                raise snapshots.SnapshotError("Git tree contains an unsupported path")
+            try:
+                path = raw_path.decode("utf-8")
+            except UnicodeDecodeError:
+                path = None
+            if path is None or not snapshots.repo_path(path):
+                unlisted.add(raw_path)
+                continue
             result[path] = (mode, kind, oid.decode("ascii"))
         return result
 
@@ -52,13 +77,15 @@ def export(repo, repository, number, base, head, absent=()):
     changes = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", base, head).split(b"\0")
     if changes[-1] == b"":
         changes.pop()
+    if len(changes) % 2 or any(raw in unlisted for raw in changes[1::2]):
+        raise snapshots.SnapshotError("Git tree contains an unsupported path")
     pairs = [(changes[i].decode("ascii"), changes[i+1].decode("utf-8")) for i in range(0, len(changes), 2)]
     needed = {v[2] for v in new.values() if v[0] in (b"100644", b"100755")}
     needed.update(old[p][2] for _, p in pairs if p in old and old[p][0] in (b"100644", b"100755"))
     # One batch avoids a process for every source file. Git's size-prefixed output
     # keeps arbitrary blob text from being interpreted as another response header.
     oids = sorted(needed)
-    result = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "cat-file", "--batch"],
+    result = subprocess.run([*GIT, "-C", str(repo), "cat-file", "--batch"], env=env,
                             input="".join(oid+"\n" for oid in oids).encode(),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode:
@@ -93,18 +120,21 @@ def export(repo, repository, number, base, head, absent=()):
         if status not in ("A", "D", "M"):
             raise snapshots.SnapshotError("Changed file status is unsupported")
         before, after = content(old, path), content(new, path)
-        patch = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, head, "--", path).decode("utf-8")
-        start = patch.find("@@")
-        if start < 0:
+        patch = git(*DIFF, base, head, "--", path).decode("utf-8")
+        # Header lines, which can contain "@@" in a file name, never start with it.
+        start = HUNK.search(patch)
+        if start is None:
             raise snapshots.SnapshotError("Changed file has no replayable text hunk")
         files.append(dict(filename=path, base_file=before, head_file=after,
-                          patch=patch[start:],
+                          patch=patch[start.start():],
                           edit_type={"A":"ADDED", "D":"DELETED", "M":"MODIFIED"}[status]))
     changed = {f["filename"] for f in files}
     sources = {path:blobs[oid] for path,(mode,kind,oid) in new.items()
                if path not in changed and mode in (b"100644", b"100755") and blobs.get(oid) is not None}
     for path in absent:
-        if not snapshots.repo_path(path) or path in new or any(p.startswith(path+"/") for p in new):
+        raw = path.encode("utf-8", "surrogateescape")
+        if (not snapshots.repo_path(path) or path in new or any(p.startswith(path+"/") for p in new)
+                or any(u == raw or u.startswith(raw + b"/") for u in unlisted)):
             raise snapshots.SnapshotError("Declared absent path exists or is invalid")
     timestamp = int(git("show", "-s", "--format=%ct", head).strip())
     data = dict(schema=snapshots.SCHEMA, version=snapshots.VERSION, repository=repository, number=number,

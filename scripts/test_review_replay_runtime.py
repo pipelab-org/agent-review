@@ -121,6 +121,33 @@ class ReplayRunTests(ReplayTestCase):
         self.assertFalse(doc["comparable"])
         self.assertFalse(doc["inference"]["quality_evidence"])
 
+    def test_handled_reads_of_nested_provider_data_are_recorded_too(self):
+        original = replay.provider_class
+
+        def provider_probing_unmodeled_fields():
+            base = original()
+
+            class Provider(base):
+                def get_languages(self):
+                    # Plain data objects, not only the Strict API objects.
+                    for probe in (lambda: self.pr.head.repo.owner, lambda: self.pr.base.user,
+                                  lambda: self.last_commit_id.committer):
+                        try:
+                            probe()
+                        except AttributeError:
+                            pass
+                    return super().get_languages()
+
+            return Provider
+
+        with patch.object(replay, "provider_class", provider_probing_unmodeled_fields):
+            doc = self.run_replay([text(CLEAN), text(CLEAN)])
+        self.assertEqual("completed", doc["adapter_outcome"])
+        self.assertEqual(["Obj.committer", "Obj.owner", "Obj.user"],
+                         doc["unmodeled_provider_access"])
+        self.assertFalse(doc["comparable"])
+        self.assertFalse(doc["inference"]["quality_evidence"])
+
     def test_configured_models_effort_budgets_and_single_attempt_are_preserved(self):
         doc = self.run_replay([text("source_requests: []\n" + CLEAN), text(CLEAN)])
         config = doc["reviewer"]["configuration"]
@@ -483,6 +510,22 @@ class CliTests(ReplayTestCase):
         code, out, _ = self.cli(*self.files([{"error": {"timeout": True}}]))
         self.assertEqual(1, code)
         self.assertEqual("aborted", json.loads(out)["adapter_outcome"])
+
+    def test_completed_but_not_comparable_replay_exits_nonzero_and_still_reports(self):
+        original = replay.provider_class
+
+        def provider_with_missing_read():
+            class Provider(original()):
+                def get_languages(self):
+                    hasattr(self.pr, "unsupported_capability")  # handled, so the run completes
+                    return super().get_languages()
+
+            return Provider
+
+        with patch.object(replay, "provider_class", provider_with_missing_read):
+            code, out, _ = self.cli(*self.files([text("source_requests: []\n" + CLEAN), text(CLEAN)]))
+        doc = json.loads(out)
+        self.assertEqual((1, "completed", False), (code, doc["adapter_outcome"], doc["comparable"]))
 
     def test_bad_inputs_exit_two_without_running_or_echoing_content(self):
         base = self.files([text(CLEAN)])
