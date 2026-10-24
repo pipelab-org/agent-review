@@ -81,6 +81,16 @@ that agrees with it by construction, is not independent evidence.
 When no finding is supported, return none and say so plainly.
 """
 
+# GitHub's published guidance for the REST API: make requests serially and wait at
+# least one second between mutative requests (POST, PATCH, PUT, DELETE).
+# https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api
+# Retries are installed by the adapter (GET/HEAD only, bounded by a wait budget);
+# the provider's own api_retries would also repeat writes, so it stays off.
+[github]
+seconds_between_requests = 0
+seconds_between_writes = 1
+api_retries = 0
+
 [otel]
 is_enabled = false
 exporter_type = "none"

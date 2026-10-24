@@ -23,11 +23,13 @@ if __package__:
     from . import review_followups as followups
     from . import review_quality as quality
     from . import review_discovery as discovery
+    from . import review_reliability as reliability
 else:
     from agent_review_contract import load_profile
     import review_followups as followups
     import review_quality as quality
     import review_discovery as discovery
+    import review_reliability as reliability
 
 PROFILE = Path(__file__).resolve().parents[1] / ".github" / "agent-review.toml"
 CONFIG = Path(__file__).resolve().parents[1] / ".github" / "pr-agent.toml"
@@ -130,7 +132,8 @@ class InlinePublisher:
 
     def __call__(self, *args, **kwargs):
         try:
-            return self.publish(*args, **kwargs)
+            with reliability.phase("publication"):
+                return self.publish(*args, **kwargs)
         except Exception as error:
             # Includes HTTP 422: never let upstream retry an ambiguous write.
             raise ReviewAbort(f"Inline publication verification failed ({type(error).__name__})") from None
@@ -228,7 +231,8 @@ class CompletionChain:
         while self.index < len(self.chain):
             model, slot = self.chain[self.index]
             try:
-                result = await self.complete(model, slot, *args)
+                with reliability.phase("inference"):
+                    result = await self.complete(model, slot, *args)
             except Exception as error:
                 if billing_rejection(error):
                     self.rejections += 1
@@ -523,6 +527,7 @@ async def review(settings):
         if not chain:
             raise ReviewAbort("No configured provider credential is available")
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        reliability.advance("context")
         await followups.reply_workflow(settings, router, binding, github_token, member_token, event, os.environ)
         return
 
@@ -705,7 +710,10 @@ async def review(settings):
             return result + f"\n\nReviewed base `{base}` and head `{head}`.\n\n{record}\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
 
 
+    # The provider's constructor reads the pull request and its commits.
+    reliability.advance("provider_init")
     reviewer = Reviewer(f"https://github.com/{repo}/pull/{number}", ai_handler=Handler)
+    reliability.advance("context")
     reviewer.check_binding()
     provider = reviewer.git_provider
     repo_obj = provider.github_client.get_repo(repo)
@@ -714,15 +722,20 @@ async def review(settings):
     scope = followups.scope_for(repo_obj, binding, records)
     if scope["kind"] == "unchanged":
         reviewer.check_binding(fresh=True)
-        provider.pr.create_issue_comment(
-            f"{notice}\nThis snapshot already has a verified completed review chain; no new inference was requested.\n\n"
-            f"Coverage chain ends at Actions run `{scope['parent']}`. [Actions run]({run_url}).")
+        with reliability.phase("publication"):
+            provider.pr.create_issue_comment(
+                f"{notice}\nThis snapshot already has a verified completed review chain; no new inference was requested.\n\n"
+                f"Coverage chain ends at Actions run `{scope['parent']}`. [Actions run]({run_url}).")
         print("Reused verified completed review chain")
         return
     if scope["kind"] == "incremental":
         try:
             files = followups.incremental_files(repo_obj, scope["from"], head)
-        except Exception:
+        except Exception as error:
+            # A rate limit is not an unsupported shape: falling back would send a
+            # full review into a throttled GitHub after paid inference.
+            if reliability.throttled(error):
+                raise
             # Unsupported compare/content shapes or publisher truncation cannot
             # suppress review. The unchanged provider retains its full PR diff.
             scope = {"kind": "full", "from": base, "to": head, "parent": None, "full_head": True}
@@ -749,17 +762,20 @@ async def review(settings):
     pr = reviewer.git_provider.pr
     # The review job's repository/PR concurrency serializes this status pattern.
     # A running or failed record is never evidence of successful completion.
-    status = pr.create_issue_comment(
-        f"{notice}\n<!-- {STATUS_MARKER} state=running key={key} -->\n"
-        f"Diff review started for base `{base}` and head `{head}`.\n\n{record}\n\n"
-        f"[Actions run]({run_url}).")
+    with reliability.phase("publication"):
+        status = pr.create_issue_comment(
+            f"{notice}\n<!-- {STATUS_MARKER} state=running key={key} -->\n"
+            f"Diff review started for base `{base}` and head `{head}`.\n\n{record}\n\n"
+            f"[Actions run]({run_url}).")
+    reliability.advance("review")
     published, roots = [], []
     provider = reviewer.git_provider
     original_create_review = getattr(pr, "create_review", None)
 
     def require_publication(original):
         def publish(*args, **kwargs):
-            result = original(*args, **kwargs)
+            with reliability.phase("publication"):
+                result = original(*args, **kwargs)
             if result is None or result is False:
                 raise ReviewAbort("Review summary publication failed")
             published.append(result)
@@ -787,6 +803,7 @@ async def review(settings):
         # Upstream raises generic exceptions, for example after an unparseable
         # prediction. Report only the class; the message can carry model output.
         raise ReviewAbort(f"PR-Agent review failed ({type(error).__name__})") from None
+    reliability.advance("completion")
     if files != []:
         check_complete(reviewer, router.calls, command_failed())
     if not published:
@@ -843,17 +860,34 @@ def main():
     parser.add_argument("--check-config", action="store_true")
     args = parser.parse_args()
     try:
+        reliability.begin()
         settings, litellm = configure()
         print_settings(settings, litellm)
         if not args.check_config:
-            asyncio.run(review(settings))
+            with reliability.runtime():
+                asyncio.run(review(settings))
+    except KeyboardInterrupt as error:
+        # The runner interrupts a step that exceeds the job limit or is cancelled.
+        report(error)
+        raise
     except (ReviewAbort, Exception) as error:
         # Provider exception messages can echo requests or credentials. Report a
         # fixed failure class; only our own ReviewAbort messages are safe to show.
         message = str(error) if isinstance(error, (ReviewAbort, followups.FollowupAbort)) else type(error).__name__
         print(f"Review failed: {message}", file=sys.stderr)
+        report(error)
         return 1
+    if not args.check_config:
+        report()
     return 0
+
+
+def report(error=None):
+    """Allowlisted outcome file, step summary and log line; never changes the exit status."""
+    try:
+        reliability.report(error)
+    except Exception:
+        print("Review outcome could not be recorded", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -164,12 +164,23 @@ jobs:
           LITELLM_LOCAL_MODEL_COST_MAP: 'True'
           OTEL_SDK_DISABLED: 'true'
           REVIEW_COMPLETION_PATH: ${{ runner.temp }}/agent-review-completion/completion.json
+          REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
         run: python trusted-agent-review/scripts/pr_agent_review.py
       - name: Preserve immutable completion proof for later commands and replies
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: agent-review-completion
           path: ${{ runner.temp }}/agent-review-completion/completion.json
+          if-no-files-found: ignore
+      # Diagnostics only, under a different artifact name: completion proof is
+      # exactly one completion.json from a successful run. This one also records
+      # failures. The same facts go to the step summary, a local file write.
+      - name: Preserve the allowlisted run outcome
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-review-outcome
+          path: ${{ runner.temp }}/agent-review-outcome/outcome.json
           if-no-files-found: ignore
 
   reply:
@@ -289,7 +300,15 @@ jobs:
           REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
           LITELLM_LOCAL_MODEL_COST_MAP: 'True'
           OTEL_SDK_DISABLED: 'true'
+          REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
         run: python trusted-agent-review/scripts/pr_agent_review.py
+      - name: Preserve the allowlisted run outcome
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-review-outcome
+          path: ${{ runner.temp }}/agent-review-outcome/outcome.json
+          if-no-files-found: ignore
 
   notify-failure:
     name: Report incomplete review
@@ -327,13 +346,87 @@ jobs:
           REVIEW_HEAD: ${{ needs.admit.outputs.head }}
           REVIEW_BASE: ${{ needs.admit.outputs.base }}
           ADMISSION_RESULT: ${{ needs.admit.result }}
+          REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-notifier/outcome.json
         shell: bash
         run: |
           python3 - <<'PY'
           import json
           import os
           import re
+          import time
           import urllib.request
+
+          # The operation in progress, from a fixed vocabulary, for the failure record.
+          where = ["start"]
+
+
+          def record(error):
+              """Allowlisted facts about a failed notification, kept even if no comment can be posted.
+
+              The same schema and rules as scripts/review_reliability.py, which this host-only
+              step cannot import: status code, validated rate-limit headers, exception class.
+              """
+              status = getattr(error, "code", None)
+              status = status if type(status) is int and 100 <= status <= 599 else None
+              try:
+                  raw = {str(k).lower(): v for k, v in getattr(error, "headers", None).items()}
+              except AttributeError:
+                  raw = {}
+              rate, bad = {}, []
+              for name, key in (("x-ratelimit-limit", "limit"), ("x-ratelimit-remaining", "remaining"),
+                                ("x-ratelimit-used", "used"), ("x-ratelimit-reset", "reset"),
+                                ("retry-after", "retry_after_seconds")):
+                  if name in raw:
+                      if isinstance(raw[name], str) and re.fullmatch(r"[0-9]{1,12}", raw[name]):
+                          rate[key] = int(raw[name])
+                      else:
+                          bad.append(name)
+              resource = raw.get("x-ratelimit-resource")
+              if isinstance(resource, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,31}", resource):
+                  rate["resource"] = resource
+              elif resource is not None:
+                  bad.append("x-ratelimit-resource")
+              if "reset" in rate:
+                  rate["reset_in_seconds"] = max(rate["reset"] - int(time.time()), 0)
+              if bad:
+                  rate["malformed"] = sorted(bad)
+              if status in (403, 429) and rate.get("remaining") == 0:
+                  category = "rate_limit_primary"
+              elif status in (403, 429) and (status == 429 or "retry_after_seconds" in rate or "retry-after" in bad):
+                  category = "rate_limit_unknown"
+              elif status is None:
+                  category = "network" if isinstance(error, OSError) else "unexpected"
+              elif status >= 500:
+                  category = "server_error"
+              else:
+                  category = {401: "authentication", 403: "forbidden", 404: "not_found",
+                              422: "validation"}.get(status, "client_error")
+              name = type(error).__name__
+              failure = {"phase": "notification", "stage": where[0], "category": category,
+                         "exception": name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"}
+              if status is not None:
+                  failure["status"] = status
+              if rate:
+                  failure["rate_limit"] = rate
+              result = {"schema": "agent-review-outcome:v1", "result": "failed", "failure": failure}
+              path, sink = os.environ.get("REVIEW_OUTCOME_PATH"), os.environ.get("GITHUB_STEP_SUMMARY")
+              try:
+                  if path:
+                      os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                      with open(path, "w", encoding="utf-8") as stream:
+                          json.dump(result, stream, sort_keys=True, separators=(",", ":"))
+                      os.chmod(path, 0o600)
+                  if sink:
+                      cells = [("Stage", failure["stage"]), ("Category", category), ("HTTP status", status),
+                               ("Exception class", failure["exception"]), ("Rate-limit remaining", rate.get("remaining")),
+                               ("Rate-limit reset (UTC epoch)", rate.get("reset")),
+                               ("Seconds until reset at capture", rate.get("reset_in_seconds")),
+                               ("Retry-After seconds", rate.get("retry_after_seconds"))]
+                      with open(sink, "a", encoding="utf-8") as stream:
+                          stream.write("### Agent review notification failed\n\n| Field | Value |\n| --- | --- |\n"
+                                       + "".join(f"| {label} | {value} |\n" for label, value in cells if value is not None))
+              except OSError:
+                  pass
 
 
           def main():
@@ -358,7 +451,8 @@ jobs:
                       or not re.fullmatch(r"[1-9][0-9]*", run_id)):
                   raise ValueError("Invalid notification identity")
 
-              def api(method, path, data=None):
+              def api(stage, method, path, data=None):
+                  where[0] = stage
                   request = urllib.request.Request(
                       "https://api.github.com/" + path, method=method,
                       headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
@@ -369,7 +463,7 @@ jobs:
 
               prefix = f"repos/{repo}"
               # Re-read eligibility even if admission failed before returning its outputs.
-              pr = api("GET", f"{prefix}/pulls/{number}")
+              pr = api("read_pull_request", "GET", f"{prefix}/pulls/{number}")
               if not (pr["state"] == "open" and pr["head"]["repo"] is not None
                       and pr["head"]["repo"]["fork"] is False
                       and pr["head"]["repo"]["full_name"] == repo and pr["base"]["repo"]["full_name"] == repo):
@@ -389,24 +483,33 @@ jobs:
               body += f"\n\n[Actions run](https://github.com/{repo}/actions/runs/{run_id})."
               page = 1
               while True:
-                  comments = api("GET", f"{prefix}/issues/{number}/comments?per_page=100&page={page}")
+                  comments = api("list_comments", "GET", f"{prefix}/issues/{number}/comments?per_page=100&page={page}")
                   for item in comments:
                       author = item.get("user", {})
                       if (author.get("login") == "github-actions[bot]" and author.get("type") == "Bot"
                               and marker in item.get("body", "").splitlines()):
                           if type(item.get("id")) is not int or item["id"] <= 0:
                               raise ValueError("Invalid notification comment")
-                          api("PATCH", f"{prefix}/issues/comments/{item['id']}", {"body": body})
+                          api("update_comment", "PATCH", f"{prefix}/issues/comments/{item['id']}", {"body": body})
                           return
                   if len(comments) < 100:
                       break
                   page += 1
-              api("POST", f"{prefix}/issues/{number}/comments", {"body": body})
+              api("create_comment", "POST", f"{prefix}/issues/{number}/comments", {"body": body})
 
 
           try:
               main()
-          except Exception:
+          except Exception as error:
               # Never echo API errors, model output, credentials, or repository text.
+              # The allowlisted record goes to the step summary and a local file only.
+              record(error)
               raise SystemExit("Review failure notification failed; inspect Actions status") from None
           PY
+      - name: Preserve notification failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-review-notifier-outcome
+          path: ${{ runner.temp }}/agent-review-notifier/outcome.json
+          if-no-files-found: ignore

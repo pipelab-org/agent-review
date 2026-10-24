@@ -1124,6 +1124,31 @@ review:
         repo.get_contents.assert_any_call("src/file.py", ref=old_head)
         repo.get_contents.assert_any_call("src/file.py", ref=self.head)
 
+    def test_rate_limited_incremental_read_stops_before_inference_while_other_failures_fall_back(self):
+        from github.GithubException import GithubException, RateLimitExceededException
+        old_head = "1" * 40
+        scope = {"kind": "incremental", "from": old_head, "to": self.head, "parent": 123, "full_head": False}
+        throttle = RateLimitExceededException(403, {"message": "API rate limit exceeded"}, {"x-ratelimit-remaining": "0"})
+        for error, falls_back in ((throttle, False), (GithubException(422, {"message": "Unprocessable"}, {}), True),
+                                  (RuntimeError("unsupported shape"), True)):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                completion = AsyncMock(return_value=self.response())
+                with (patch.object(review.followups, "verified_records", return_value={}),
+                      patch.object(review.followups, "scope_for", return_value=scope),
+                      patch.object(review.followups, "incremental_files", side_effect=error)):
+                    if falls_back:
+                        self.run_adapter(completion)
+                        self.assertEqual(3, completion.await_count)
+                        self.assertIn('"kind": "full"', self.status.edit.call_args.args[0])
+                    else:
+                        with self.assertRaises(RateLimitExceededException):
+                            self.run_adapter(completion)
+                        # Nothing paid for and nothing published into a throttled GitHub.
+                        completion.assert_not_awaited()
+                        self.status.edit.assert_not_called()
+                        self.provider.pr.create_issue_comment.assert_not_called()
+
     def test_incremental_discovery_reads_unchanged_requested_source_at_the_admitted_head(self):
         from scripts.test_review_followups import evidence
         old_head = "1" * 40

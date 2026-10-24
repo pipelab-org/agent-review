@@ -5,6 +5,7 @@
 
 import base64
 import copy
+import email.message
 import hashlib
 import io
 import json
@@ -12,8 +13,10 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 from types import SimpleNamespace as NS
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import yaml
@@ -197,7 +200,8 @@ class CallerTests(unittest.TestCase):
                         f"{repo}/.github/workflows/agent-review.yaml@refs/pull/1/head"):
                 with self.assertRaises(ValueError): contract.validate_caller_ref(ref, repo)
         reply = WORKFLOW["jobs"]["reply"]
-        source, checkout, policy, profile, validate, run = reply["steps"]
+        source, checkout, policy, profile, validate, run, outcome = reply["steps"]
+        self.assertEqual("agent-review-outcome", outcome["with"]["name"])
         self.assertEqual('reply-source', source['id'])
         self.assertNotIn("secrets.", json.dumps(policy))
         self.assertEqual("${{ steps.policy.outputs.sha }}", profile["with"]["ref"])
@@ -223,7 +227,7 @@ class CallerTests(unittest.TestCase):
         job = WORKFLOW['jobs']['review']
         self.assertEqual('max', job['concurrency']['queue'])
         self.assertEqual('false', job['concurrency']['cancel-in-progress'])
-        run = job['steps'][-2]
+        run = next(step for step in job['steps'] if step.get('name') == 'Review the admitted diff')
         self.assertEqual('${{ needs.source.outputs.reviewer_sha }}', run['env']['REVIEW_SOURCE_SHA'])
         self.assertEqual('${{ github.workflow_sha }}', run['env']['REVIEW_PROFILE_SHA'])
         self.assertEqual('trusted-agent-profile/.github/agent-review.toml', run['env']['REVIEW_PROFILE_PATH'])
@@ -502,11 +506,14 @@ class ReporterTests(unittest.TestCase):
                     'GITHUB_REPOSITORY': 'example/project', 'GITHUB_ACTOR': 'luckyPipewrench',
                     'GITHUB_ACTOR_ID': '142104046', 'GITHUB_TRIGGERING_ACTOR': 'luckyPipewrench',
                     'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_RUN_ID': '123', 'GH_TOKEN': 'fixture',
-                    'REVIEW_HEAD': 'a' * 40, 'REVIEW_BASE': 'b' * 40, 'ADMISSION_RESULT': 'success'}
+                    'REVIEW_HEAD': 'a' * 40, 'REVIEW_BASE': 'b' * 40, 'ADMISSION_RESULT': 'success',
+                    'REVIEW_OUTCOME_PATH': str(Path(self.temp.name).resolve() / 'notifier' / 'outcome.json'),
+                    'GITHUB_STEP_SUMMARY': str(Path(self.temp.name).resolve() / 'summary.md')}
         self.pr = {'state': 'open', 'head': {'repo': {'full_name': 'example/project', 'fork': False}, 'sha': 'a' * 40},
                    'base': {'repo': {'full_name': 'example/project'}, 'sha': 'b' * 40}}
         self.comments = []
         self.calls = []
+        self.fail_method = None
 
     def execute(self, error=None):
         script = WORKFLOW['jobs']['notify-failure']['steps'][0]['run'].split("python3 - <<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
@@ -514,7 +521,7 @@ class ReporterTests(unittest.TestCase):
 
         def request(req):
             self.calls.append((req.method, req.full_url, json.loads(req.data) if req.data else None))
-            if error:
+            if error and self.fail_method in (None, req.method):
                 raise error
             if req.full_url.endswith('/pulls/1'):
                 result = self.pr
@@ -536,6 +543,14 @@ class ReporterTests(unittest.TestCase):
         text = json.dumps(job)
         for denied in ('secrets.', 'checkout', 'download-artifact', 'pr_agent_review.py'):
             self.assertNotIn(denied, text)
+
+    def test_notification_outcome_is_retained_after_a_failed_step(self):
+        job = WORKFLOW['jobs']['notify-failure']
+        upload = job['steps'][-1]
+        self.assertEqual('always()', upload['if'])
+        self.assertTrue(upload['uses'].startswith('actions/upload-artifact@'))
+        self.assertEqual('agent-review-notifier-outcome', upload['with']['name'])
+        self.assertEqual(job['steps'][0]['env']['REVIEW_OUTCOME_PATH'], upload['with']['path'])
 
     def test_failure_is_visible_and_existing_per_run_bot_notice_is_updated(self):
         self.execute()
@@ -561,6 +576,96 @@ class ReporterTests(unittest.TestCase):
         self.assertIn('commits changed', self.calls[-1][2]['body'])
         with self.assertRaisesRegex(SystemExit, '^Review failure notification failed; inspect Actions status$'):
             self.execute(error=RuntimeError('private provider detail'))
+
+    def http_error(self, status, **headers):
+        message = email.message.Message()
+        for name, value in headers.items():
+            message[name.replace('_', '-')] = value
+        return urllib.error.HTTPError('https://api.github.com/repos/example/project/SECRET-URL', status,
+                                      'SECRET-REASON', message, io.BytesIO(b'{"message":"SECRET-BODY"}'))
+
+    def outcome(self):
+        return json.loads(Path(self.env['REVIEW_OUTCOME_PATH']).read_text())
+
+    def test_failed_notification_keeps_a_machine_readable_outcome_when_no_comment_is_possible(self):
+        # The same token that was rate limited cannot comment, so the record is local.
+        reset = int(time.time()) + 1800
+        error = self.http_error(403, x_ratelimit_remaining='0', x_ratelimit_limit='1000',
+                                x_ratelimit_reset=str(reset), x_ratelimit_resource='core',
+                                Authorization='Bearer SECRET-TOKEN', x_github_request_id='SECRET-ID')
+        stderr = io.StringIO()
+        with patch('sys.stderr', stderr), self.assertRaisesRegex(
+                SystemExit, '^Review failure notification failed; inspect Actions status$'):
+            self.execute(error=error)
+        outcome = self.outcome()
+        self.assertEqual('agent-review-outcome:v1', outcome['schema'])
+        self.assertEqual('failed', outcome['result'])
+        failure = outcome['failure']
+        self.assertEqual(('notification', 'read_pull_request', 'rate_limit_primary', 403, 'HTTPError'),
+                         (failure['phase'], failure['stage'], failure['category'], failure['status'], failure['exception']))
+        self.assertEqual({'limit': 1000, 'remaining': 0, 'reset': reset, 'resource': 'core'},
+                         {k: v for k, v in failure['rate_limit'].items() if k != 'reset_in_seconds'})
+        self.assertTrue(0 < failure['rate_limit']['reset_in_seconds'] <= 1800)
+        summary = Path(self.env['GITHUB_STEP_SUMMARY']).read_text()
+        self.assertIn('rate_limit_primary', summary)
+        self.assertIn('read_pull_request', summary)
+        self.assertEqual(0o600, Path(self.env['REVIEW_OUTCOME_PATH']).stat().st_mode & 0o777)
+        for text in (json.dumps(outcome), summary, stderr.getvalue()):
+            for secret in ('SECRET', 'fixture', 'api.github.com', 'example/project'):
+                self.assertNotIn(secret, text)
+
+    def test_failure_stage_and_category_follow_the_failing_operation(self):
+        self.fail_method = 'POST'
+        with self.assertRaises(SystemExit):
+            self.execute(error=self.http_error(502))
+        self.assertEqual(('create_comment', 'server_error', 502),
+                         tuple(self.outcome()['failure'][k] for k in ('stage', 'category', 'status')))
+        self.fail_method = 'PATCH'
+        self.comments = [{'id': 7, 'body': '<!-- agent-review-notice:v1 run=123 -->\nold',
+                          'user': {'login': 'github-actions[bot]', 'type': 'Bot'}}]
+        with self.assertRaises(SystemExit):
+            self.execute(error=self.http_error(403))
+        self.assertEqual(('update_comment', 'forbidden'),
+                         tuple(self.outcome()['failure'][k] for k in ('stage', 'category')))
+        self.fail_method = None
+        with self.assertRaises(SystemExit):
+            self.execute(error=urllib.error.URLError('SECRET-NETWORK'))
+        failure = self.outcome()['failure']
+        self.assertEqual('network', failure['category'])
+        self.assertNotIn('status', failure)
+        with self.assertRaises(SystemExit):
+            self.execute(error=RuntimeError('private provider detail'))
+        self.assertEqual('unexpected', self.outcome()['failure']['category'])
+        self.assertNotIn('private', Path(self.env['REVIEW_OUTCOME_PATH']).read_text())
+
+    def test_notifier_classification_matches_the_engines_for_header_only_evidence(self):
+        from scripts import review_reliability as reliability
+        cases = [(403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '4102444800'}),
+                 (403, {'retry-after': '60'}), (403, {'retry-after': 'Wed, 21 Oct 2026 07:28:00 GMT'}),
+                 (429, {}), (429, {'x-ratelimit-remaining': '0'}), (403, {}), (401, {}), (404, {}),
+                 (422, {}), (500, {}), (503, {'retry-after': '5'}), (418, {}),
+                 (403, {'x-ratelimit-remaining': '-1', 'x-ratelimit-reset': '0'}),
+                 (403, {'x-ratelimit-resource': 'Core Data', 'x-ratelimit-limit': '1e3'})]
+        for status, headers in cases:
+            with self.subTest(status=status, headers=headers):
+                self.fail_method = None
+                with self.assertRaises(SystemExit):
+                    self.execute(error=self.http_error(status, **{k.replace('-', '_'): v for k, v in headers.items()}))
+                failure = self.outcome()['failure']
+                self.assertEqual(reliability.classify(status, headers), failure['category'])
+                expected = {k: v for k, v in reliability.rate_headers(headers).items() if k != 'reset_in_seconds'}
+                actual = {k: v for k, v in failure.get('rate_limit', {}).items() if k != 'reset_in_seconds'}
+                self.assertEqual(expected, actual)
+
+    def test_outcome_sinks_are_optional_and_never_change_the_failure(self):
+        for name in ('REVIEW_OUTCOME_PATH', 'GITHUB_STEP_SUMMARY'):
+            del self.env[name]
+        with self.assertRaisesRegex(SystemExit, '^Review failure notification failed; inspect Actions status$'):
+            self.execute(error=self.http_error(403, retry_after='60'))
+        self.env['REVIEW_OUTCOME_PATH'] = str(Path(self.temp.name).resolve() / 'summary-dir')
+        os.mkdir(self.env['REVIEW_OUTCOME_PATH'])
+        with self.assertRaisesRegex(SystemExit, '^Review failure notification failed; inspect Actions status$'):
+            self.execute(error=self.http_error(403, retry_after='60'))
 
     def test_unauthorized_edited_rerun_issue_fork_and_closed_requests_do_not_comment(self):
         original = copy.deepcopy(self.event)
