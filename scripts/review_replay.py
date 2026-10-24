@@ -309,7 +309,7 @@ class Egress:
         guard = self
         proxies = guard.proxies()
         # Permission belongs to one checked HTTPX transport request, not the process.
-        # ContextVar also follows the async transport's DNS worker context.
+        # Async DNS workers receive an explicit copy of that context below.
         active_request = contextvars.ContextVar("replay_gateway_request", default=None)
         getaddrinfo, connect, connect_ex = socket.getaddrinfo, socket.socket.connect, socket.socket.connect_ex
         client_send, async_send = httpx.Client.send, httpx.AsyncClient.send
@@ -319,15 +319,22 @@ class Egress:
         def resolve(host, port, *args, **kwargs):
             state = active_request.get()
             host = host.decode("ascii") if isinstance(host, bytes) else host
-            if state is None or (host, int(port)) not in state["destinations"]:
+            if state is None or not state["active"] or (host, int(port)) not in state["destinations"]:
                 guard.deny("resolve outside gateway request")
             result = getaddrinfo(host, port, *args, **kwargs)
             state["resolved"].update((item[4][0], item[4][1]) for item in result)
             return result
 
+        async def async_resolve(loop, host, port, *args, **kwargs):
+            # BaseEventLoop.getaddrinfo uses run_in_executor, which doesn't copy
+            # contextvars. Carry this request's permission into that DNS worker only.
+            context = contextvars.copy_context()
+            return await loop.run_in_executor(
+                None, context.run, lambda: resolve(host, port, *args, **kwargs))
+
         def check_address(address):
             state = active_request.get()
-            if state is None:
+            if state is None or not state["active"]:
                 guard.deny("connect outside gateway request")
             if not isinstance(address, tuple) or len(address) < 2:
                 guard.deny("non-IP socket")
@@ -366,11 +373,14 @@ class Egress:
         def transport_request(request):
             # HTTPX's pinned single-request seam runs for each redirect and auth resend.
             check_request(request)
-            token = active_request.set({"destinations": proxies | {(request.url.host, 443)},
-                                        "resolved": set()})
+            state = {"destinations": proxies | {(request.url.host, 443)},
+                     "resolved": set(), "active": True}
+            token = active_request.set(state)
             try:
                 yield
             finally:
+                # Context copies held by child tasks or DNS workers expire too.
+                state["active"] = False
                 active_request.reset(token)
 
         def sync_single(client, request):
@@ -385,6 +395,7 @@ class Egress:
             guard.deny("requests")
 
         with (patch.object(socket, "getaddrinfo", resolve),
+              patch.object(asyncio.BaseEventLoop, "getaddrinfo", async_resolve),
               patch.object(socket.socket, "connect", guarded_connect),
               patch.object(socket.socket, "connect_ex", guarded_connect_ex),
               patch.object(httpx.Client, "send", sync_send),

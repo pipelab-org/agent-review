@@ -218,9 +218,24 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             exporter.export(self.repo, "example/project", 1, self.base, "HEAD")
 
+    def test_ignored_submodule_changes_cannot_disappear_from_the_snapshot(self):
+        self.git("update-index", "--add", "--cacheinfo", "160000", self.base, "dependency")
+        self.git("commit", "-qm", "Add gitlink")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        self.git("config", "diff.ignoreSubmodules", "all")
+        with self.assertRaises(SnapshotError):
+            self.export()
+
     def test_binary_changed_file_refuses_comparison(self):
         (self.repo/"binary.dat").write_bytes(b"\xfe")
         self.git("commit", "-qam", "Binary fixture")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        with self.assertRaises(SnapshotError):
+            self.export()
+
+    def test_utf8_decodable_binary_source_is_still_refused(self):
+        (self.repo/"code.py").write_bytes(b"binary\0source\n")
+        self.git("commit", "-qam", "Nul-containing fixture")
         self.head = self.git("rev-parse", "HEAD").strip()
         with self.assertRaises(SnapshotError):
             self.export()

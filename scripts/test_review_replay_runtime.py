@@ -424,32 +424,34 @@ class NoGitHubTests(ReplayTestCase):
         thread.start()
         self.addCleanup(thread.join, 2)
         self.addCleanup(server.shutdown)
-        proxy = f"http://127.0.0.1:{server.server_port}"
-        env = {name: "" for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-                                     "http_proxy", "https_proxy", "all_proxy", "no_proxy")}
-        env.update(HTTPS_PROXY=proxy, https_proxy=proxy)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"https": proxy}))
-        guard = replay.Egress(("api.anthropic.com",))
-        with patch.dict(os.environ, env), guard.active():
-            with self.assertRaises(replay.ReplayError):
-                opener.open("https://outside.example/test", timeout=1)
-            with self.assertRaises(replay.ReplayError):
-                httpx.get(proxy.replace("http:", "https:") + "/test", timeout=1)
-            # The existing HTTP proxy route remains usable by the supported transport.
-            with self.assertRaises(httpx.ProxyError):
-                httpx.get("https://api.anthropic.com/v1/messages", timeout=1)
-            import asyncio
-            async def async_call():
-                async with httpx.AsyncClient() as client:
-                    await client.get("https://api.anthropic.com/v1/messages", timeout=1)
-            with self.assertRaises(httpx.ProxyError):
-                asyncio.run(async_call())
-            with self.assertRaises(replay.ReplayError):
-                opener.open("https://outside.example/after", timeout=1)
-            with self.assertRaises(replay.ReplayError):
-                socket.create_connection(("127.0.0.1", server.server_port), timeout=1)
-        self.assertEqual(["api.anthropic.com:443"] * 2, seen)
-        self.assertEqual(4, len(guard.denied))
+        for proxy_host in ("127.0.0.1", "localhost"):
+            seen.clear()
+            proxy = f"http://{proxy_host}:{server.server_port}"
+            env = {name: "" for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                                         "http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+            env.update(HTTPS_PROXY=proxy, https_proxy=proxy)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({"https": proxy}))
+            guard = replay.Egress(("api.anthropic.com",))
+            with patch.dict(os.environ, env), guard.active():
+                with self.assertRaises(replay.ReplayError):
+                    opener.open("https://outside.example/test", timeout=1)
+                with self.assertRaises(replay.ReplayError):
+                    httpx.get(proxy.replace("http:", "https:") + "/test", timeout=1)
+                # The existing HTTP proxy route remains usable by the supported transport.
+                with self.assertRaises(httpx.ProxyError):
+                    httpx.get("https://api.anthropic.com/v1/messages", timeout=1)
+                import asyncio
+                async def async_call():
+                    async with httpx.AsyncClient() as client:
+                        await client.get("https://api.anthropic.com/v1/messages", timeout=1)
+                with self.assertRaises(httpx.ProxyError):
+                    asyncio.run(async_call())
+                with self.assertRaises(replay.ReplayError):
+                    opener.open("https://outside.example/after", timeout=1)
+                with self.assertRaises(replay.ReplayError):
+                    socket.create_connection(("127.0.0.1", server.server_port), timeout=1)
+            self.assertEqual(["api.anthropic.com:443"] * 2, seen)
+            self.assertEqual(4, len(guard.denied))
 
     def test_gateway_permission_is_not_shared_with_other_async_tasks(self):
         import asyncio
@@ -475,6 +477,28 @@ class NoGitHubTests(ReplayTestCase):
         with guard.active():
             asyncio.run(run())
         self.assertEqual(2, len(guard.denied))
+
+    def test_gateway_permission_expires_in_inherited_task_contexts(self):
+        import asyncio
+        import httpx
+        guard = replay.Egress(("api.anthropic.com",))
+        async def run():
+            release = asyncio.Event()
+            pending = []
+            async def late_lookup():
+                await release.wait()
+                with self.assertRaises(replay.ReplayError):
+                    socket.getaddrinfo("127.0.0.1", 8888)
+            async def respond(request):
+                pending.append(asyncio.create_task(late_lookup()))
+                return httpx.Response(200)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                await client.get("https://api.anthropic.com/v1/messages")
+            release.set()
+            await pending[0]
+        with patch.dict(os.environ, {"HTTPS_PROXY": "http://127.0.0.1:8888"}), guard.active():
+            asyncio.run(run())
+        self.assertEqual(1, len(guard.denied))
 
     def test_redirects_are_checked_before_the_next_transport_request(self):
         import asyncio

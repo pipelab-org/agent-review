@@ -80,7 +80,7 @@ def export(repo, repository, number, base, head, absent=()):
         return result
 
     old, new = tree(base), tree(head)
-    changes = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", base, head).split(b"\0")
+    changes = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", "--name-status", "-z", base, head).split(b"\0")
     if changes[-1] == b"":
         changes.pop()
     if len(changes) % 2 or any(raw in unlisted for raw in changes[1::2]):
@@ -140,7 +140,7 @@ def export(repo, repository, number, base, head, absent=()):
             diff_env.pop("GIT_ATTR_SOURCE", None)
             result = subprocess.run(
                 [*GIT, "-C", directory, "-c", "core.attributesFile=" + os.devnull,
-                 *DIFF, "--no-index", "--text", "--",
+                 *DIFF, "--no-index", "--",
                  os.devnull if status == "A" else str(left),
                  os.devnull if status == "D" else str(right)],
                 env=diff_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
