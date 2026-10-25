@@ -74,6 +74,18 @@ class DiscoveryTests(unittest.TestCase):
             with self.subTest(template=template[:40]), self.assertRaises(discovery.DiscoveryAbort):
                 discovery.first_pass_template(template)
 
+    def test_first_pass_template_refuses_a_stray_source_request_definition_it_did_not_write(self):
+        pinned = ("x\nclass PRReview(BaseModel):\n    review: Review\n=====\n\nExample output:\n```yaml\nreview:\n"
+                  "  security_concerns: |\n    No\n{%- endif %}\n```\n\nAnswer should be a valid YAML, and nothing else.\n"
+                  + discovery.FORMAT_ANCHOR + "\n")
+        patched = discovery.first_pass_template(pinned)
+        # Every original anchor is present exactly once either way; only the unrelated
+        # mention distinguishes these from a template this adapter can complete.
+        stray = "\nsource_requests: optional\n"
+        for template in (pinned + stray, patched + stray):
+            with self.subTest(template=template[-40:]), self.assertRaises(discovery.DiscoveryAbort):
+                discovery.first_pass_template(template)
+
     def test_request_description_is_safe_inside_the_field_definition(self):
         text = discovery.REQUEST_DESCRIPTION
         for forbidden in ('"', "\\", "\n", "{{", "{%", "{#"):
