@@ -483,7 +483,7 @@ def report(error=None, env=None, stream=None):
         except OSError:
             try:
                 print("Review outcome could not be recorded", file=stream or sys.stderr)
-            except OSError:
+            except (OSError, ValueError):
                 pass  # A diagnostic sink must not change the review result.
     sink = env.get("GITHUB_STEP_SUMMARY")
     if sink:
@@ -493,7 +493,10 @@ def report(error=None, env=None, stream=None):
         except OSError:
             pass
     if error is not None:
-        print(f"Review diagnostics: {line}", file=stream or sys.stderr)
+        try:
+            print(f"Review diagnostics: {line}", file=stream or sys.stderr)
+        except (OSError, ValueError):
+            pass
     return result
 
 

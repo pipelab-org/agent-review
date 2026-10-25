@@ -306,6 +306,12 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual("succeeded", result["result"])
             broken = NS(write=lambda text: (_ for _ in ()).throw(OSError("private-error")))
             self.assertEqual(result, reliability.report(env=env, stream=broken))
+            stream.close()
+            self.assertEqual(result, reliability.report(env=env, stream=stream))
+            error = RuntimeError("private-error")
+            expected = reliability.outcome(error, env)
+            for sink in (stream, broken):
+                self.assertEqual(expected, reliability.report(error, env=env, stream=sink))
 
     def test_nothing_sensitive_reaches_the_outcome_summary_or_log_line(self):
         error = GH(403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "bad", "authorization": SECRET,
