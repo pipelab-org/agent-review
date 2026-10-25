@@ -404,10 +404,21 @@ class Egress:
             with transport_request(request):
                 return await async_single_send(client, request)
 
+        def no_legacy_dns(*args, **kwargs):
+            # Python socket docs: gethostbyname[_ex], gethostbyaddr and getnameinfo
+            # perform their own resolution, without calling Python's getaddrinfo.
+            # Only the checked HTTPX transport's getaddrinfo route is supported.
+            # https://docs.python.org/3/library/socket.html#socket.gethostbyname
+            guard.deny("unsupported name lookup")
+
         def no_requests(*args, **kwargs):
             guard.deny("requests")
 
         with (patch.object(socket, "getaddrinfo", resolve),
+              patch.object(socket, "gethostbyname", no_legacy_dns),
+              patch.object(socket, "gethostbyname_ex", no_legacy_dns),
+              patch.object(socket, "gethostbyaddr", no_legacy_dns),
+              patch.object(socket, "getnameinfo", no_legacy_dns),
               patch.object(asyncio.BaseEventLoop, "getaddrinfo", async_resolve),
               patch.object(socket.socket, "connect", guarded_connect),
               patch.object(socket.socket, "connect_ex", guarded_connect_ex),

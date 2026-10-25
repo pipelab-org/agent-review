@@ -378,6 +378,29 @@ class NoGitHubTests(ReplayTestCase):
                 unix.connect("/var/run/docker.sock")
         self.assertEqual(6, len(guard.denied))
 
+    def test_legacy_name_lookups_are_denied_and_recorded(self):
+        # Real socket entry points, using only local hosts-file entries. These don't
+        # call Python's getaddrinfo; the dedicated patches must intercept them.
+        calls = (
+            lambda: socket.gethostbyname("localhost"),
+            lambda: socket.gethostbyname_ex("localhost"),
+            lambda: socket.gethostbyaddr("127.0.0.1"),
+            lambda: socket.getnameinfo(("127.0.0.1", 443), socket.NI_NAMEREQD),
+            lambda: socket.getfqdn("127.0.0.1"),
+        )
+        for call in calls:
+            self.assertTrue(call())  # control: the local lookup works without the guard
+        for hosts in ((), ("api.anthropic.com",)):
+            with self.subTest(hosts=hosts):
+                guard = replay.Egress(hosts)
+                with guard.active():
+                    for call in calls:
+                        with self.assertRaises(replay.ReplayError):
+                            call()
+                self.assertEqual(["unsupported name lookup"] * len(calls), guard.denied)
+        for call in calls:
+            self.assertTrue(call())  # restoration also works after a denial
+
     def test_datagrams_to_a_named_peer_are_denied_like_connections(self):
         guard = replay.Egress(())
         with (contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as receiver,
@@ -672,6 +695,27 @@ class CliTests(ReplayTestCase):
             code, out, _ = self.cli(*self.files([text("source_requests: []\n" + CLEAN), text(CLEAN)]))
         doc = json.loads(out)
         self.assertEqual((1, "completed", False), (code, doc["adapter_outcome"], doc["comparable"]))
+
+    def test_caught_name_lookup_denial_invalidates_completion_and_cli_success(self):
+        original = replay.provider_class
+
+        def provider_with_caught_lookup():
+            class Provider(original()):
+                def get_languages(self):
+                    try:
+                        socket.gethostbyname("localhost")
+                    except replay.ReplayError:
+                        pass
+                    return super().get_languages()
+
+            return Provider
+
+        with patch.object(replay, "provider_class", provider_with_caught_lookup):
+            code, out, _ = self.cli(*self.files([text("source_requests: []\n" + CLEAN), text(CLEAN)]))
+        doc = json.loads(out)
+        self.assertEqual((1, "completed", False), (code, doc["adapter_outcome"], doc["comparable"]))
+        self.assertFalse(doc["inference"]["quality_evidence"])
+        self.assertEqual({"unsupported name lookup"}, set(doc["network_denials"]))
 
     def test_bad_inputs_exit_two_without_running_or_echoing_content(self):
         base = self.files([text(CLEAN)])
