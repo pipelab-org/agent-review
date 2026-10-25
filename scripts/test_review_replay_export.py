@@ -11,6 +11,11 @@ from scripts import review_replay_export as exporter
 from scripts.review_replay_snapshot import SnapshotError
 
 
+def fixture_git_env():
+    return {k: v for k, v in os.environ.items()
+            if k not in exporter.AMBIENT and not k.startswith("GIT_CONFIG")}
+
+
 class ExportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -30,7 +35,20 @@ class ExportTests(unittest.TestCase):
         self.head = self.git("rev-parse", "HEAD").strip()
 
     def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.repo), *args], stderr=subprocess.DEVNULL).decode()
+        return subprocess.check_output(["git", "-C", str(self.repo), *args], stderr=subprocess.DEVNULL, env=fixture_git_env()).decode()
+
+    def test_fixture_git_ignores_inherited_repository_selectors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            other = Path(directory)
+            subprocess.check_call(["git", "init", "-q", str(other)], env=fixture_git_env())
+            before = (other / ".git" / "config").read_bytes()
+            with patch.dict(os.environ, {"GIT_DIR": str(other / ".git"),
+                                         "GIT_WORK_TREE": str(other),
+                                         "GIT_INDEX_FILE": str(other / "index")}):
+                self.assertEqual(str(self.repo), self.git("rev-parse", "--show-toplevel").strip())
+                self.git("config", "fixture.isolated", "true")
+            self.assertEqual(before, (other / ".git" / "config").read_bytes())
+            self.assertFalse((other / "index").exists())
 
     def export(self, **kwargs):
         return exporter.export(self.repo, "example/project", 1, self.base, self.head, **kwargs)
@@ -86,7 +104,7 @@ class ExportTests(unittest.TestCase):
         # An inherited repository selector never redirects the export to another repository.
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
-        subprocess.check_call(["git", "init", "-q", other.name])
+        subprocess.check_call(["git", "init", "-q", other.name], env=fixture_git_env())
         with patch.dict(os.environ, {"GIT_DIR": str(Path(other.name) / ".git")}):
             self.assertEqual(expected, self.export()["files"][0]["patch"])
 
@@ -229,10 +247,10 @@ class ExportTests(unittest.TestCase):
             outer = Path(directory) / "workspace"
             outer.mkdir()
             marker = Path(directory) / "filter-ran"
-            subprocess.check_call(["git", "init", "-q", str(outer)])
+            subprocess.check_call(["git", "init", "-q", str(outer)], env=fixture_git_env())
             (outer/".gitattributes").write_text("* text eol=lf filter=mark\n")
             subprocess.check_call(["git", "-C", str(outer), "config", "filter.mark.clean",
-                                   f"sh -c 'touch {marker}; cat' --"])
+                                   f"sh -c 'touch {marker}; cat' --"], env=fixture_git_env())
             (outer/"tmp").mkdir()
             link = Path(directory) / "link"
             link.symlink_to(outer/"tmp")
@@ -240,7 +258,7 @@ class ExportTests(unittest.TestCase):
                 with self.subTest(location=str(location)), patch.object(tempfile, "tempdir", str(location)):
                     # Control: Git applies that repository's filter to a file in that location.
                     subprocess.run(["git", "-C", str(location), "hash-object", "--path", "probe.txt", "--stdin"],
-                                   input=b"x\r\n", stdout=subprocess.DEVNULL, check=True)
+                                   input=b"x\r\n", stdout=subprocess.DEVNULL, check=True, env=fixture_git_env())
                     self.assertTrue(marker.exists())
                     marker.unlink()
                     self.assertEqual(expected, self.export()["files"][0]["patch"])
@@ -251,10 +269,10 @@ class ExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             clone = Path(directory) / "partial"
             subprocess.check_call(["git", "clone", "-q", "--filter=blob:none", "--no-checkout",
-                                   self.repo.as_uri(), str(clone)])
+                                   self.repo.as_uri(), str(clone)], env=fixture_git_env())
             def git(*args):
                 return subprocess.check_output(["git", "-C", str(clone), *args],
-                                               stderr=subprocess.DEVNULL).decode()
+                                               stderr=subprocess.DEVNULL, env=fixture_git_env()).decode()
             missing = git("rev-list", "--objects", "--all", "--missing=print")
             self.assertIn("?", missing)  # real promisor objects, not a mocked subprocess
             git("config", "protocol.file.allow", "always")

@@ -198,10 +198,18 @@ def download_record(artifact, token, timeout):
         raise FollowupAbort("Invalid artifact archive URL")
     response = requests.get(endpoint, headers={"Authorization": "Bearer " + token,
                             "Accept": "application/vnd.github+json"}, timeout=timeout, allow_redirects=False)
+    message = None
+    if response.status_code in reliability.THROTTLE_STATUSES:
+        try:
+            body = response.json()
+            message = body.get("message") if isinstance(body, dict) else None
+        except ValueError:
+            pass
     if response.status_code in reliability.THROTTLE_STATUSES and reliability.classify(
-            response.status_code, response.headers) in reliability.RATE_CATEGORIES:
-        # Not "unavailable": the caller must not mistake a throttle for missing proof.
-        raise reliability.Throttled(response.status_code, response.headers)
+            response.status_code, response.headers, message) in reliability.RATE_CATEGORIES:
+        # Retain only the existing classifier's fixed wording, never the response text.
+        raise reliability.Throttled(response.status_code, response.headers,
+                                    reliability.message_kind(message))
     if response.status_code != 302:
         raise FollowupAbort("Completion artifact unavailable")
     location = response.headers.get("Location", "")

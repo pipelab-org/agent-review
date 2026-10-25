@@ -346,7 +346,8 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      # Host-only, no checkout, artifacts, provider secrets, or container.
+      # Host-only, no checkout, artifact downloads, provider secrets, or container.
+      # Uploads only the allowlisted notification outcome file.
       - name: Publish fixed incomplete status for the original eligible request
         env:
           GH_TOKEN: ${{ github.token }}

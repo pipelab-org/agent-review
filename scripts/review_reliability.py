@@ -78,12 +78,13 @@ class Unbounded(Exception):
 
 
 class Throttled(Exception):
-    """A GitHub rate-limit response seen outside PyGithub (status and headers only)."""
+    """A GitHub rate-limit response with allowlisted headers and fixed message wording."""
 
-    def __init__(self, status, headers):
+    def __init__(self, status, headers, kind=None):
         super().__init__(status)
         self.status = status
         self.headers = header_map(headers)
+        self.message = KIND_WORDING.get(kind)
 
 
 def header_map(headers):

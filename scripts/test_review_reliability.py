@@ -455,6 +455,30 @@ class FollowupThrottleTests(unittest.TestCase):
         with self.assertRaises(GH):
             followups.scope_for(repo_raising(GH(403, {"x-ratelimit-remaining": "0"})), current, records)
 
+    def test_artifact_secondary_limit_preserves_classification_without_server_text(self):
+        artifact = NS(archive_download_url="https://api.github.com/repos/o/r/actions/artifacts/1/zip", raw_data={})
+        message = "You have exceeded a secondary rate limit. private-response-marker"
+        requests = NS(get=lambda *a, **k: NS(status_code=403, headers={}, json=lambda: {"message": message}))
+        with patch.dict(sys.modules, {"requests": requests}), self.assertRaises(reliability.Throttled) as caught:
+            followups.download_record(artifact, "token", 5)
+        self.assertTrue(reliability.throttled(caught.exception))
+        self.assertEqual("rate_limit_secondary", reliability.diagnostic(caught.exception)["category"])
+        self.assertNotIn("private-response-marker", repr(vars(caught.exception)))
+        self.assertNotIn("private-response-marker", str(caught.exception))
+
+    def test_artifact_error_body_cannot_hide_header_throttle(self):
+        artifact = NS(archive_download_url="https://api.github.com/repos/o/r/actions/artifacts/1/zip", raw_data={})
+        def invalid_json():
+            raise ValueError("invalid JSON")
+        for decode in (invalid_json, lambda: [], lambda: {"message": 42}):
+            for status, headers, expected in ((403, {}, followups.FollowupAbort),
+                                              (429, {}, reliability.Throttled),
+                                              (403, {"retry-after": "5"}, reliability.Throttled)):
+                with self.subTest(status=status, decode=decode):
+                    response = NS(status_code=status, headers=headers, json=decode)
+                    with patch.dict(sys.modules, {"requests": NS(get=lambda *a, **k: response)}), self.assertRaises(expected):
+                        followups.download_record(artifact, "token", 5)
+
     def test_artifact_download_distinguishes_throttle_from_unavailable(self):
         artifact = NS(archive_download_url="https://api.github.com/repos/o/r/actions/artifacts/1/zip", raw_data={})
         for status, headers, expected in ((429, {}, reliability.Throttled),
@@ -463,7 +487,7 @@ class FollowupThrottleTests(unittest.TestCase):
                                           (403, {}, followups.FollowupAbort), (404, {}, followups.FollowupAbort),
                                           (200, {}, followups.FollowupAbort)):
             with self.subTest(status=status, headers=headers):
-                requests = NS(get=lambda *a, **k: NS(status_code=status, headers=headers))
+                requests = NS(get=lambda *a, **k: NS(status_code=status, headers=headers, json=lambda: {"message": "Forbidden"}))
                 with patch.dict(sys.modules, {"requests": requests}), self.assertRaises(expected):
                     followups.download_record(artifact, "token", 5)
 
