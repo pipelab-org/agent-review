@@ -276,6 +276,131 @@ review:
         self.assertLess(system.index("Operator review criteria:"), system.index("Runtime output schema"))
         self.assertEqual([], self.completion_evidence()["findings"])
 
+    def test_first_pass_prompt_declares_source_requests_in_the_pinned_schema_and_example(self):
+        from pr_agent.tools.pr_reviewer import PRReviewer
+        completion = self.answering()
+        self.run_adapter(completion)
+        system = completion.await_args_list[0].kwargs["messages"][0]["content"]
+        self.assertFalse(system.startswith(review.discovery.SYSTEM))
+        # One schema: the pinned PRReview definition plus the single key this adapter reads.
+        definition = system.split("Pydantic definitions:\n=====", 1)[1].split("\n=====", 1)[0]
+        fields = definition.split("class PRReview(BaseModel):\n", 1)[1].strip().splitlines()
+        self.assertEqual(["review: Review", "source_requests: List[str]"], [f.strip().split(" = ")[0] for f in fields])
+        # The pinned example is the one the parser accepts, and it shows the key.
+        example = system.split("Example output:\n```yaml\n", 1)[1].split("\n```", 1)[0]
+        parsed = object.__new__(PRReviewer)._load_review_yaml(example)
+        self.assertEqual({"review", "source_requests"}, set(parsed))
+        self.assertEqual(["directory/xxx.py"], review.discovery.requested_paths(parsed))
+        # The old blanket scalar rule would append a newline to each path.
+        # Keep refusing that value instead of relaxing the literal path boundary.
+        block_example = ("source_requests:\n  - |\n    directory/xxx.py\n"
+                         + example.replace("source_requests:\n  - directory/xxx.py", ""))
+        block = object.__new__(PRReviewer)._load_review_yaml(block_example)
+        unavailable = {}
+        self.assertEqual([], review.discovery.requested_paths(block, unavailable))
+        self.assertEqual({"directory/xxx.py\n": "invalid repository-relative file path"}, unavailable)
+        # The rule has one home: neither the operator's extra instructions nor a second block carry it.
+        extra = system.split("Extra instructions from the user:\n======\n", 1)[1].split("\n======", 1)[0]
+        self.assertNotIn("source_requests", extra)
+        self.assertEqual(2, system.count("source_requests"))  # the field and its example, nothing else
+        self.assertIn(review.discovery.REQUEST_DESCRIPTION, system)
+        self.assertNotIn("Each YAML output MUST", system)
+        self.assertIn("Use block scalars for review prose only", system)
+        # Token planning renders the same template the request does.
+        self.assertIn("source_requests: List[str]", self.settings.pr_review_prompt.system)
+
+    def test_second_pass_review_only_contract_carries_no_source_request_guidance(self):
+        completion = self.answering()
+        self.run_adapter(completion)
+        system = completion.await_args_list[1].kwargs["messages"][0]["content"]
+        criteria = system.split("Operator review criteria:\n", 1)[1].split("\nOutput format is required", 1)[0]
+        self.assertNotIn("source_requests", criteria)
+        self.assertNotIn(review.discovery.REQUEST_DESCRIPTION, system)  # the first-pass field description
+        schema = system.split("Runtime output schema (JSON Schema; response remains YAML):\n", 1)[1].split("\nOperator", 1)[0]
+        schema = json.loads(schema)
+        self.assertEqual(["review"], list(schema["properties"]))
+        self.assertIs(False, schema["additionalProperties"])
+
+    def test_configuration_refuses_a_prompt_that_would_contradict_the_source_request_contract(self):
+        import tempfile
+        from pathlib import Path
+        original = self.settings.pr_review_prompt.system
+        self.addCleanup(self.settings.set, "pr_review_prompt.system", original)
+        self.addCleanup(self.settings.set, "config.duplicate_prompt_examples", False)  # the pinned default
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pr-agent.toml"
+            path.write_text(review.CONFIG.read_text(encoding="utf-8").replace(
+                "[config]\n", "[config]\nduplicate_prompt_examples = true\n", 1), encoding="utf-8")
+            with patch.object(review, "CONFIG", path), self.assertRaisesRegex(
+                    review.ReviewAbort, "^Repeated prompt examples would contradict"):
+                review.configure()
+        # An upstream prompt that no longer has the pinned output definition is refused, not guessed at.
+        self.settings.set("config.duplicate_prompt_examples", False)
+        self.settings.set("pr_review_prompt.system", "The output must be YAML.")
+        with self.assertRaisesRegex(review.ReviewAbort, "^Pinned review prompt no longer matches"):
+            review.configure()
+
+        # Reconfiguration must inspect our previously augmented template too.
+        for template in (original + original,
+                         original.replace("class PRReview(BaseModel):", "class Wrong(BaseModel):"),
+                         original.replace(review.discovery.SCHEMA_FIELD, "") + review.discovery.SCHEMA_FIELD):
+            self.settings.set("pr_review_prompt.system", template)
+            with self.subTest(template=template[-80:]), self.assertRaisesRegex(
+                    review.ReviewAbort, "^Pinned review prompt no longer matches"):
+                review.configure()
+
+    def test_omitted_source_requests_fail_closed_before_second_call_read_or_publication(self):
+        self.output = self.output.replace("source_requests: []\n", "")
+        completion = self.answering()
+        with self.assertRaisesRegex(review.ReviewAbort, "^Discovery source requests are invalid$"):
+            self.run_adapter(completion)
+        completion.assert_awaited_once()
+        self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
+        self.summary_publish.assert_not_called()
+        self.status.edit.assert_not_called()
+
+    def test_recovery_parser_losing_source_requests_still_fails_closed(self):
+        from pr_agent.tools.pr_reviewer import PRReviewer
+        # The pinned fallback extracts review: after prose it cannot parse.
+        # A request preceding that mapping can be lost during recovery.
+        first = "Unparseable prose [\nsource_requests: [src/consumer.py]\n" + self.CLEAN
+        parsed = object.__new__(PRReviewer)._load_review_yaml(first)
+        self.assertIsInstance(parsed, dict)
+        self.assertNotIn("source_requests", parsed)
+        completion = self.answering(first=first)
+        with self.assertRaisesRegex(review.ReviewAbort, "^Discovery source requests are invalid$"):
+            self.run_adapter(completion)
+        completion.assert_awaited_once()
+        self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
+        self.summary_publish.assert_not_called()
+        self.status.edit.assert_not_called()
+
+    def test_explicit_empty_source_requests_are_recorded_as_declared_and_still_run_discovery(self):
+        completion = self.answering()
+        self.run_adapter(completion)
+        self.assertEqual(3, completion.await_count)
+        discovery = self.completion_evidence()["quality"]["discovery"]
+        self.assertTrue(discovery["declared"])
+        self.assertEqual([], discovery["requested_paths"])
+
+    def test_zero_candidates_still_deliver_requested_changed_and_unchanged_full_source(self):
+        file = self.provider.get_diff_files.return_value[0]
+        file.head_file = "new\nunchanged_in_changed_file()\n"
+        repo = self.provider.github_client.get_repo.return_value
+        repo.get_contents.return_value = NS(type="file", encoding="base64", raw_data={},
+                                            decoded_content=b"existing_guard()\n")
+        first = "review:\n  relevant_tests: 'No'\n  security_concerns: 'No'\n  key_issues_to_review: []\nsource_requests:\n  - src/file.py\n  - src/consumer.py\n"
+        completion = self.answering(first=first, discovery=self.output.replace("source_requests: []\n", ""))
+        self.run_adapter(completion)
+        repo.get_contents.assert_called_once_with("src/consumer.py", ref=self.head)
+        bundles = self.bundles(completion)
+        self.assertEqual([], bundles["discovery"][1]["candidates"])
+        for name in ("discovery", "challenge"):
+            sources = bundles[name][1]["sources"]
+            self.assertIn("unchanged_in_changed_file()", sources["src/file.py"]["content"])
+            self.assertEqual("existing_guard()\n", sources["src/consumer.py"]["content"])
+        self.assertEqual(["src/file.py", "src/consumer.py"], self.completion_evidence()["quality"]["discovery"]["requested_paths"])
+
     def test_invalid_discovery_schema_is_named_without_output_or_paid_retry(self):
         # The former prompt allowed arbitrary strings; YAML also coerces bare No
         # to False. Exercise the actual pinned parser, not a validator mock.
@@ -466,21 +591,6 @@ review:
         self.assertEqual(3, completion.await_count)
         self.assertEqual(1, len(self.bundles(completion)["challenge"][1]["candidates"]))
         self.assertEqual(1, len(self.completion_evidence()["findings"]))
-
-    def test_omitted_source_request_key_still_runs_discovery_and_is_recorded_as_undeclared(self):
-        self.output = self.output.replace("source_requests: []\n", "")
-        completion = self.answering()
-        self.run_adapter(completion)
-        self.assertEqual(3, completion.await_count)
-        discovery = self.completion_evidence()["quality"]["discovery"]
-        self.assertFalse(discovery["declared"])
-        self.assertEqual([], discovery["requested_paths"])
-        self.assertTrue(self.bundles(completion)["discovery"][1]["diff"])
-
-    def test_declared_source_request_key_is_recorded_as_declared(self):
-        completion = self.answering()
-        self.run_adapter(completion)
-        self.assertTrue(self.completion_evidence()["quality"]["discovery"]["declared"])
 
     def test_malformed_source_requests_fail_before_any_read_or_second_call(self):
         for value in ("src/consumer.py", "null", "[{path: src/a.py}]"):

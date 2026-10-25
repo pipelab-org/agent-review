@@ -47,11 +47,50 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(discovery.Unavailable):
             discovery.read_source(repo, "src/a.py", "a" * 40)
 
-    def test_omitted_key_requests_nothing_but_a_non_mapping_is_invalid(self):
-        self.assertEqual([], discovery.requested_paths({}))
-        for value in (None, [], "source_requests: []"):
+    def test_the_key_is_required_and_only_an_explicit_empty_list_requests_nothing(self):
+        self.assertEqual([], discovery.requested_paths({"source_requests": []}))
+        # Omission is a contract violation, never an empty request.
+        for value in ({}, {"review": {}}, None, [], "source_requests: []"):
             with self.subTest(value=value), self.assertRaises(discovery.DiscoveryAbort):
                 discovery.requested_paths(value)
+
+    def test_first_pass_template_adds_the_key_once_and_refuses_a_changed_prompt(self):
+        pinned = ("x\nclass PRReview(BaseModel):\n    review: Review\n=====\n\nExample output:\n```yaml\nreview:\n"
+                  "  security_concerns: |\n    No\n{%- endif %}\n```\n\nAnswer should be a valid YAML, and nothing else.\n"
+                  + discovery.FORMAT_ANCHOR + "\n")
+        patched = discovery.first_pass_template(pinned)
+        self.assertIn("    review: Review\n" + discovery.SCHEMA_FIELD + "=====", patched)
+        self.assertIn("{%- endif %}\n" + discovery.EXAMPLE_FIELD + "```\n\nAnswer", patched)
+        self.assertEqual(patched, discovery.first_pass_template(patched))
+        self.assertIn(discovery.FORMAT_RULE, patched)
+        self.assertNotIn(discovery.FORMAT_ANCHOR, patched)
+        for template in ("", pinned.replace("    review: Review\n", ""), pinned.replace("\n```\n\nAnswer", "\n\nAnswer"),
+                         pinned + pinned, patched + patched,
+                         patched.replace(discovery.SCHEMA_FIELD, "") + discovery.SCHEMA_FIELD,
+                         patched.replace(discovery.SCHEMA_ANCHOR, "class Wrong:\n"),
+                         patched.replace(discovery.FORMAT_RULE, discovery.FORMAT_ANCHOR),
+                         patched + discovery.FORMAT_ANCHOR,
+                         pinned.replace(discovery.FORMAT_ANCHOR, "")):
+            with self.subTest(template=template[:40]), self.assertRaises(discovery.DiscoveryAbort):
+                discovery.first_pass_template(template)
+
+    def test_first_pass_template_refuses_a_stray_source_request_definition_it_did_not_write(self):
+        pinned = ("x\nclass PRReview(BaseModel):\n    review: Review\n=====\n\nExample output:\n```yaml\nreview:\n"
+                  "  security_concerns: |\n    No\n{%- endif %}\n```\n\nAnswer should be a valid YAML, and nothing else.\n"
+                  + discovery.FORMAT_ANCHOR + "\n")
+        patched = discovery.first_pass_template(pinned)
+        # Every original anchor is present exactly once either way; only the unrelated
+        # mention distinguishes these from a template this adapter can complete.
+        stray = "\nsource_requests: optional\n"
+        for template in (pinned + stray, patched + stray):
+            with self.subTest(template=template[-40:]), self.assertRaises(discovery.DiscoveryAbort):
+                discovery.first_pass_template(template)
+
+    def test_request_description_is_safe_inside_the_field_definition(self):
+        text = discovery.REQUEST_DESCRIPTION
+        for forbidden in ('"', "\\", "\n", "{{", "{%", "{#"):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(2, discovery.SCHEMA_FIELD.count('"'))
 
     def test_a_colon_is_a_legal_filename_character_but_urls_stay_invalid(self):
         self.assertEqual(["docs/a:b.md"], discovery.requested_paths({"source_requests": ["docs/a:b.md"]}))
