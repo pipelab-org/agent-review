@@ -94,6 +94,59 @@ class ReplayRunTests(ReplayTestCase):
              "reported_tokens": {"completion_tokens": 100, "prompt_tokens": 200, "total_tokens": 300}},
             {k: doc["run"][k] for k in ("models", "successful_calls", "billing_rejections", "reported_tokens")})
 
+    def test_response_capture_is_opt_in_and_replays_a_failed_challenge(self):
+        responses = [text("source_requests: []\n" + FINDING), text(FINDING),
+                     text('{"decisions": []}')]
+        ordinary = self.run_replay(responses)
+        self.assertNotIn("diagnostics", ordinary)
+        self.assertNotIn("transport_fixture", ordinary)
+        self.assertTrue(all("response" not in call for call in ordinary["calls"]))
+        captured = self.run_replay(responses, record_responses=True)
+        self.assertEqual("aborted", captured["adapter_outcome"])
+        self.assertFalse(captured["comparable"])
+        self.assertIn("finding challenge decisions", captured["failure"])
+        self.assertEqual(3, len(captured["calls"]))
+        self.assertEqual('{"decisions": []}', captured["calls"][-1]["response"]["text"])
+        self.assertEqual("stop", captured["calls"][-1]["response"]["finish_reason"])
+        chain = captured["diagnostics"]["failure_chain"]
+        self.assertEqual("QualityAbort", chain[-1]["type"])
+        self.assertTrue(any(frame["file"] == "scripts/review_quality.py" and frame["function"] == "adjudicate"
+                            for frame in chain[-1]["frames"]))
+        path = self.directory / "captured-fixture.json"
+        path.write_text(json.dumps(captured["transport_fixture"]))
+        replayed = self.run_replay(replay.load_fixture(path), record_responses=True)
+        self.assertEqual(captured["failure"], replayed["failure"])
+        self.assertEqual(captured["diagnostics"], replayed["diagnostics"])
+        self.assertEqual(captured["findings"], replayed["findings"])
+        self.assertEqual("stop", replayed["calls"][-1]["response"]["finish_reason"])
+        self.assertEqual([c["user_sha256"] for c in captured["calls"]],
+                         [c["user_sha256"] for c in replayed["calls"]])
+        self.assertFalse(replayed["inference"]["quality_evidence"])
+
+    def test_captured_truncation_remains_an_incomplete_completion(self):
+        doc = self.run_replay([text("source_requests: []\n" + CLEAN, finish_reason="length")],
+                              record_responses=True)
+        self.assertEqual("Provider returned an incomplete completion", doc["failure"])
+        self.assertFalse(doc["comparable"])
+        path = self.directory / "truncated.json"
+        path.write_text(json.dumps(doc["transport_fixture"]))
+        reproduced = self.run_replay(replay.load_fixture(path), record_responses=True)
+        self.assertEqual(doc["failure"], reproduced["failure"])
+        self.assertEqual("length", reproduced["calls"][0]["response"]["finish_reason"])
+
+    def test_failure_trace_does_not_capture_messages_or_locals(self):
+        planted = "private-" + "diagnostic-marker"
+        try:
+            try:
+                raise ValueError(planted)
+            except ValueError as cause:
+                raise replay.review.ReviewAbort("outer " + planted) from cause
+        except replay.review.ReviewAbort as error:
+            trace = replay.failure_trace(error, Path(replay.__file__).resolve().parents[1])
+        self.assertEqual(["ReviewAbort", "ValueError"], [item["type"] for item in trace])
+        self.assertNotIn(planted, json.dumps(trace))
+        self.assertTrue(all(set(item) == {"type", "frames"} for item in trace))
+
     def test_fixture_results_are_never_quality_evidence(self):
         doc = self.run_replay([text("source_requests: []\n" + CLEAN), text(CLEAN)])
         self.assertEqual("fixture", doc["inference"]["mode"])
@@ -674,6 +727,18 @@ class CliTests(ReplayTestCase):
         code, out, err = self.cli(*argv, "--snapshot-sha256", "0" * 64)
         self.assertEqual((2, ""), (code, out))
         self.assertIn("expected SHA-256", err)
+
+    def test_response_capture_cli_preserves_failure_and_refuses_partial_fixture(self):
+        code, out, _ = self.cli(*self.files([text("source_requests: []\n" + FINDING),
+                                           text(FINDING), text('{"decisions": []}')]),
+                                "--record-responses")
+        doc = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertEqual(3, len(doc["transport_fixture"]["responses"]))
+        self.assertEqual("QualityAbort", doc["diagnostics"]["failure_chain"][-1]["type"])
+        code, out, _ = self.cli(*self.files([{"error": {"timeout": True}}]), "--record-responses")
+        self.assertEqual(1, code)
+        self.assertIsNone(json.loads(out)["transport_fixture"])
 
     def test_aborted_replay_still_reports_and_exits_nonzero(self):
         code, out, _ = self.cli(*self.files([{"error": {"timeout": True}}]))

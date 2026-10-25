@@ -21,6 +21,10 @@ docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges
 
 Exit status is 0 when the adapter reached its own completion transition and the result is comparable, 1 when it aborted or completed without being comparable (the result is still printed), and 2 when nothing ran because an input was invalid. `--output FILE` writes the result instead of printing it. `--profile FILE --profile-sha SHA` selects a profile other than the engine's. `--depth deep` selects the deep policy. `--record-prompts` adds the exact model messages to each call, which contain snapshot text.
 
+For a private diagnostic, `--record-responses` retains returned response text and finish reasons in `calls[].response`, including when later validation aborts. It also records exception types and local script locations in `diagnostics.failure_chain`, without exception messages, stack locals or provider response objects. Response text can quote repository content; protect the result like the snapshot. Capture is off by default and does not alter finding validation or publication.
+
+When every attempted call returned captured text, `transport_fixture` contains a fixture accepted by `--fixture`. Save that object as a separate JSON file and replay it with the same snapshot, profile, depth and engine revision in fixture mode. Compare call prompt hashes and failure locations to check that the same path ran. The fixture reuses output text and finish reasons, not model reasoning, latency, token accounting or provider error behavior. Runs with a failed or uncaptured call have `transport_fixture: null`; no error response is invented. A reproduced failure stays failed and fixture output is never quality evidence. Capturing a future run cannot recover response text discarded by an earlier run.
+
 Prepare the tokenizer data first, as the CI runtime job does, and mount it read-only. The replay cannot fetch it: outside the configured model gateways, network access is denied.
 
 ## Exporting local history
