@@ -146,7 +146,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("needs.admit.outputs.admitted == 'true'", job["if"])
         self.assertRegex(job["container"]["image"], r"^pragent/pr-agent:0\.47\.0@sha256:[0-9a-f]{64}$")
         self.assertNotIn("env", job)
-        checkout, profile, validate, run, artifact = job["steps"]
+        checkout, profile, validate, run, artifact, outcome = job["steps"]
         self.assertEqual("${{ needs.source.outputs.reviewer_sha }}", checkout["with"]["ref"])
         self.assertEqual("pipelab-org/agent-review", checkout["with"]["repository"])
         self.assertEqual("trusted-agent-review", checkout["with"]["path"])
@@ -160,6 +160,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("python trusted-agent-review/scripts/pr_agent_review.py", run["run"])
         self.assertEqual("${{ github.event.comment.body == '/review deep' && 'deep' || 'default' }}", run["env"]["REVIEW_DEPTH"])
         self.assertNotIn("comment.body", run["run"])
+        # Diagnostics ride a different artifact than completion proof, and upload on failure.
+        self.assertEqual("agent-review-completion", artifact["with"]["name"])
+        self.assertNotIn("if", artifact)
+        self.assertEqual("agent-review-outcome", outcome["with"]["name"])
+        self.assertEqual("always()", outcome["if"])
+        # A re-run attempt shares its run's immutable artifacts: diagnostics replace the
+        # earlier record and never fail the job; completion proof stays a single, strict upload.
+        self.assertEqual("true", outcome["continue-on-error"])
+        self.assertEqual("true", outcome["with"]["overwrite"])
+        self.assertNotIn("continue-on-error", artifact)
+        self.assertNotIn("overwrite", artifact["with"])
+        self.assertNotIn("secrets.", json.dumps(outcome))
+        self.assertEqual("${{ runner.temp }}/agent-review-outcome/outcome.json", run["env"]["REVIEW_OUTCOME_PATH"])
+        self.assertEqual(run["env"]["REVIEW_OUTCOME_PATH"], outcome["with"]["path"])
 
     def test_container_keeps_hardening_and_uses_hosted_runner_uid(self):
         job = WORKFLOW["jobs"]["review"]

@@ -28,8 +28,10 @@ from urllib.parse import urlparse
 
 if __package__:
     from .agent_review_contract import MAX_DATA_BYTES, source_lines
+    from . import review_reliability as reliability
 else:
     from agent_review_contract import MAX_DATA_BYTES, source_lines
+    import review_reliability as reliability
 
 
 class FollowupAbort(Exception):
@@ -196,6 +198,18 @@ def download_record(artifact, token, timeout):
         raise FollowupAbort("Invalid artifact archive URL")
     response = requests.get(endpoint, headers={"Authorization": "Bearer " + token,
                             "Accept": "application/vnd.github+json"}, timeout=timeout, allow_redirects=False)
+    message = None
+    if response.status_code in reliability.THROTTLE_STATUSES:
+        try:
+            body = response.json()
+            message = body.get("message") if isinstance(body, dict) else None
+        except ValueError:
+            pass
+    if response.status_code in reliability.THROTTLE_STATUSES and reliability.classify(
+            response.status_code, response.headers, message) in reliability.RATE_CATEGORIES:
+        # Retain only the existing classifier's fixed wording, never the response text.
+        raise reliability.Throttled(response.status_code, response.headers,
+                                    reliability.message_kind(message))
     if response.status_code != 302:
         raise FollowupAbort("Completion artifact unavailable")
     location = response.headers.get("Location", "")
@@ -219,8 +233,12 @@ def download_record(artifact, token, timeout):
 def verified_records(repo, pr, current, load_artifact, *, contexts=None):
     try:
         comments = {c.id: c for c in pr.get_issue_comments()}
-    except Exception:
-        return {}  # Optional old proof never prevents a fresh full review.
+    except Exception as error:
+        # Optional old proof never prevents a fresh full review, but a rate limit is
+        # not missing proof: paid inference would follow into a throttled GitHub.
+        if reliability.throttled(error):
+            raise
+        return {}
     records = {}
     for comment in comments.values():
         record = parse_record(comment, comments)
@@ -234,9 +252,11 @@ def verified_records(repo, pr, current, load_artifact, *, contexts=None):
             if len(artifacts) != 1 or load_artifact(artifacts[0]) != record:
                 continue
             records[record["run_id"]] = record
-        except Exception:
+        except Exception as error:
             # Missing, stale, malformed, or unavailable proof must never suppress
             # needed review. Reply admission also refuses an unverified root.
+            if reliability.throttled(error):
+                raise
             continue
     return records
 
@@ -258,7 +278,9 @@ def scope_for(repo, current, records):
             if current_compare.base_commit.sha != current["base"] or not full_sha(current_compare.merge_base_commit.sha):
                 raise FollowupAbort("Invalid current base relationship")
             merge_base = current_compare.merge_base_commit.sha
-        except Exception:
+        except Exception as error:
+            if reliability.throttled(error):
+                raise
             records = {}
     pending = dict(records)
     while pending:
@@ -281,8 +303,9 @@ def scope_for(repo, current, records):
                     compare_ancestor(repo, scope["from"], record["head"])
                 compare_ancestor(repo, record["head"], current["head"])
                 valid[run_id] = record
-            except Exception:
-                pass
+            except Exception as error:
+                if reliability.throttled(error):
+                    raise
             del pending[run_id]
             progressed = True
         if not progressed:
@@ -300,9 +323,13 @@ def scope_for(repo, current, records):
             try:
                 compare_ancestor(repo, newest["head"], candidate["head"])
                 newest = candidate
-            except Exception:
+            except Exception as error:
+                if reliability.throttled(error):
+                    raise
                 compare_ancestor(repo, candidate["head"], newest["head"])
-    except Exception:
+    except Exception as error:
+        if reliability.throttled(error):
+            raise
         return {"kind": "full", "from": current["base"], "to": current["head"], "parent": None, "full_head": True}
     return {"kind": "unchanged" if newest["head"] == current["head"] else "incremental",
             "from": newest["head"], "to": current["head"], "parent": newest["run_id"], "full_head": False}
@@ -421,16 +448,22 @@ def write_completion(path, evidence):
 
 
 async def reply_workflow(settings, router, current, token, member_token, event, env, *, client=None):
-    from github import Auth, Github
+    from github import Auth
+
+    def new_client(secret):
+        # PyGithub's own defaults for pacing (0.25 s between requests, 1 s between writes).
+        return reliability.github_client(Auth.Token(secret), "https://api.github.com",
+                                         seconds_between_requests=0.25, seconds_between_writes=1.0)
+
     if client is None:
-        client = Github(auth=Auth.Token(token), retry=0)
+        client = new_client(token)
     repo = client.get_repo(current["repository"])
     pr = repo.get_pull(current["number"])
 
     def membership(org, login):
         # GitHub's organization-membership endpoint requires Members:read for
         # private membership. Invisible/unknown membership always fails closed.
-        member_client = Github(auth=Auth.Token(member_token or token), retry=0)
+        member_client = new_client(member_token or token)
         # The pinned PyGithub has no Organization.get_membership helper.
         # Use its authenticated requester for GitHub's documented endpoint.
         _, entry = member_client.requester.requestJsonAndCheck("GET", f"/orgs/{org}/memberships/{login}")
@@ -481,7 +514,8 @@ async def reply_workflow(settings, router, current, token, member_token, event, 
     # GitHub's repository/PR concurrency serializes separate workflow processes.
     pending_body = marker + "\nReply pending; no completed answer yet. " + (
         f"[Actions run](https://github.com/{current['repository']}/actions/runs/{env['GITHUB_RUN_ID']}).")
-    pending = pr.create_review_comment_reply(root.id, pending_body)
+    with reliability.phase("publication"):
+        pending = pr.create_review_comment_reply(root.id, pending_body)
     observed = pr.get_review_comment(pending.id)
     if (not identity(observed.user, BOT) or observed.raw_data.get("in_reply_to_id") != root.id
             or observed.body != pending_body):
@@ -493,7 +527,8 @@ async def reply_workflow(settings, router, current, token, member_token, event, 
         pr, live, root = check()
         # Model output remains plain untrusted text in the same fixed comment.
         # It cannot choose a target or become a command/configuration argument.
-        pending.edit(marker + "\n" + response)
+        with reliability.phase("publication"):
+            pending.edit(marker + "\n" + response)
         fetched = pr.get_review_comment(pending.id)
         if (not identity(fetched.user, BOT) or fetched.raw_data.get("in_reply_to_id") != root.id
                 or fetched.body != marker + "\n" + response):
