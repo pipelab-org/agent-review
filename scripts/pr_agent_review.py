@@ -275,6 +275,14 @@ def configure():
             continue
         for key, value in entries.items():
             settings.set(f"{section}.{key}", value)
+    # The first pass declares source_requests in the pinned prompt's own output
+    # definition. A repeated example in the user prompt would show the old shape.
+    if settings.config.get("duplicate_prompt_examples", False):
+        raise ReviewAbort("Repeated prompt examples would contradict the source-request contract")
+    try:
+        settings.set("pr_review_prompt.system", discovery.first_pass_template(settings.pr_review_prompt.system))
+    except discovery.DiscoveryAbort as error:
+        raise ReviewAbort("Pinned review prompt no longer matches the source-request contract") from error
     settings.set("pr_reviewer.extra_instructions",
                  data["pr_reviewer"]["extra_instructions"].rstrip() + "\n\n" + profile["review"]["instructions"])
     depth = review_depth()
@@ -545,9 +553,6 @@ async def review(settings):
             if limit < 3:
                 raise ReviewAbort("Review budget cannot include source discovery and finding challenge")
             settings.set("pr_reviewer.max_number_of_calls", limit - 2)
-            self.vars["extra_instructions"] += discovery.REQUEST_INSTRUCTIONS
-            if hasattr(self, "_raw_prompt_vars"):
-                self._raw_prompt_vars["extra_instructions"] = self.vars["extra_instructions"]
             try:
                 await super()._prepare_prediction(model)
             finally:
@@ -559,9 +564,6 @@ async def review(settings):
                 paths = discovery.requested_paths(data, invalid_requests)
             except discovery.DiscoveryAbort as error:
                 raise ReviewAbort("Discovery source requests are invalid") from error
-            # The pinned schema and example show only `review`, so a model can omit the
-            # key. The second pass still runs, so record the omission rather than fail.
-            declared = "source_requests" in data
             data.pop("source_requests", None)
             self.prediction_data = data
             if not self._validate_review_schema(data):
@@ -620,7 +622,7 @@ async def review(settings):
                 if any(not isinstance(f.patch, str) for f in files):
                     raise discovery.DiscoveryAbort("Discovery patch context is unavailable")
                 bundle["diff"] = {f.filename: f.patch for f in files}
-                instructions = self.vars["extra_instructions"].replace(discovery.REQUEST_INSTRUCTIONS, "")
+                instructions = self.vars["extra_instructions"]
                 context_hash = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
                 from pr_agent.tools.pr_reviewer import PRReview
                 stage = "source discovery response"
@@ -643,7 +645,8 @@ async def review(settings):
                 stage = "finding challenge context"
                 bundle = quality.context(self.check_binding(fresh=True), files, candidates, content, evidence)
                 bundle["unavailable_requests"].update(unavailable)
-                self.quality_audit["discovery"] = {"declared": declared, "requested_paths": paths,
+                # requested_paths refuses an omitted key, so a recorded run always declared it.
+                self.quality_audit["discovery"] = {"declared": True, "requested_paths": paths,
                                                    "source_paths": sorted(evidence),
                                                    "unavailable_requests": unavailable,
                                                    "context_sha256": context_hash}

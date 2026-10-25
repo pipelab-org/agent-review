@@ -83,7 +83,7 @@ class ReplayRunTests(ReplayTestCase):
         self.assertEqual([], doc["findings"])
         self.assertTrue(doc["comparable"])
         # The adapter's own prompts, not a replay-specific reviewer.
-        self.assertIn(replay.review.discovery.REQUEST_INSTRUCTIONS, calls[0][0]["content"])
+        self.assertIn(replay.review.discovery.REQUEST_DESCRIPTION, calls[0][0]["content"])
         self.assertTrue(calls[1][0]["content"].startswith(replay.review.discovery.SYSTEM))
         bundle = json.loads(calls[1][1]["content"])
         self.assertEqual("existing_guard()\n", bundle["sources"]["src/consumer.py"]["content"])
@@ -115,7 +115,7 @@ class ReplayRunTests(ReplayTestCase):
             return Provider
 
         with patch.object(replay, "provider_class", provider_with_missing_read):
-            doc = self.run_replay([text(CLEAN), text(CLEAN)])
+            doc = self.run_replay([text("source_requests: []\n" + CLEAN), text(CLEAN)])
         self.assertEqual("completed", doc["adapter_outcome"])
         self.assertTrue(doc["unmodeled_provider_access"])
         self.assertFalse(doc["comparable"])
@@ -141,7 +141,7 @@ class ReplayRunTests(ReplayTestCase):
             return Provider
 
         with patch.object(replay, "provider_class", provider_probing_unmodeled_fields):
-            doc = self.run_replay([text(CLEAN), text(CLEAN)])
+            doc = self.run_replay([text("source_requests: []\n" + CLEAN), text(CLEAN)])
         self.assertEqual("completed", doc["adapter_outcome"])
         self.assertEqual(["Obj.committer", "Obj.owner", "Obj.user"],
                          doc["unmodeled_provider_access"])
