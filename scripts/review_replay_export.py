@@ -80,7 +80,10 @@ def export(repo, repository, number, base, head, absent=()):
         return result
 
     old, new = tree(base), tree(head)
-    changes = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", "--name-status", "-z", base, head).split(b"\0")
+    # git-config(1) diff.orderFile: "To cancel diff.orderFile, use -O/dev/null". Otherwise a
+    # configured order file changes which files the adapter sees first.
+    changes = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none",
+                  "-O" + os.devnull, "--name-status", "-z", base, head).split(b"\0")
     if changes[-1] == b"":
         changes.pop()
     if len(changes) % 2 or any(raw in unlisted for raw in changes[1::2]):
@@ -135,8 +138,13 @@ def export(repo, repository, number, base, head, absent=()):
             left, right = Path(directory) / "before", Path(directory) / "after"
             left.write_bytes(before.encode("utf-8"))
             right.write_bytes(after.encode("utf-8"))
+            # git(1) GIT_CEILING_DIRECTORIES: Git does not chdir up into a listed directory
+            # looking for a repository. Without it a temporary directory inside some other
+            # repository (TMPDIR in a workspace) would apply that repository's attributes
+            # and filters to these bytes. Git compares against its real current directory.
+            ceiling = os.path.dirname(os.path.realpath(directory))
             diff_env = dict(env, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                            GIT_ATTR_NOSYSTEM="1")
+                            GIT_ATTR_NOSYSTEM="1", GIT_CEILING_DIRECTORIES=ceiling)
             diff_env.pop("GIT_ATTR_SOURCE", None)
             result = subprocess.run(
                 [*GIT, "-C", directory, "-c", "core.attributesFile=" + os.devnull,
@@ -163,7 +171,9 @@ def export(repo, repository, number, base, head, absent=()):
         if (not snapshots.repo_path(path) or path in new or any(p.startswith(path+"/") for p in new)
                 or any(u == raw or u.startswith(raw + b"/") for u in unlisted)):
             raise snapshots.SnapshotError("Declared absent path exists or is invalid")
-    timestamp = int(git("show", "-s", "--format=%ct", head).strip())
+    # git-log(1) --no-show-signature overrides log.showSignature, which would run the
+    # configured gpg.program for a signed commit.
+    timestamp = int(git("show", "-s", "--no-show-signature", "--format=%ct", head).strip())
     data = dict(schema=snapshots.SCHEMA, version=snapshots.VERSION, repository=repository, number=number,
                 base=base, head=head, title="Review captured change", branch="replay/snapshot",
                 description="", commits=[], languages={}, files=files, sources=sources, absent=list(absent),

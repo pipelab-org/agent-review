@@ -177,6 +177,75 @@ class ExportTests(unittest.TestCase):
         attributes.write_text("*.py -diff\n")
         self.assertEqual(expected, self.export()["files"][0]["patch"])
 
+    def test_a_configured_order_file_cannot_reorder_the_changed_files(self):
+        (self.repo/"another.py").write_text("one\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Add a second file")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        (self.repo/"another.py").write_text("two\n")
+        (self.repo/"code.py").write_text("value = 3\n")
+        self.git("commit", "-qam", "Change both")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        expected = [f["filename"] for f in self.export()["files"]]
+        self.assertEqual(["another.py", "code.py"], expected)
+        order = self.repo.parent / (self.repo.name + "-order")
+        order.write_text("code.py\nanother.py\n")
+        self.git("config", "diff.orderFile", str(order))
+        self.assertEqual(["code.py", "another.py"],  # plain git follows the setting
+                         self.git("diff", "--name-only", self.base, self.head).split())
+        self.assertEqual(expected, [f["filename"] for f in self.export()["files"]])
+
+    def test_a_signed_commit_never_runs_the_configured_signature_program(self):
+        marker = self.repo.parent / (self.repo.name + "-gpg")
+        program = self.repo.parent / (self.repo.name + "-gpg.sh")
+        program.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        program.chmod(0o755)
+        self.git("config", "log.showSignature", "true")
+        self.git("config", "gpg.program", str(program))
+        tree = self.git("rev-parse", self.head + "^{tree}").strip()
+        commit = self.repo.parent / (self.repo.name + "-commit")
+        commit.write_text(f"tree {tree}\nparent {self.base}\nauthor A <a@example.invalid> 1700000000 +0000\n"
+                          "committer A <a@example.invalid> 1700000000 +0000\n"
+                          "gpgsig -----BEGIN PGP SIGNATURE-----\n \n fixture\n -----END PGP SIGNATURE-----\n\nsigned\n")
+        self.head = self.git("hash-object", "-t", "commit", "-w", "--literally", str(commit)).strip()
+        # Control: plain Git runs the program for this commit, so the case is real.
+        self.git("show", "-s", self.head)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        self.assertEqual("2023-11-14T22:13:20Z", self.export()["discussion"]["as_of"])
+        self.assertFalse(marker.exists())
+
+    @unittest.skipIf(os.name == "nt", "the fixture links a directory")
+    def test_a_temporary_directory_inside_another_repository_cannot_change_the_diff(self):
+        (self.repo/"code.py").write_bytes(b"one\r\ntwo\r\n")
+        self.git("commit", "-qam", "CRLF fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        (self.repo/"code.py").write_bytes(b"one\r\ntwo\r\nthree\r\n")
+        self.git("commit", "-qam", "Append")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        expected = self.export()["files"][0]["patch"]
+        self.assertIn("+three\r\n", expected)
+        with tempfile.TemporaryDirectory() as directory:
+            outer = Path(directory) / "workspace"
+            outer.mkdir()
+            marker = Path(directory) / "filter-ran"
+            subprocess.check_call(["git", "init", "-q", str(outer)])
+            (outer/".gitattributes").write_text("* text eol=lf filter=mark\n")
+            subprocess.check_call(["git", "-C", str(outer), "config", "filter.mark.clean",
+                                   f"sh -c 'touch {marker}; cat' --"])
+            (outer/"tmp").mkdir()
+            link = Path(directory) / "link"
+            link.symlink_to(outer/"tmp")
+            for location in (outer/"tmp", outer, link):
+                with self.subTest(location=str(location)), patch.object(tempfile, "tempdir", str(location)):
+                    # Control: Git applies that repository's filter to a file in that location.
+                    subprocess.run(["git", "-C", str(location), "hash-object", "--path", "probe.txt", "--stdin"],
+                                   input=b"x\r\n", stdout=subprocess.DEVNULL, check=True)
+                    self.assertTrue(marker.exists())
+                    marker.unlink()
+                    self.assertEqual(expected, self.export()["files"][0]["patch"])
+                    self.assertFalse(marker.exists())
+
     def test_partial_clone_never_fetches_missing_objects(self):
         self.git("config", "uploadpack.allowFilter", "true")
         with tempfile.TemporaryDirectory() as directory:

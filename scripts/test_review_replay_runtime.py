@@ -378,6 +378,26 @@ class NoGitHubTests(ReplayTestCase):
                 unix.connect("/var/run/docker.sock")
         self.assertEqual(6, len(guard.denied))
 
+    def test_datagrams_to_a_named_peer_are_denied_like_connections(self):
+        guard = replay.Egress(())
+        with (contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as receiver,
+              contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sender):
+            receiver.bind(("127.0.0.1", 0))
+            receiver.settimeout(0.2)
+            peer = receiver.getsockname()
+            sender.sendto(b"control", peer)  # unguarded control: the datagram really arrives
+            self.assertEqual(b"control", receiver.recv(16))
+            with guard.active():
+                with self.assertRaises(replay.ReplayError):
+                    sender.sendto(b"x", peer)
+                with self.assertRaises(replay.ReplayError):
+                    sender.sendto(b"x", 0, peer)
+                with self.assertRaises(replay.ReplayError):
+                    sender.sendmsg([b"x"], [], 0, peer)
+            with self.assertRaises(TimeoutError):
+                receiver.recv(16)
+        self.assertEqual(3, len(guard.denied))
+
     def test_requests_is_denied_even_where_no_socket_or_name_lookup_would_happen(self):
         # A transport adapter that never touches a socket isolates the Session.send layer
         # PyGithub uses; the name-lookup layer alone cannot be what denies this call.

@@ -312,6 +312,7 @@ class Egress:
         # Async DNS workers receive an explicit copy of that context below.
         active_request = contextvars.ContextVar("replay_gateway_request", default=None)
         getaddrinfo, connect, connect_ex = socket.getaddrinfo, socket.socket.connect, socket.socket.connect_ex
+        sendto, sendmsg = socket.socket.sendto, socket.socket.sendmsg
         client_send, async_send = httpx.Client.send, httpx.AsyncClient.send
         single_send = httpx.Client._send_single_request
         async_single_send = httpx.AsyncClient._send_single_request
@@ -356,6 +357,18 @@ class Egress:
             check_address(address)
             return connect_ex(sock, address)
 
+        def guarded_sendto(sock, data, *args):
+            # socket(7): an unconnected datagram socket names its peer on each send, so
+            # connect() alone never sees it. sendto(data, address) or (data, flags, address).
+            check_address(args[-1])
+            return sendto(sock, data, *args)
+
+        def guarded_sendmsg(sock, buffers, *args, **kwargs):
+            address = kwargs.get("address", args[2] if len(args) > 2 else None)
+            if address is not None:
+                check_address(address)
+            return sendmsg(sock, buffers, *args, **kwargs)
+
         def check_request(request):
             if (request.url.scheme != "https" or request.url.host not in guard.hosts
                     or request.url.port not in (None, 443)):
@@ -398,6 +411,8 @@ class Egress:
               patch.object(asyncio.BaseEventLoop, "getaddrinfo", async_resolve),
               patch.object(socket.socket, "connect", guarded_connect),
               patch.object(socket.socket, "connect_ex", guarded_connect_ex),
+              patch.object(socket.socket, "sendto", guarded_sendto),
+              patch.object(socket.socket, "sendmsg", guarded_sendmsg),
               patch.object(httpx.Client, "send", sync_send),
               patch.object(httpx.AsyncClient, "send", async_guarded),
               patch.object(httpx.Client, "_send_single_request", sync_single),
