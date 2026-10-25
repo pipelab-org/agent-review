@@ -12,8 +12,10 @@ from scripts.review_replay_snapshot import SnapshotError
 
 
 def fixture_git_env():
-    return {k: v for k, v in os.environ.items()
-            if k not in exporter.AMBIENT and not k.startswith("GIT_CONFIG")}
+    env = {k: v for k, v in os.environ.items()
+           if k not in exporter.AMBIENT and not k.startswith("GIT_CONFIG")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+    return env
 
 
 class ExportTests(unittest.TestCase):
@@ -49,6 +51,20 @@ class ExportTests(unittest.TestCase):
                 self.git("config", "fixture.isolated", "true")
             self.assertEqual(before, (other / ".git" / "config").read_bytes())
             self.assertFalse((other / "index").exists())
+
+    def test_fixture_commits_ignore_global_signing_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".gitconfig").write_text("[commit]\n gpgSign = true\n[gpg]\n program = false\n")
+            with patch.dict(os.environ, {"HOME": str(home), "XDG_CONFIG_HOME": str(home),
+                                         "GIT_CONFIG_GLOBAL": os.devnull}):
+                control_env = fixture_git_env()
+                control_env.pop("GIT_CONFIG_GLOBAL", None)
+                control = subprocess.run(["git", "-C", str(self.repo), "commit", "--allow-empty", "-m", "Control"],
+                                         env=control_env, capture_output=True)
+                self.assertNotEqual(0, control.returncode)
+                self.assertIn(b"failed to sign", control.stderr)
+                self.git("commit", "--allow-empty", "-qm", "Isolated fixture")
 
     def export(self, **kwargs):
         return exporter.export(self.repo, "example/project", 1, self.base, self.head, **kwargs)
