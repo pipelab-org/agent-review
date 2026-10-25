@@ -56,13 +56,21 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_first_pass_template_adds_the_key_once_and_refuses_a_changed_prompt(self):
         pinned = ("x\nclass PRReview(BaseModel):\n    review: Review\n=====\n\nExample output:\n```yaml\nreview:\n"
-                  "  security_concerns: |\n    No\n{%- endif %}\n```\n\nAnswer should be a valid YAML, and nothing else.\n")
+                  "  security_concerns: |\n    No\n{%- endif %}\n```\n\nAnswer should be a valid YAML, and nothing else.\n"
+                  + discovery.FORMAT_ANCHOR + "\n")
         patched = discovery.first_pass_template(pinned)
         self.assertIn("    review: Review\n" + discovery.SCHEMA_FIELD + "=====", patched)
         self.assertIn("{%- endif %}\n" + discovery.EXAMPLE_FIELD + "```\n\nAnswer", patched)
         self.assertEqual(patched, discovery.first_pass_template(patched))
+        self.assertIn(discovery.FORMAT_RULE, patched)
+        self.assertNotIn(discovery.FORMAT_ANCHOR, patched)
         for template in ("", pinned.replace("    review: Review\n", ""), pinned.replace("\n```\n\nAnswer", "\n\nAnswer"),
-                         pinned + pinned):
+                         pinned + pinned, patched + patched,
+                         patched.replace(discovery.SCHEMA_FIELD, "") + discovery.SCHEMA_FIELD,
+                         patched.replace(discovery.SCHEMA_ANCHOR, "class Wrong:\n"),
+                         patched.replace(discovery.FORMAT_RULE, discovery.FORMAT_ANCHOR),
+                         patched + discovery.FORMAT_ANCHOR,
+                         pinned.replace(discovery.FORMAT_ANCHOR, "")):
             with self.subTest(template=template[:40]), self.assertRaises(discovery.DiscoveryAbort):
                 discovery.first_pass_template(template)
 

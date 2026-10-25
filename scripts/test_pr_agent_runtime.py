@@ -291,11 +291,21 @@ review:
         parsed = object.__new__(PRReviewer)._load_review_yaml(example)
         self.assertEqual({"review", "source_requests"}, set(parsed))
         self.assertEqual(["directory/xxx.py"], review.discovery.requested_paths(parsed))
+        # The old blanket scalar rule would append a newline to each path.
+        # Keep refusing that value instead of relaxing the literal path boundary.
+        block_example = ("source_requests:\n  - |\n    directory/xxx.py\n"
+                         + example.replace("source_requests:\n  - directory/xxx.py", ""))
+        block = object.__new__(PRReviewer)._load_review_yaml(block_example)
+        unavailable = {}
+        self.assertEqual([], review.discovery.requested_paths(block, unavailable))
+        self.assertEqual({"directory/xxx.py\n": "invalid repository-relative file path"}, unavailable)
         # The rule has one home: neither the operator's extra instructions nor a second block carry it.
         extra = system.split("Extra instructions from the user:\n======\n", 1)[1].split("\n======", 1)[0]
         self.assertNotIn("source_requests", extra)
         self.assertEqual(2, system.count("source_requests"))  # the field and its example, nothing else
         self.assertIn(review.discovery.REQUEST_DESCRIPTION, system)
+        self.assertNotIn("Each YAML output MUST", system)
+        self.assertIn("Use block scalars for review prose only", system)
         # Token planning renders the same template the request does.
         self.assertIn("source_requests: List[str]", self.settings.pr_review_prompt.system)
 
@@ -305,7 +315,7 @@ review:
         system = completion.await_args_list[1].kwargs["messages"][0]["content"]
         criteria = system.split("Operator review criteria:\n", 1)[1].split("\nOutput format is required", 1)[0]
         self.assertNotIn("source_requests", criteria)
-        self.assertNotIn("plain single-line YAML string", system)  # the first-pass field description
+        self.assertNotIn(review.discovery.REQUEST_DESCRIPTION, system)  # the first-pass field description
         schema = system.split("Runtime output schema (JSON Schema; response remains YAML):\n", 1)[1].split("\nOperator", 1)[0]
         schema = json.loads(schema)
         self.assertEqual(["review"], list(schema["properties"]))
@@ -330,9 +340,34 @@ review:
         with self.assertRaisesRegex(review.ReviewAbort, "^Pinned review prompt no longer matches"):
             review.configure()
 
+        # Reconfiguration must inspect our previously augmented template too.
+        for template in (original + original,
+                         original.replace("class PRReview(BaseModel):", "class Wrong(BaseModel):"),
+                         original.replace(review.discovery.SCHEMA_FIELD, "") + review.discovery.SCHEMA_FIELD):
+            self.settings.set("pr_review_prompt.system", template)
+            with self.subTest(template=template[-80:]), self.assertRaisesRegex(
+                    review.ReviewAbort, "^Pinned review prompt no longer matches"):
+                review.configure()
+
     def test_omitted_source_requests_fail_closed_before_second_call_read_or_publication(self):
         self.output = self.output.replace("source_requests: []\n", "")
         completion = self.answering()
+        with self.assertRaisesRegex(review.ReviewAbort, "^Discovery source requests are invalid$"):
+            self.run_adapter(completion)
+        completion.assert_awaited_once()
+        self.provider.github_client.get_repo.return_value.get_contents.assert_not_called()
+        self.summary_publish.assert_not_called()
+        self.status.edit.assert_not_called()
+
+    def test_recovery_parser_losing_source_requests_still_fails_closed(self):
+        from pr_agent.tools.pr_reviewer import PRReviewer
+        # The pinned fallback extracts review: after prose it cannot parse.
+        # A request preceding that mapping can be lost during recovery.
+        first = "Unparseable prose [\nsource_requests: [src/consumer.py]\n" + self.CLEAN
+        parsed = object.__new__(PRReviewer)._load_review_yaml(first)
+        self.assertIsInstance(parsed, dict)
+        self.assertNotIn("source_requests", parsed)
+        completion = self.answering(first=first)
         with self.assertRaisesRegex(review.ReviewAbort, "^Discovery source requests are invalid$"):
             self.run_adapter(completion)
         completion.assert_awaited_once()
