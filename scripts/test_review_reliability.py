@@ -296,6 +296,17 @@ class DiagnosticTests(unittest.TestCase):
         self.assertNotIn("status", entry)
         self.assertFalse(reliability.throttled(caught))
 
+    def test_outcome_write_failure_warns_and_still_writes_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"REVIEW_OUTCOME_PATH": directory, "GITHUB_STEP_SUMMARY": f"{directory}/summary.md"}
+            stream = io.StringIO()
+            result = reliability.report(env=env, stream=stream)
+            self.assertEqual("Review outcome could not be recorded\n", stream.getvalue())
+            self.assertIn("Agent review outcome", Path(env["GITHUB_STEP_SUMMARY"]).read_text())
+            self.assertEqual("succeeded", result["result"])
+            broken = NS(write=lambda text: (_ for _ in ()).throw(OSError("private-error")))
+            self.assertEqual(result, reliability.report(env=env, stream=broken))
+
     def test_nothing_sensitive_reaches_the_outcome_summary_or_log_line(self):
         error = GH(403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "bad", "authorization": SECRET,
                          "x-ratelimit-resource": SECRET, "set-cookie": SECRET},

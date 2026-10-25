@@ -481,7 +481,10 @@ def report(error=None, env=None, stream=None):
             target.write_text(line, encoding="utf-8")
             target.chmod(0o600)
         except OSError:
-            pass
+            try:
+                print("Review outcome could not be recorded", file=stream or sys.stderr)
+            except OSError:
+                pass  # A diagnostic sink must not change the review result.
     sink = env.get("GITHUB_STEP_SUMMARY")
     if sink:
         try:
