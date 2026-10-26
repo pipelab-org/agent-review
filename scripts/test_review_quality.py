@@ -213,9 +213,24 @@ class QualityTests(unittest.TestCase):
             for response in (invalid, "```json\n" + invalid + "\n```"):
                 with self.subTest(response=response), self.assertRaises(ValueError):
                     q.parse_response(response)
+        # Only the documented envelope is recovered: a lowercase json info string on
+        # three backticks, closed at the start of a line. Other fence shapes fail.
+        for shape in ("```\n%s\n```", "```JSON\n%s\n```", "```yaml\n%s\n```", "```json \n%s\n```",
+                      "````json\n%s\n````", "~~~json\n%s\n~~~", "```json\n%s\n  ```", "```json\n%s```",
+                      "```json %s```"):
+            with self.subTest(shape=shape), self.assertRaises(ValueError):
+                q.parse_response(shape % raw)
         for invalid in ('{"decisions": []}', json.dumps({"decisions": [dict(decision(), extra="ignored")]})):
             with self.subTest(invalid=invalid), self.assertRaises(q.QualityAbort):
                 q.adjudicate(self.data, self.bundle, q.parse_response("```json\n" + invalid + "\n```"))
+
+    def test_unreadable_patch_for_any_changed_file_fails_closed_even_when_it_is_no_candidate(self):
+        # The challenge now carries every patch, so a file that is not a candidate
+        # can no longer be skipped: its missing patch would be a silent evidence gap.
+        for patch in (None, b"@@", 7):
+            files = self.files + [NS(filename="src/other.py", head_file="x()", patch=patch)]
+            with self.subTest(patch=patch), self.assertRaisesRegex(q.QualityAbort, "diff evidence is unavailable"):
+                q.context(self.pr, files, [self.finding])
 
     def test_security_duplicate_retains_the_security_concern(self):
         self.bundle["candidates"].append(dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence"))

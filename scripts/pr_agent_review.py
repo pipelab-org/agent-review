@@ -619,9 +619,6 @@ async def review(settings):
                 # request loop supplied that source; never tell the model both.
                 unavailable = {p: reason for p, reason in unavailable.items() if p not in bundle["sources"]}
                 bundle["unavailable_requests"] = dict(unavailable)
-                if any(not isinstance(f.patch, str) for f in files):
-                    raise discovery.DiscoveryAbort("Discovery patch context is unavailable")
-                bundle["diff"] = {f.filename: f.patch for f in files}
                 instructions = self.vars["extra_instructions"]
                 context_hash = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
                 from pr_agent.tools.pr_reviewer import PRReview

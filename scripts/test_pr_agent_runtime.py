@@ -819,6 +819,18 @@ review:
         self.provider.publish_code_suggestions.assert_not_called()
         self.status.edit.assert_not_called()
 
+    def test_unreadable_patch_of_a_non_candidate_file_aborts_before_discovery(self):
+        from pr_agent.algo.types import FilePatchInfo
+        self.provider.get_diff_files.return_value.append(FilePatchInfo(
+            base_file="a()\n", head_file="b()\n", patch=None, filename="src/other.py"))
+        completion = AsyncMock(side_effect=[self.response()])
+        with self.assertRaisesRegex(review.ReviewAbort, "^Review incomplete or invalid at source context$"):
+            self.run_adapter(completion)
+        self.assertEqual(1, completion.await_count)
+        self.summary_publish.assert_not_called()
+        self.provider.publish_code_suggestions.assert_not_called()
+        self.status.edit.assert_not_called()
+
     def test_challenge_retains_repeat_and_held_findings_without_new_inline_threads(self):
         for verdict in ("duplicate", "acknowledged-decision"):
             with self.subTest(verdict=verdict):
