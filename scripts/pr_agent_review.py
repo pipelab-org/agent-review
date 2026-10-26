@@ -656,7 +656,7 @@ async def review(settings):
                 answer = await self.evidence_completion(quality.SYSTEM, bundle)
                 stage = "finding challenge decisions"
                 self.prediction_data, self.retained_findings, audit = quality.adjudicate(
-                    data, bundle, followups.strict_json(answer))
+                    data, bundle, quality.parse_response(answer))
                 self.quality_audit.update(audit)
                 self.quality_audit["unavailable_sources"] = {p: reason for p, reason in bundle["unavailable_requests"].items() if p not in unavailable}
             except (quality.QualityAbort, discovery.DiscoveryAbort, ValueError, TypeError) as error:

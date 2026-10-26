@@ -17,8 +17,10 @@ import re
 
 if __package__:
     from .agent_review_contract import source_lines
+    from .review_followups import strict_json
 else:
     from agent_review_contract import source_lines
+    from review_followups import strict_json
 
 
 class QualityAbort(Exception):
@@ -75,6 +77,8 @@ def context(pr, files, findings, content=lambda file: file.head_file, extra_sour
         paths.update(file.filename for file in files)
     inventory = []
     for file in files:
+        if not isinstance(file.patch, str):
+            raise QualityAbort("Current diff evidence is unavailable")
         inventory.append(file.filename)
         if file.filename in paths:
             text = content(file)
@@ -105,14 +109,26 @@ def context(pr, files, findings, content=lambda file: file.head_file, extra_sour
         raise QualityAbort("Prior review context could not be read") from error
     bundle = {"description": description, "threads": sorted(threads, key=lambda c: c["id"]),
               "reviewable_files": sorted(inventory), "sources": sources, "candidates": findings,
-              "unavailable_requests": unavailable}
-    # A finding in unchanged source must show how this diff causes it, which needs the
-    # whole diff. A changed file's own patch is already in sources, so only supply every
-    # patch when such a finding can be published: on a large pull request they alone
-    # can exhaust the request budget before the challenge call.
-    if any(path in sources and path not in inventory for path in paths):
-        bundle["diff"] = {f.filename: f.patch for f in files}
+              "unavailable_requests": unavailable, "diff": {f.filename: f.patch for f in files}}
+    # Cross-file evidence supports or refutes changed-file candidates too. The
+    # caller checks the entire request against every remaining route's budget;
+    # exceeding it must abort rather than silently remove supporting patches.
     return bundle
+
+
+def parse_response(raw):
+    """Decode model decisions, allowing one complete Markdown JSON fence.
+
+    This envelope recovery is only for the challenge response. Completion
+    records and other trusted JSON retain their strict wire format. CommonMark
+    fenced code blocks supply the envelope; JSON and decision validation still
+    reject duplicate fields, extra documents and malformed dispositions.
+    """
+    if isinstance(raw, str):
+        fenced = re.fullmatch(r"[ \t\r\n]*```json\r?\n(.*)\r?\n```[ \t\r\n]*", raw, re.DOTALL)
+        if fenced:
+            raw = fenced[1]
+    return strict_json(raw)
 
 
 def inline_location(candidate, bundle):
