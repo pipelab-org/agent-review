@@ -21,6 +21,10 @@ docker run --rm --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges
 
 Exit status is 0 when the adapter reached its own completion transition and the result is comparable, 1 when it aborted or completed without being comparable (the result is still printed), and 2 when nothing ran because an input was invalid. `--output FILE` writes the result instead of printing it. `--profile FILE --profile-sha SHA` selects a profile other than the engine's. `--depth deep` selects the deep policy. `--record-prompts` adds the exact model messages to each call, which contain snapshot text.
 
+For a private diagnostic, `--record-responses` retains returned response text and finish reasons in `calls[].response`, including when later validation aborts. When the adapter aborts or raises, it also records exception types and local script locations in `diagnostics.failure_chain` (empty otherwise), without exception messages, stack locals or provider response objects. A provider failure the adapter re-raises without its cause shows as the adapter's own abort; the failed call's `outcome` names the provider exception type. Response text can quote repository content; protect the result like the snapshot. Capture is off by default and does not alter finding validation or publication.
+
+When every attempted call returned captured text, `transport_fixture` contains a fixture accepted by `--fixture`. Save that object as a separate JSON file and replay it with the same snapshot, profile, depth and engine revision in fixture mode. Compare call prompt hashes and failure locations to check that the same path ran. The fixture reuses output text and finish reasons, not model reasoning, latency, token accounting or provider error behavior. Runs with no calls, or with a failed or uncaptured call, have `transport_fixture: null`; no error response is invented. A reproduced failure stays failed and fixture output is never quality evidence. Capturing a future run cannot recover response text discarded by an earlier run.
+
 Prepare the tokenizer data first, as the CI runtime job does, and mount it read-only. The replay cannot fetch it: outside the configured model gateways, network access is denied.
 
 ## Exporting local history
@@ -40,6 +44,8 @@ Pass `--repo`, `--repository`, `--number`, `--base`, `--head`, and a new `--outp
   {"error": {"timeout": true}}
 ]}
 ```
+
+A text response may also carry `finish_reason`, a string or null, replayed unchanged and defaulting to `stop`. The adapter accepts only `stop` and `end_turn`; the pinned streaming helper reports null when a stream ends without one, which the adapter refuses as an incomplete completion.
 
 Fixtures exercise the adapter, its transport handling and the CLI. The result says so in `inference.note` and sets `inference.quality_evidence` to false. The fixture path populates every credential slot with a label so the adapter admits its configured chain; no request is made with them.
 

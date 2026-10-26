@@ -94,6 +94,198 @@ class ReplayRunTests(ReplayTestCase):
              "reported_tokens": {"completion_tokens": 100, "prompt_tokens": 200, "total_tokens": 300}},
             {k: doc["run"][k] for k in ("models", "successful_calls", "billing_rejections", "reported_tokens")})
 
+    def test_response_capture_is_opt_in_and_replays_a_failed_challenge(self):
+        responses = [text("source_requests: []\n" + FINDING), text(FINDING),
+                     text('{"decisions": []}')]
+        ordinary = self.run_replay(responses)
+        self.assertNotIn("diagnostics", ordinary)
+        self.assertNotIn("transport_fixture", ordinary)
+        self.assertTrue(all("response" not in call for call in ordinary["calls"]))
+        captured = self.run_replay(responses, record_responses=True)
+        self.assertEqual("aborted", captured["adapter_outcome"])
+        self.assertFalse(captured["comparable"])
+        self.assertIn("finding challenge decisions", captured["failure"])
+        self.assertEqual(3, len(captured["calls"]))
+        self.assertEqual('{"decisions": []}', captured["calls"][-1]["response"]["text"])
+        self.assertEqual("stop", captured["calls"][-1]["response"]["finish_reason"])
+        chain = captured["diagnostics"]["failure_chain"]
+        self.assertEqual("QualityAbort", chain[-1]["type"])
+        self.assertTrue(any(frame["file"] == "scripts/review_quality.py" and frame["function"] == "adjudicate"
+                            for frame in chain[-1]["frames"]))
+        path = self.directory / "captured-fixture.json"
+        path.write_text(json.dumps(captured["transport_fixture"]))
+        replayed = self.run_replay(replay.load_fixture(path), record_responses=True)
+        self.assertEqual(captured["failure"], replayed["failure"])
+        self.assertEqual(captured["diagnostics"], replayed["diagnostics"])
+        self.assertEqual(captured["findings"], replayed["findings"])
+        self.assertEqual("stop", replayed["calls"][-1]["response"]["finish_reason"])
+        self.assertEqual([c["user_sha256"] for c in captured["calls"]],
+                         [c["user_sha256"] for c in replayed["calls"]])
+        self.assertFalse(replayed["inference"]["quality_evidence"])
+
+    def test_captured_truncation_remains_an_incomplete_completion(self):
+        doc = self.run_replay([text("source_requests: []\n" + CLEAN, finish_reason="length")],
+                              record_responses=True)
+        self.assertEqual("Provider returned an incomplete completion", doc["failure"])
+        self.assertFalse(doc["comparable"])
+        path = self.directory / "truncated.json"
+        path.write_text(json.dumps(doc["transport_fixture"]))
+        reproduced = self.run_replay(replay.load_fixture(path), record_responses=True)
+        self.assertEqual(doc["failure"], reproduced["failure"])
+        self.assertEqual("length", reproduced["calls"][0]["response"]["finish_reason"])
+
+    def test_failure_trace_does_not_capture_messages_or_locals(self):
+        planted = "private-" + "diagnostic-marker"
+        try:
+            try:
+                raise ValueError(planted)
+            except ValueError as cause:
+                raise replay.review.ReviewAbort("outer " + planted) from cause
+        except replay.review.ReviewAbort as error:
+            trace = replay.failure_trace(error, Path(replay.__file__).resolve().parents[1])
+        self.assertEqual(["ReviewAbort", "ValueError"], [item["type"] for item in trace])
+        self.assertNotIn(planted, json.dumps(trace))
+        self.assertTrue(all(set(item) == {"type", "frames"} for item in trace))
+
+    def trace_of(self, error):
+        return replay.failure_trace(error, Path(replay.__file__).resolve().parents[1])
+
+    def test_failure_trace_follows_cause_then_context_and_honors_suppression(self):
+        def chained():
+            try:
+                try:
+                    raise KeyError("inner")
+                except KeyError:
+                    raise ValueError("middle")
+            except ValueError as middle:
+                raise RuntimeError("outer") from middle
+
+        with self.assertRaises(RuntimeError) as caught:
+            chained()
+        self.assertEqual(["RuntimeError", "ValueError", "KeyError"],
+                         [item["type"] for item in self.trace_of(caught.exception)])
+
+        def suppressed():
+            try:
+                raise KeyError("hidden")
+            except KeyError:
+                raise ValueError("shown") from None
+
+        with self.assertRaises(ValueError) as caught:
+            suppressed()
+        self.assertEqual(["ValueError"], [item["type"] for item in self.trace_of(caught.exception)])
+
+    def test_failure_trace_stops_on_a_cycle_and_keeps_only_local_script_frames(self):
+        import signal
+
+        def expired(*_):
+            raise TimeoutError("failure_trace did not terminate")
+
+        first, second = ValueError("a"), KeyError("b")
+        first.__context__, second.__context__ = second, first
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.alarm(3)  # a real trace takes microseconds; keep a broken loop from filling memory
+        try:
+            self.assertEqual(["ValueError", "KeyError"], [item["type"] for item in self.trace_of(first)])
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        try:  # assertRaises discards the traceback, which is what is under test here
+            replay.followups.strict_json("{")
+        except ValueError as error:
+            caught = error
+        frames = [f for item in self.trace_of(caught) for f in item["frames"]]
+        self.assertIn("strict_json", {f["function"] for f in frames})
+        self.assertNotIn("raw_decode", {f["function"] for f in frames})
+        self.assertTrue(all(f["file"].startswith("scripts/") and "/" not in f["file"][len("scripts/"):]
+                            and isinstance(f["line"], int) for f in frames))
+        self.assertNotIn(str(Path(replay.__file__).resolve().parents[1]), json.dumps(frames))
+
+    def test_unexpected_error_and_zero_calls_keep_the_original_failure_and_refuse_a_fixture(self):
+        async def broken(settings):
+            raise RuntimeError("private-" + "unexpected-marker")
+
+        with patch.object(replay.review, "review", broken):
+            doc = self.run_replay([], record_responses=True)
+        self.assertEqual("RuntimeError", doc["failure"])
+        self.assertEqual([], doc["calls"])
+        self.assertIsNone(doc["transport_fixture"])
+        self.assertEqual("RuntimeError", doc["diagnostics"]["failure_chain"][0]["type"])
+        self.assertNotIn("unexpected-marker", json.dumps(doc))
+
+    def test_a_partly_failed_run_never_yields_a_fixture(self):
+        doc = self.run_replay([text("source_requests: []\n" + CLEAN), {"error": {"timeout": True}}],
+                              record_responses=True)
+        self.assertEqual(["returned", "error:APITimeoutError"], [c["outcome"] for c in doc["calls"]])
+        self.assertIn("response", doc["calls"][0])
+        self.assertNotIn("response", doc["calls"][1])
+        self.assertIsNone(doc["transport_fixture"])
+
+    def test_a_null_finish_reason_is_captured_replayed_and_refused_as_incomplete(self):
+        # The pinned streaming helper returns None when a stream ends without a finish reason.
+        doc = self.run_replay([text("source_requests: []\n" + CLEAN, finish_reason=None)], record_responses=True)
+        self.assertEqual("Provider returned an incomplete completion", doc["failure"])
+        self.assertIn("finish_reason", doc["calls"][0]["response"])
+        self.assertIsNone(doc["calls"][0]["response"]["finish_reason"])
+        path = self.directory / "null-finish.json"
+        path.write_text(json.dumps(doc["transport_fixture"]))
+        again = self.run_replay(replay.load_fixture(path), record_responses=True)
+        self.assertEqual(doc["failure"], again["failure"])
+        self.assertEqual(doc["diagnostics"], again["diagnostics"])
+
+    def test_malformed_provider_results_fail_as_they_do_without_capture(self):
+        from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+        credentials = {"ANTHROPIC_API_KEY": "sk-ant-fixture-secret-one", "ANTHROPIC_API_KEY_2": "",
+                       "OPENAI_API_KEY": "sk-fixture-secret-openai"}
+        first = "source_requests: []\n" + CLEAN
+        for name, result in (("none", None), ("short", (first,)), ("odd finish", (first, 5, None)),
+                             ("object finish", (first, object(), None))):
+            async def fake(handler, **kwargs):
+                return result
+
+            with self.subTest(name), patch.dict(os.environ, credentials), \
+                    patch.object(LiteLLMAIHandler, "_get_completion", fake):
+                plain = replay.run(self.snapshot(), mode="real", reviewer_sha=REVIEWER)
+                captured = replay.run(self.snapshot(), mode="real", reviewer_sha=REVIEWER, record_responses=True)
+            self.assertEqual(plain["failure"], captured["failure"])
+            self.assertEqual("aborted", captured["adapter_outcome"])
+            self.assertIsNone(captured["transport_fixture"])
+            self.assertTrue(all("finish_reason" not in c.get("response", {}) for c in captured["calls"]))
+
+    def test_real_handler_capture_reproduces_offline_without_credentials_or_requests(self):
+        import httpx
+        credentials = {"ANTHROPIC_API_KEY": "sk-ant-fixture-secret-one", "ANTHROPIC_API_KEY_2": "",
+                       "OPENAI_API_KEY": "sk-fixture-secret-openai"}
+        first = "source_requests: []\n" + CLEAN
+        for name, replies, outcome in (("complete", [(first, "end_turn"), (CLEAN, "end_turn")], "completed"),
+                                       ("truncated", [(first, "max_tokens")], "aborted")):
+            queue = iter(replies)
+
+            async def wire(client, request, *args, **kwargs):
+                answer, reason = next(queue)
+                body = {"id": "msg_replay", "type": "message", "role": "assistant", "model": "claude-sonnet-5-5",
+                        "content": [{"type": "text", "text": answer}], "stop_reason": reason,
+                        "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 5}}
+                return httpx.Response(200, request=request, json=body)
+
+            with self.subTest(name), patch.dict(os.environ, credentials), patch.object(httpx.AsyncClient, "send", wire):
+                doc = replay.run(self.snapshot(), mode="real", reviewer_sha=REVIEWER, record_responses=True)
+            self.assertEqual(outcome, doc["adapter_outcome"])
+            responses = doc["transport_fixture"]["responses"]
+            self.assertEqual([answer for answer, _ in replies], [r["text"] for r in responses])
+            self.assertTrue(all(isinstance(r["finish_reason"], str) for r in responses))
+            dumped = json.dumps(doc)
+            for secret in credentials.values():
+                self.assertTrue(not secret or secret not in dumped)
+            path = self.directory / f"real-{name}.json"
+            path.write_text(json.dumps(doc["transport_fixture"]))
+            again = self.run_replay(replay.load_fixture(path), record_responses=True)
+            self.assertEqual(doc["failure"], again["failure"])
+            self.assertEqual(doc["diagnostics"], again["diagnostics"])
+            self.assertEqual(doc["findings"], again["findings"])
+            self.assertEqual([c["user_sha256"] for c in doc["calls"]], [c["user_sha256"] for c in again["calls"]])
+            self.assertEqual(doc["calls"][-1]["response"], again["calls"][-1]["response"])
+
     def test_fixture_results_are_never_quality_evidence(self):
         doc = self.run_replay([text("source_requests: []\n" + CLEAN), text(CLEAN)])
         self.assertEqual("fixture", doc["inference"]["mode"])
@@ -675,6 +867,18 @@ class CliTests(ReplayTestCase):
         self.assertEqual((2, ""), (code, out))
         self.assertIn("expected SHA-256", err)
 
+    def test_response_capture_cli_preserves_failure_and_refuses_partial_fixture(self):
+        code, out, _ = self.cli(*self.files([text("source_requests: []\n" + FINDING),
+                                           text(FINDING), text('{"decisions": []}')]),
+                                "--record-responses")
+        doc = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertEqual(3, len(doc["transport_fixture"]["responses"]))
+        self.assertEqual("QualityAbort", doc["diagnostics"]["failure_chain"][-1]["type"])
+        code, out, _ = self.cli(*self.files([{"error": {"timeout": True}}]), "--record-responses")
+        self.assertEqual(1, code)
+        self.assertIsNone(json.loads(out)["transport_fixture"])
+
     def test_aborted_replay_still_reports_and_exits_nonzero(self):
         code, out, _ = self.cli(*self.files([{"error": {"timeout": True}}]))
         self.assertEqual(1, code)
@@ -756,6 +960,32 @@ class CliTests(ReplayTestCase):
         self.assertIn("real inference is not attempted", err)
         code, _, _ = self.cli(*base[:4], "--inference", "real", "--fixture", base[-1])
         self.assertEqual(2, code)
+
+    def test_fixture_finish_reason_is_a_string_or_null_on_text_items_only(self):
+        base = self.files([text(CLEAN)])
+        fixture = Path(base[base.index("--fixture") + 1])
+
+        def load(item):
+            fixture.write_text(json.dumps({"schema": replay.FIXTURE_SCHEMA, "version": 1, "responses": [item]}))
+            return replay.load_fixture(fixture)
+
+        for accepted in ("stop", "length", "", None):
+            with self.subTest(accepted=accepted):
+                self.assertEqual(accepted, load({"text": "x", "finish_reason": accepted})[0]["finish_reason"])
+        for refused in (5, True, [], {}, 1.5):
+            with self.subTest(refused=refused), self.assertRaises(replay.ReplayError):
+                load({"text": "x", "finish_reason": refused})
+        with self.assertRaises(replay.ReplayError):
+            load({"error": {"timeout": True}, "finish_reason": "stop"})
+
+    def test_capture_flag_is_off_by_default_on_the_command_line(self):
+        code, out, _ = self.cli(*self.files([text("source_requests: []\n" + FINDING), text(FINDING),
+                                           text('{"decisions": []}')]))
+        doc = json.loads(out)
+        self.assertEqual(1, code)
+        self.assertFalse({"diagnostics", "transport_fixture"} & set(doc))
+        self.assertTrue(all("response" not in call for call in doc["calls"]))
+        self.assertNotIn('"decisions"', out)
 
 
 if __name__ == "__main__":

@@ -442,8 +442,10 @@ def load_fixture(path):
             or not isinstance(data["responses"], list)):
         raise ReplayError("Transport fixture has an unknown shape")
     for item in data["responses"]:
-        text = isinstance(item, dict) and set(item) <= {"text", "usage"} and "text" in item
+        text = isinstance(item, dict) and set(item) <= {"text", "usage", "finish_reason"} and "text" in item
         error = isinstance(item, dict) and set(item) == {"error"}
+        if text and "finish_reason" in item and not isinstance(item["finish_reason"], (str, type(None))):
+            raise ReplayError("Transport fixture finish reason is invalid")
         if not (text and isinstance(item["text"], str)) and not (
                 error and isinstance(item["error"], dict)):
             raise ReplayError("Transport fixture response is invalid")
@@ -498,8 +500,28 @@ def settings_record(settings, models):
             "max_findings": settings.pr_reviewer.num_max_findings}
 
 
+def failure_trace(error, root):
+    """Local code locations only: exception messages and locals can contain secrets."""
+    chain, seen = [], set()
+    scripts = (root / "scripts").resolve()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        frames = []
+        trace = error.__traceback__
+        while trace is not None:
+            filename = Path(trace.tb_frame.f_code.co_filename).resolve()
+            if filename.parent == scripts:
+                frames.append({"file": "scripts/" + filename.name, "line": trace.tb_lineno,
+                               "function": trace.tb_frame.f_code.co_name})
+            trace = trace.tb_next
+        chain.append({"type": type(error).__name__, "frames": frames})
+        error = error.__cause__ if error.__cause__ is not None else (
+            None if error.__suppress_context__ else error.__context__)
+    return chain
+
+
 def run(snapshot, *, mode, fixture=None, profile=None, reviewer_sha, profile_sha=None, depth="default",
-        record_prompts=None, root=None):
+        record_prompts=None, record_responses=False, root=None):
     """Replay one snapshot. Returns the result document; raises ReplayError before any run."""
     root = Path(root) if root else Path(review.__file__).resolve().parents[1]
     profile = Path(profile) if profile else review.PROFILE
@@ -559,11 +581,15 @@ def run(snapshot, *, mode, fixture=None, profile=None, reviewer_sha, profile_sha
                     response = litellm.ModelResponse(
                         model=kwargs["model"], choices=[{"message": {"content": item["text"]}}],
                         usage=item.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}))
-                    result = item["text"], "stop", response
+                    result = item["text"], item.get("finish_reason", "stop"), response
             except BaseException as error:
                 entry["outcome"] = f"error:{type(error).__name__}"
                 raise
             entry["outcome"] = "returned"
+            if record_responses and isinstance(result[0], str):
+                entry["response"] = {"text": result[0]}
+                if isinstance(result[1], (str, type(None))):
+                    entry["response"]["finish_reason"] = result[1]
             return result
 
         provider = provider_class()(snapshot, store)
@@ -572,17 +598,31 @@ def run(snapshot, *, mode, fixture=None, profile=None, reviewer_sha, profile_sha
         stack.enter_context(patch.object(LiteLLMAIHandler, "_get_completion", completion))
         stack.enter_context(egress.active())
         failure = None
+        diagnostic = []
         try:
             review.reliability.begin()
             with contextlib.redirect_stdout(out), review.reliability.runtime():
                 asyncio.run(review.review(settings))
         except (review.ReviewAbort, followups.FollowupAbort) as error:
             failure = str(error)
+            if record_responses:
+                diagnostic = failure_trace(error, root)
         except Exception as error:
             failure = f"{type(error).__name__}"
-    return result_document(snapshot, mode, settings, models, chain, profile, root, reviewer_sha, profile_sha,
+            if record_responses:
+                diagnostic = failure_trace(error, root)
+    document = result_document(snapshot, mode, settings, models, chain, profile, root, reviewer_sha, profile_sha,
                            depth, calls, store, out.getvalue(), failure, egress, responses,
                            record_prompts is not None)
+    if record_responses:
+        document["diagnostics"] = {"failure_chain": diagnostic}
+        # Do not invent provider errors or retry behavior for a partially captured run.
+        document["transport_fixture"] = (
+            {"schema": FIXTURE_SCHEMA, "version": 1,
+             "responses": [dict(call["response"]) for call in calls]}
+            if calls and all(call["outcome"] == "returned" and "response" in call and "finish_reason" in call["response"] for call in calls)
+            else None)
+    return document
 
 
 def result_document(snapshot, mode, settings, models, chain, profile, root, reviewer_sha, profile_sha,
@@ -657,6 +697,8 @@ def main(argv=None):
     parser.add_argument("--output")
     parser.add_argument("--record-prompts", action="store_true",
                         help="include the exact model messages in the result (contains snapshot text)")
+    parser.add_argument("--record-responses", action="store_true",
+                        help="include model output, local failure locations and an offline fixture (may contain source text)")
     args = parser.parse_args(argv)
     try:
         snapshot = snapshots.load(args.snapshot, args.snapshot_sha256)
@@ -668,7 +710,7 @@ def main(argv=None):
         with contextlib.redirect_stdout(sys.stderr):
             document = run(snapshot, mode=args.inference, fixture=fixture, profile=args.profile,
                            reviewer_sha=args.reviewer_sha, profile_sha=args.profile_sha, depth=args.depth,
-                           record_prompts=True if args.record_prompts else None)
+                           record_prompts=True if args.record_prompts else None, record_responses=args.record_responses)
     except (snapshots.SnapshotError, ReplayError) as error:
         print(f"Replay not run: {error}", file=sys.stderr)
         return 2
