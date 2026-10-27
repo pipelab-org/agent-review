@@ -45,6 +45,24 @@ class QualityTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(q.QualityAbort):
                 q.adjudicate(self.data, self.bundle, {"decisions": [d]})
 
+    def test_multiline_candidate_requires_the_entire_source_range(self):
+        self.finding.update(line=2, end_line=4)
+        self.data["review"]["key_issues_to_review"][0].update(start_line=2, end_line=4)
+        self.files[0].head_file = "first\nbegin\nchanged()\nend\nlast\n"
+        self.files[0].patch = "@@ -1,5 +1,5 @@\n first\n begin\n-old()\n+changed()\n end\n last"
+        bundle = q.context(self.pr, self.files, [self.finding])
+        lines = self.files[0].head_file.splitlines()
+        for start, end in ((3, 3), (1, 3), (3, 5), (2, 4), (1, 5)):
+            d = decision()
+            d["evidence"].update(start_line=start, end_line=end, quote="\n".join(lines[start - 1:end]))
+            with self.subTest(start=start, end=end):
+                if start <= 2 and 4 <= end:
+                    result, _, _ = q.adjudicate(self.data, bundle, {"decisions": [d]})
+                    self.assertEqual(1, len(result["review"]["key_issues_to_review"]))
+                else:
+                    with self.assertRaisesRegex(q.QualityAbort, "does not cover the inline source location"):
+                        q.adjudicate(self.data, bundle, {"decisions": [d]})
+
     def test_same_run_duplicate_requires_a_surviving_earlier_finding(self):
         self.bundle["candidates"].append(dict(self.finding, title="Reworded"))
         self.data["review"]["key_issues_to_review"].append(dict(self.data["review"]["key_issues_to_review"][0], issue_header="Reworded"))
