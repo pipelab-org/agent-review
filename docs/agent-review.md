@@ -153,3 +153,9 @@ Completion evidence and the bound summary must fit the existing data budget befo
 ## Historical replay
 
 An operator can measure a reviewer revision against saved pull request snapshots without publishing anything. See [Historical review replay](review-replay.md).
+
+### Large-context replay diagnostic
+
+The replay CLI accepts an explicit `--large-context-diagnostic` with `--depth deep`. This uses a 1,000,000-token context cap for the documented Opus 5.5 and GPT-6 Luna routes. Their published capacities are [1M tokens](https://platform.claude.com/docs/en/about-claude/models/overview) and [1,050,000 tokens](https://developers.openai.com/api/docs/models/gpt-6-luna). The preset refuses other configured routes. It changes both the operator context cap and PR-Agent's custom-model context fallback; the existing output reserve, timeouts, three-call ceiling, retries, source handling and publication validators stay in force. Complete requests must still fit on every remaining billing-fallback route.
+
+This option exists only in the nonpublishing replay CLI. Normal reviews and replays without the flag retain the configured 90,000-token cap. A repository profile, snapshot or pull request cannot enable it. Results label `reviewer.context_policy` as `large-context-diagnostic` or `configured` and record both effective context settings. Diagnostic results test a different budget policy; compare only runs declaring the same policy, engine, profile and inputs. More context capacity permits more input spending and does not establish detection quality. Fixture responses remain mechanic evidence.

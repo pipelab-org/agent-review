@@ -4,8 +4,9 @@
 """Nonpublishing historical replay of the real review adapter.
 
 Runs scripts/pr_agent_review.py unmodified: its prompts, model selection, budgets,
-billing-only fallback, discovery, challenge and validators. Only the pull request
-provider differs. PR-Agent's own provider factory (the same seam the runtime tests
+billing-only fallback, discovery, challenge and validators. An explicit large-context
+replay diagnostic changes only the input context cap, and labels that policy in the
+result. The pull request provider differs. PR-Agent's own provider factory (the same seam the runtime tests
 use) returns a subclass of the pinned GithubProvider built without its constructor,
 so no GitHub client exists; every GitHub read comes from an immutable snapshot and
 every write is captured in memory. Results identify themselves as replays and are
@@ -52,6 +53,12 @@ RESULT_VERSION = 1
 REPLAY_RUN_ID = str(2**63 - 1)
 GATEWAY_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
 CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_2", "OPENAI_API_KEY")
+# Published common context capacity for the diagnostic's two deep-review routes:
+# https://platform.claude.com/docs/en/about-claude/models/overview (Opus 5.5: 1M)
+# https://developers.openai.com/api/docs/models/gpt-6-luna (1,050,000)
+# This replay-only preset is separate from the configured operator budget.
+LARGE_CONTEXT_TOKENS = 1_000_000
+LARGE_CONTEXT_MODELS = ["anthropic/claude-opus-5-5", "gpt-6-luna"]
 EXECUTED = ("scripts/pr_agent_review.py", "scripts/review_discovery.py", "scripts/review_quality.py",
             "scripts/review_followups.py", "scripts/agent_review_contract.py", ".github/pr-agent.toml",
             "scripts/review_reliability.py", "scripts/review_replay.py", "scripts/review_replay_snapshot.py")
@@ -494,6 +501,7 @@ def chain_for(settings, litellm):
 def settings_record(settings, models):
     return {"models": models, "reasoning_effort": settings.config.get("reasoning_effort"),
             "max_model_tokens": settings.config.max_model_tokens,
+            "custom_model_max_tokens": settings.config.custom_model_max_tokens,
             "max_output_tokens": settings.config.max_output_tokens,
             "ai_timeout": settings.config.ai_timeout,
             "max_calls": settings.pr_reviewer.max_number_of_calls,
@@ -521,7 +529,7 @@ def failure_trace(error, root):
 
 
 def run(snapshot, *, mode, fixture=None, profile=None, reviewer_sha, profile_sha=None, depth="default",
-        record_prompts=None, record_responses=False, root=None):
+        record_prompts=None, record_responses=False, large_context_diagnostic=False, root=None):
     """Replay one snapshot. Returns the result document; raises ReplayError before any run."""
     root = Path(root) if root else Path(review.__file__).resolve().parents[1]
     profile = Path(profile) if profile else review.PROFILE
@@ -530,6 +538,8 @@ def run(snapshot, *, mode, fixture=None, profile=None, reviewer_sha, profile_sha
         raise ReplayError("Choose fixture mode with a transport fixture, or real mode without one")
     if depth not in ("default", "deep") or not all(followups.full_sha(s) for s in (reviewer_sha, profile_sha)):
         raise ReplayError("Depth or reviewer identity is invalid")
+    if type(large_context_diagnostic) is not bool or (large_context_diagnostic and depth != "deep"):
+        raise ReplayError("Large-context diagnostic requires deep review and an explicit boolean option")
     responses = list(fixture) if mode == "fixture" else None
     env = {"REVIEW_SOURCE_SHA": reviewer_sha, "REVIEW_PROFILE_SHA": profile_sha,
            "REVIEW_PROFILE_PATH": str(profile), "REVIEW_DEPTH": depth, "REVIEW_HEAD": snapshot.head,
@@ -551,6 +561,13 @@ def run(snapshot, *, mode, fixture=None, profile=None, reviewer_sha, profile_sha
         except (ValueError, OSError, review.ReviewAbort):
             raise ReplayError("Profile or review configuration is invalid") from None
         models, chain, hosts = chain_for(settings, litellm)
+        if large_context_diagnostic:
+            if models != LARGE_CONTEXT_MODELS:
+                raise ReplayError("Large-context diagnostic requires the documented deep-review routes")
+            # PR-Agent uses custom_model_max_tokens for models newer than its metadata;
+            # max_model_tokens is the additional operator cap. Both must fit the request.
+            settings.set("config.max_model_tokens", LARGE_CONTEXT_TOKENS)
+            settings.set("config.custom_model_max_tokens", LARGE_CONTEXT_TOKENS)
         if mode == "real" and not chain:
             raise ReplayError("No configured model credential is available; real inference is not attempted")
         egress = Egress(hosts if mode == "real" else ())
@@ -614,6 +631,7 @@ def run(snapshot, *, mode, fixture=None, profile=None, reviewer_sha, profile_sha
     document = result_document(snapshot, mode, settings, models, chain, profile, root, reviewer_sha, profile_sha,
                            depth, calls, store, out.getvalue(), failure, egress, responses,
                            record_prompts is not None)
+    document["reviewer"]["context_policy"] = ("large-context-diagnostic" if large_context_diagnostic else "configured")
     if record_responses:
         document["diagnostics"] = {"failure_chain": diagnostic}
         # Do not invent provider errors or retry behavior for a partially captured run.
@@ -692,6 +710,8 @@ def main(argv=None):
     parser.add_argument("--profile")
     parser.add_argument("--profile-sha")
     parser.add_argument("--depth", default="default", choices=("default", "deep"))
+    parser.add_argument("--large-context-diagnostic", action="store_true",
+                        help="deep replay only: use the documented 1M-token context cap; keep output and call limits")
     parser.add_argument("--inference", required=True, choices=("fixture", "real"))
     parser.add_argument("--fixture")
     parser.add_argument("--output")
@@ -710,7 +730,8 @@ def main(argv=None):
         with contextlib.redirect_stdout(sys.stderr):
             document = run(snapshot, mode=args.inference, fixture=fixture, profile=args.profile,
                            reviewer_sha=args.reviewer_sha, profile_sha=args.profile_sha, depth=args.depth,
-                           record_prompts=True if args.record_prompts else None, record_responses=args.record_responses)
+                           record_prompts=True if args.record_prompts else None, record_responses=args.record_responses,
+                           large_context_diagnostic=args.large_context_diagnostic)
     except (snapshots.SnapshotError, ReplayError) as error:
         print(f"Replay not run: {error}", file=sys.stderr)
         return 2
