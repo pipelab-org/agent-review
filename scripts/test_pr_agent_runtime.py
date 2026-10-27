@@ -560,10 +560,10 @@ review:
         self.assertEqual(3, completion.await_count)
         source = self.bundles(completion)["challenge"][1]["sources"]["src/file.py"]
         self.assertEqual("@@ -1 +1 @@\n-old\n+new\n", source["patch"])
-        # The discovery call carries every patch; the challenge of a changed-file candidate
-        # needs only that file's own patch, and the rest could exhaust its request budget.
+        # Cross-file patches remain evidence when discovery adds a changed-file candidate.
         self.assertIn("diff", self.bundles(completion)["discovery"][1])
-        self.assertNotIn("diff", self.bundles(completion)["challenge"][1])
+        self.assertEqual(self.bundles(completion)["discovery"][1]["diff"],
+                         self.bundles(completion)["challenge"][1]["diff"])
 
     def test_source_supplied_for_a_preliminary_candidate_is_not_also_reported_unavailable(self):
         # The first pass can name an unchanged file before the model's own source request
@@ -777,6 +777,59 @@ review:
         self.provider.publish_code_suggestions.assert_not_called()
         self.assertEqual([], self.completion_evidence()["findings"])
         self.assertEqual("unsupported", self.completion_evidence()["quality"]["decisions"][0]["verdict"])
+
+    def test_challenge_keeps_discovery_diff_and_requested_source_for_changed_candidate(self):
+        from pr_agent.algo.types import FilePatchInfo
+        self.provider.get_diff_files.return_value.append(FilePatchInfo(
+            base_file="old_guard()\n", head_file="new_guard()\n",
+            patch="@@ -1 +1 @@\n-old_guard()\n+new_guard()\n", filename="src/guard.py"))
+        self.output = self.output.replace("source_requests: []", "source_requests: [src/consumer.py]")
+        self.provider.github_client.get_repo.return_value.get_contents.return_value = NS(
+            type="file", encoding="base64", raw_data={}, decoded_content=b"existing_consumer()\n")
+        completion = self.answering(discovery=self.CLEAN)
+        self.run_adapter(completion)
+        bundles = self.bundles(completion)
+        discovery, challenge = (bundles[name][1] for name in ("discovery", "challenge"))
+        self.assertEqual(discovery["diff"], challenge["diff"])
+        self.assertIn("src/guard.py", challenge["diff"])
+        self.assertEqual(discovery["sources"], challenge["sources"])
+        self.assertEqual(3, completion.await_count)
+
+    def test_complete_json_fence_is_accepted_only_for_the_model_challenge(self):
+        d = decision()
+        d["evidence"].update(start_line=1, end_line=1, quote="new")
+        response, finish, usage = self.challenged(d)
+        completion = AsyncMock(side_effect=[self.response(), self.response(),
+            ("```json\n" + response + "\n```", finish, usage)])
+        self.run_adapter(completion)
+        self.assertEqual(3, completion.await_count)
+        self.assertEqual(1, len(self.completion_evidence()["findings"]))
+        with self.assertRaises(ValueError):
+            review.followups.strict_json("```json\n" + response + "\n```")
+
+    def test_challenge_new_candidate_source_over_budget_aborts_without_truncation(self):
+        self.provider.get_diff_files.return_value[0].head_file = "source " * self.settings.config.max_model_tokens
+        candidate = self.output.replace("source_requests: []\n", "")
+        completion = AsyncMock(side_effect=[("source_requests: []\n" + self.CLEAN, "stop", self.response()[2]),
+                                            (candidate, "stop", self.response()[2])])
+        with self.assertRaisesRegex(review.ReviewAbort, "^Repository evidence exceeds the existing token budget$"):
+            self.run_adapter(completion)
+        self.assertEqual(2, completion.await_count)
+        self.summary_publish.assert_not_called()
+        self.provider.publish_code_suggestions.assert_not_called()
+        self.status.edit.assert_not_called()
+
+    def test_unreadable_patch_of_a_non_candidate_file_aborts_before_discovery(self):
+        from pr_agent.algo.types import FilePatchInfo
+        self.provider.get_diff_files.return_value.append(FilePatchInfo(
+            base_file="a()\n", head_file="b()\n", patch=None, filename="src/other.py"))
+        completion = AsyncMock(side_effect=[self.response()])
+        with self.assertRaisesRegex(review.ReviewAbort, "^Review incomplete or invalid at source context$"):
+            self.run_adapter(completion)
+        self.assertEqual(1, completion.await_count)
+        self.summary_publish.assert_not_called()
+        self.provider.publish_code_suggestions.assert_not_called()
+        self.status.edit.assert_not_called()
 
     def test_challenge_retains_repeat_and_held_findings_without_new_inline_threads(self):
         for verdict in ("duplicate", "acknowledged-decision"):

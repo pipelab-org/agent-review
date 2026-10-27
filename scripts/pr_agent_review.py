@@ -619,9 +619,6 @@ async def review(settings):
                 # request loop supplied that source; never tell the model both.
                 unavailable = {p: reason for p, reason in unavailable.items() if p not in bundle["sources"]}
                 bundle["unavailable_requests"] = dict(unavailable)
-                if any(not isinstance(f.patch, str) for f in files):
-                    raise discovery.DiscoveryAbort("Discovery patch context is unavailable")
-                bundle["diff"] = {f.filename: f.patch for f in files}
                 instructions = self.vars["extra_instructions"]
                 context_hash = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
                 from pr_agent.tools.pr_reviewer import PRReview
@@ -656,7 +653,7 @@ async def review(settings):
                 answer = await self.evidence_completion(quality.SYSTEM, bundle)
                 stage = "finding challenge decisions"
                 self.prediction_data, self.retained_findings, audit = quality.adjudicate(
-                    data, bundle, followups.strict_json(answer))
+                    data, bundle, quality.parse_response(answer))
                 self.quality_audit.update(audit)
                 self.quality_audit["unavailable_sources"] = {p: reason for p, reason in bundle["unavailable_requests"].items() if p not in unavailable}
             except (quality.QualityAbort, discovery.DiscoveryAbort, ValueError, TypeError) as error:

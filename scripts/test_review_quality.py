@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import json
 import unittest
 from types import SimpleNamespace as NS
 
@@ -179,13 +180,11 @@ class QualityTests(unittest.TestCase):
         bundle = copy.deepcopy(self.bundle); bundle["candidates"] *= 2
         with self.assertRaises(q.QualityAbort): q.adjudicate(self.data, bundle, {"decisions": [decision(), decision()]})
 
-    def test_out_of_hunk_finding_uses_summary_and_keeps_the_challenge_within_its_budget(self):
+    def test_out_of_hunk_finding_uses_summary_and_keeps_cross_file_evidence(self):
         self.files.append(NS(filename="src/caller.py", head_file="changed()", patch="@@ -1 +1 @@\n-old()\n+changed()"))
         self.files[0].patch = "@@ -1 +1 @@\n-old\n+def f():"
         bundle = q.context(self.pr, self.files, [self.finding])
-        # The candidate's own patch is in sources; every other patch would only spend
-        # request budget (a 47-file pull request overran it with them).
-        self.assertNotIn("diff", bundle)
+        self.assertEqual({f.filename: f.patch for f in self.files}, bundle["diff"])
         self.assertEqual(self.files[0].patch, bundle["sources"]["src/file.py"]["patch"])
         result, _, audit = q.adjudicate(self.data, bundle, {"decisions": [decision()]})
         self.assertEqual([], result["review"]["key_issues_to_review"])
@@ -197,8 +196,41 @@ class QualityTests(unittest.TestCase):
         bundle = q.context(self.pr, self.files, [self.finding],
                            extra_sources={"src/consumer.py": {"content": "def f():\nreturn new\n", "patch": ""}})
         self.assertEqual({f.filename: f.patch for f in self.files}, bundle["diff"])
-        # A candidate whose source was never supplied cannot be published, so it adds no diff.
-        self.assertNotIn("diff", q.context(self.pr, self.files, [self.finding]))
+        self.assertEqual(bundle["diff"], q.context(self.pr, self.files, [self.finding])["diff"])
+
+    def test_model_response_envelope_preserves_json_and_decision_validation(self):
+        answer = {"decisions": [decision()]}
+        raw = json.dumps(answer)
+        for response in (raw, "```json\n" + raw + "\n```", " \n```json\r\n" + raw + "\r\n```\n"):
+            with self.subTest(response=response):
+                parsed = q.parse_response(response)
+                self.assertEqual(answer, parsed)
+                result, _, _ = q.adjudicate(self.data, self.bundle, parsed)
+                self.assertEqual(1, len(result["review"]["key_issues_to_review"]))
+        for invalid in ("prefix\n```json\n" + raw + "\n```", "```json\n" + raw + "\n```\nsuffix",
+                        "```json\n" + raw, "```json\n" + raw + "\n```\n```json\n{}\n```",
+                        '{"decisions": [], "decisions": []}', '{"decisions": []} {}'):
+            for response in (invalid, "```json\n" + invalid + "\n```"):
+                with self.subTest(response=response), self.assertRaises(ValueError):
+                    q.parse_response(response)
+        # Only the documented envelope is recovered: a lowercase json info string on
+        # three backticks, closed at the start of a line. Other fence shapes fail.
+        for shape in ("```\n%s\n```", "```JSON\n%s\n```", "```yaml\n%s\n```", "```json \n%s\n```",
+                      "````json\n%s\n````", "~~~json\n%s\n~~~", "```json\n%s\n  ```", "```json\n%s```",
+                      "```json %s```"):
+            with self.subTest(shape=shape), self.assertRaises(ValueError):
+                q.parse_response(shape % raw)
+        for invalid in ('{"decisions": []}', json.dumps({"decisions": [dict(decision(), extra="ignored")]})):
+            with self.subTest(invalid=invalid), self.assertRaises(q.QualityAbort):
+                q.adjudicate(self.data, self.bundle, q.parse_response("```json\n" + invalid + "\n```"))
+
+    def test_unreadable_patch_for_any_changed_file_fails_closed_even_when_it_is_no_candidate(self):
+        # The challenge now carries every patch, so a file that is not a candidate
+        # can no longer be skipped: its missing patch would be a silent evidence gap.
+        for patch in (None, b"@@", 7):
+            files = self.files + [NS(filename="src/other.py", head_file="x()", patch=patch)]
+            with self.subTest(patch=patch), self.assertRaisesRegex(q.QualityAbort, "diff evidence is unavailable"):
+                q.context(self.pr, files, [self.finding])
 
     def test_security_duplicate_retains_the_security_concern(self):
         self.bundle["candidates"].append(dict(self.finding, path="unknown", line=None, end_line=None, body="Security consequence"))
