@@ -365,6 +365,62 @@ class ReplayRunTests(ReplayTestCase):
         self.assertEqual({"effort": "high"}, deep["calls"][0]["output_config"])
         self.assertEqual("deep", deep["reviewer"]["depth"])
 
+    def test_large_context_diagnostic_is_explicit_and_keeps_other_limits(self):
+        replies = [text("source_requests: []\n" + FINDING), text(CLEAN), publish()]
+        baseline = self.run_replay(replies, depth="deep")
+        diagnostic = self.run_replay(replies, depth="deep", large_context_diagnostic=True)
+        self.assertEqual("completed", diagnostic["adapter_outcome"])
+        self.assertEqual("large-context-diagnostic", diagnostic["reviewer"]["context_policy"])
+        config = diagnostic["reviewer"]["configuration"]
+        self.assertEqual((1000000, 1000000), (config["max_model_tokens"], config["custom_model_max_tokens"]))
+        self.assertEqual(3, len(diagnostic["calls"]))
+        self.assertFalse(diagnostic["inference"]["quality_evidence"])
+        for key in ("models", "reasoning_effort", "max_output_tokens", "ai_timeout", "max_calls", "max_findings"):
+            self.assertEqual(baseline["reviewer"]["configuration"][key], config[key])
+        self.assertEqual(baseline["reviewer"]["credential_route"], diagnostic["reviewer"]["credential_route"])
+        self.assertEqual(baseline["findings"], diagnostic["findings"])
+        self.assertEqual([(c["system_sha256"], c["user_sha256"]) for c in baseline["calls"]],
+                         [(c["system_sha256"], c["user_sha256"]) for c in diagnostic["calls"]])
+        repeated = self.run_replay(replies, depth="deep")
+        self.assertEqual("configured", repeated["reviewer"]["context_policy"])
+        self.assertEqual(90000, repeated["reviewer"]["configuration"]["custom_model_max_tokens"])
+        self.assertEqual(90000, repeated["reviewer"]["configuration"]["max_model_tokens"])
+
+    def test_large_context_replays_complete_source_that_exceeds_the_normal_budget(self):
+        source = "existing_guard()\n" * 30000
+        snapshot = self.snapshot(sources={"src/consumer.py": source})
+        replies = [text("source_requests: [src/consumer.py]\n" + CLEAN), text(CLEAN)]
+        baseline = self.run_replay(replies, snapshot=snapshot, depth="deep")
+        self.assertEqual("Repository evidence exceeds the existing token budget", baseline["failure"])
+        self.assertEqual(1, len(baseline["calls"]))
+        diagnostic = self.run_replay(replies, snapshot=snapshot, depth="deep",
+                                     large_context_diagnostic=True, record_prompts=True)
+        self.assertEqual("completed", diagnostic["adapter_outcome"])
+        self.assertTrue(diagnostic["comparable"])
+        self.assertFalse(diagnostic["inference"]["quality_evidence"])
+        bundle = json.loads(diagnostic["calls"][1]["messages"][-1]["content"])
+        self.assertEqual(source, bundle["sources"]["src/consumer.py"]["content"])
+        self.assertEqual({"src/file.py": "@@ -1 +1 @@\n-old\n+new\n"}, bundle["diff"])
+
+    def test_large_context_diagnostic_refuses_wrong_depth_type_and_routes(self):
+        # The default-depth routes differ from the preset's, so the message pins which guard fired.
+        for options in ({"depth": "default", "large_context_diagnostic": True},
+                        {"depth": "deep", "large_context_diagnostic": "true"}):
+            with self.subTest(options=options), self.assertRaisesRegex(replay.ReplayError, "requires deep review"):
+                self.run_replay([], **options)
+        original = replay.review.configure
+        opus, luna = "anthropic/claude-opus-5-5", "gpt-6-luna"
+        # The preset names the exact primary and fallback order; a subset, a swap or an extra route is refused.
+        for model, fallbacks in ((opus, []), (luna, [opus]), (opus, [luna, luna])):
+            def different_route():
+                settings, litellm = original()
+                settings.set("config.model", model)
+                settings.set("config.fallback_models", fallbacks)
+                return settings, litellm
+            with self.subTest(routes=(model, fallbacks)), patch.object(replay.review, "configure", different_route), \
+                    self.assertRaisesRegex(replay.ReplayError, "documented deep-review routes"):
+                self.run_replay([], depth="deep", large_context_diagnostic=True)
+
     def test_result_binds_the_executed_files_and_snapshot_identity(self):
         snapshot = self.snapshot()
         doc = self.run_replay([text("source_requests: []\n" + CLEAN), text(CLEAN)], snapshot=snapshot)
