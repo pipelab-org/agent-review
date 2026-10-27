@@ -262,6 +262,16 @@ review:
         body = self.status.edit.call_args.args[0]
         return json.loads(base64.b64decode(body.split("<!-- agent-review-result:v1 ")[1].split(" -->")[0]))
 
+    def test_challenge_prompt_declares_the_candidate_evidence_range_contract(self):
+        completion = AsyncMock(return_value=self.response())
+        self.run_adapter(completion)
+        system = completion.await_args_list[-1].kwargs["messages"][0]["content"]
+        self.assertIn("evidence.start_line <= candidate.line", system)
+        self.assertIn("candidate.end_line <= evidence.end_line", system)
+        self.assertIn("quote every complete source line in the chosen inclusive evidence range", system)
+        # An unlocated security concern has the path "unknown", which is never a valid evidence path.
+        self.assertIn('a candidate whose path is "unknown" cites a supplied source path', system)
+
     def test_discovery_prompt_example_and_schema_match_pinned_runtime(self):
         from pr_agent.tools.pr_reviewer import PRReviewer, PRReview
         example = review.discovery.SYSTEM.split("Minimal no-additional-findings response:\n", 1)[1].split("Each issue", 1)[0]

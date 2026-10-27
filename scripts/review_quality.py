@@ -50,6 +50,11 @@ Return strict JSON only, with this exact shape:
 "evidence":{"path":"current file","start_line":1,"end_line":1,"quote":"exact complete lines"},
 "prior_comment_id":null,"description_quote":""}]}
 For publish all title/trigger/consequence/repair/evidence fields are required.
+For publish candidates with numeric line/end_line, evidence must contain the
+entire candidate range: evidence.start_line <= candidate.line and
+candidate.end_line <= evidence.end_line. Use candidate.path for evidence.path,
+except that a candidate whose path is "unknown" cites a supplied source path;
+quote every complete source line in the chosen inclusive evidence range.
 For duplicate name an existing root comment id and explain the same scenario.
 For duplicate-candidate add duplicate_candidate with the index of an EARLIER
 candidate whose verdict is publish. Use it only for the SAME trigger and broken
