@@ -403,17 +403,23 @@ class ReplayRunTests(ReplayTestCase):
         self.assertEqual({"src/file.py": "@@ -1 +1 @@\n-old\n+new\n"}, bundle["diff"])
 
     def test_large_context_diagnostic_refuses_wrong_depth_type_and_routes(self):
+        # The default-depth routes differ from the preset's, so the message pins which guard fired.
         for options in ({"depth": "default", "large_context_diagnostic": True},
                         {"depth": "deep", "large_context_diagnostic": "true"}):
-            with self.subTest(options=options), self.assertRaises(replay.ReplayError):
+            with self.subTest(options=options), self.assertRaisesRegex(replay.ReplayError, "requires deep review"):
                 self.run_replay([], **options)
         original = replay.review.configure
-        def different_route():
-            settings, litellm = original()
-            settings.set("config.fallback_models", [])
-            return settings, litellm
-        with patch.object(replay.review, "configure", different_route), self.assertRaises(replay.ReplayError):
-            self.run_replay([], depth="deep", large_context_diagnostic=True)
+        opus, luna = "anthropic/claude-opus-5-5", "gpt-6-luna"
+        # The preset names the exact primary and fallback order; a subset, a swap or an extra route is refused.
+        for model, fallbacks in ((opus, []), (luna, [opus]), (opus, [luna, luna])):
+            def different_route():
+                settings, litellm = original()
+                settings.set("config.model", model)
+                settings.set("config.fallback_models", fallbacks)
+                return settings, litellm
+            with self.subTest(routes=(model, fallbacks)), patch.object(replay.review, "configure", different_route), \
+                    self.assertRaisesRegex(replay.ReplayError, "documented deep-review routes"):
+                self.run_replay([], depth="deep", large_context_diagnostic=True)
 
     def test_result_binds_the_executed_files_and_snapshot_identity(self):
         snapshot = self.snapshot()
