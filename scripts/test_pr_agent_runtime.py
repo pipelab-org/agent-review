@@ -269,6 +269,8 @@ review:
         self.assertIn("evidence.start_line <= candidate.line", system)
         self.assertIn("candidate.end_line <= evidence.end_line", system)
         self.assertIn("quote every complete source line in the chosen inclusive evidence range", system)
+        # An unlocated security concern has the path "unknown", which is never a valid evidence path.
+        self.assertIn('a candidate whose path is "unknown" cites a supplied source path', system)
 
     def test_discovery_prompt_example_and_schema_match_pinned_runtime(self):
         from pr_agent.tools.pr_reviewer import PRReviewer, PRReview

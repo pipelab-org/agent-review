@@ -52,7 +52,8 @@ Return strict JSON only, with this exact shape:
 For publish all title/trigger/consequence/repair/evidence fields are required.
 For publish candidates with numeric line/end_line, evidence must contain the
 entire candidate range: evidence.start_line <= candidate.line and
-candidate.end_line <= evidence.end_line. Use candidate.path for evidence.path;
+candidate.end_line <= evidence.end_line. Use candidate.path for evidence.path,
+except that a candidate whose path is "unknown" cites a supplied source path;
 quote every complete source line in the chosen inclusive evidence range.
 For duplicate name an existing root comment id and explain the same scenario.
 For duplicate-candidate add duplicate_candidate with the index of an EARLIER

@@ -292,5 +292,14 @@ class QualityTests(unittest.TestCase):
         result, _, _ = q.adjudicate(data, bundle, {"decisions": [decision()]})
         self.assertIn("Trigger:", result["review"]["security_concerns"])
 
+    def test_unlocated_concern_must_cite_a_supplied_source_path_not_unknown(self):
+        finding = dict(self.finding, path="unknown", line=None, end_line=None)
+        bundle = q.context(self.pr, self.files, [finding])
+        data = dict(review=dict(key_issues_to_review=[], security_concerns="Concern"))
+        d = decision()
+        d["evidence"]["path"] = "unknown"
+        with self.assertRaisesRegex(q.QualityAbort, "lacks current source evidence"):
+            q.adjudicate(data, bundle, {"decisions": [d]})
+
 
 if __name__ == "__main__": unittest.main()
