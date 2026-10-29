@@ -22,7 +22,6 @@ from unittest.mock import patch
 import yaml
 
 from scripts import agent_review_contract as contract
-from scripts import pr_agent_review as adapter
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = yaml.load((ROOT / '.github/workflows/agent-review-reusable.yaml').read_text(), Loader=yaml.BaseLoader)
@@ -89,7 +88,7 @@ class ProfileTests(unittest.TestCase):
         import fnmatch
         data, _ = contract.load_profile(ROOT / '.github/agent-review.toml')
         globs = data['ignore']['glob']
-        for path in ('scripts/pr_agent_review.py', 'scripts/agent_review_contract.py',
+        for path in ('scripts/review_engine.py', 'scripts/agent_review_contract.py',
                      '.github/workflows/agent-review-reusable.yaml', '.github/pr-agent.toml',
                      'examples/pipelock/agent-review.toml'):
             with self.subTest(path=path):
@@ -99,7 +98,7 @@ class ProfileTests(unittest.TestCase):
         import fnmatch
         data, _ = contract.load_profile(ROOT / 'examples/pipelock/agent-review.toml')
         globs = data['ignore']['glob']
-        for path, excluded in [('internal/scanner/scanner.go', False), ('scripts/pr_agent_review.py', False),
+        for path, excluded in [('internal/scanner/scanner.go', False), ('scripts/review_engine.py', False),
                                ('internal/scanner/testdata/fixture.json', True), ('api/example.pb.go', True),
                                ('web/package-lock.json', True)]:
             with self.subTest(path=path):
@@ -123,7 +122,7 @@ class CallerTests(unittest.TestCase):
                          remote.replace("github.run_attempt == '1' &&", ''),
                          remote.replace("github.event.comment.author_association == 'MEMBER' &&", ''),
                          remote.replace("github.event.comment.user.type == 'User' &&", ''),
-                         remote.replace('["/review","/review deep"]', '["/review","/review deep","/other"]'),
+                         remote.replace('["/review","/review deep","/review codex"]', '["/review","/review deep","/other"]'),
                          remote.replace('types: [created]', 'types: [created, edited]'),
                          remote.replace('pull-requests: write', 'pull-requests: read'),
                          remote.replace('    secrets:\n', '    secrets: inherit\n    ignored:\n'),
@@ -169,7 +168,7 @@ class CallerTests(unittest.TestCase):
         for bad_repo in (None, '', 'example', 'example/project/extra'):
             with self.subTest(repo=bad_repo), self.assertRaises(ValueError):
                 contract.validate_caller_ref(f'{bad_repo}/.github/workflows/agent-review.yaml@refs/heads/main', bad_repo)
-        step = WORKFLOW['jobs']['review']['steps'][2]
+        step = next(s for s in WORKFLOW['jobs']['review']['steps'] if s.get('name') == 'Validate the trusted caller and restricted profile before inference')
         self.assertEqual('${{ github.workflow_ref }}', step['env']['CALLER_WORKFLOW_REF'])
         # A matching caller file and profile still fail when another file is running.
         with tempfile.TemporaryDirectory() as directory:
@@ -191,48 +190,12 @@ class CallerTests(unittest.TestCase):
                             contract.main()
                         self.assertEqual(code, raised.exception.code)
 
-    def test_inline_events_bind_exact_merge_ref_and_immutable_default_policy(self):
-        repo = "example/project"
-        with patch.dict(os.environ, GITHUB_EVENT_NAME="pull_request_review_comment"):
-            contract.validate_caller_ref(f"{repo}/.github/workflows/agent-review.yaml@refs/pull/1/merge", repo)
-            for ref in (f"{repo}/.github/workflows/other.yaml@refs/pull/1/merge",
-                        f"{repo}/.github/workflows/agent-review.yaml@refs/heads/feature",
-                        f"{repo}/.github/workflows/agent-review.yaml@refs/pull/1/head"):
-                with self.assertRaises(ValueError): contract.validate_caller_ref(ref, repo)
-        reply = WORKFLOW["jobs"]["reply"]
-        source, checkout, policy, profile, validate, run, outcome = reply["steps"]
-        self.assertEqual("agent-review-outcome", outcome["with"]["name"])
-        self.assertEqual(("true", "true"), (outcome["continue-on-error"], outcome["with"]["overwrite"]))
-        self.assertEqual('reply-source', source['id'])
-        self.assertNotIn("secrets.", json.dumps(policy))
-        self.assertEqual("${{ steps.policy.outputs.sha }}", profile["with"]["ref"])
-        self.assertIn("--resolve-reply-policy", policy["run"])
-        self.assertEqual("${{ github.event.pull_request.head.sha }}", run["env"]["REVIEW_HEAD"])
-        self.assertIn("ORG_MEMBERS_TOKEN", run["env"])
-        self.assertEqual("default", run["env"]["REVIEW_DEPTH"])
-        self.assertEqual("max", reply["concurrency"]["queue"])
-        self.assertEqual("false", reply["concurrency"]["cancel-in-progress"])
 
     def test_every_job_repeats_the_exact_admission_gate(self):
         gate = WORKFLOW['jobs']['admit']['if']
         reply_gate = WORKFLOW['jobs']['reply']['if']
         self.assertEqual(f'({gate}) || ({reply_gate})', WORKFLOW['jobs']['source']['if'])
         self.assertTrue(WORKFLOW['jobs']['notify-failure']['if'].startswith('always() && ' + gate + ' && ('))
-
-    def test_source_binding_and_queue_precede_provider_work(self):
-        source = WORKFLOW['jobs']['source']
-        self.assertEqual('./.github/workflows/agent-review-source.yaml', source['uses'])
-        self.assertEqual({}, source['permissions'])
-        self.assertNotIn('secrets', source)
-        self.assertEqual('source', WORKFLOW['jobs']['admit']['needs'])
-        job = WORKFLOW['jobs']['review']
-        self.assertEqual('max', job['concurrency']['queue'])
-        self.assertEqual('false', job['concurrency']['cancel-in-progress'])
-        run = next(step for step in job['steps'] if step.get('name') == 'Review the admitted diff')
-        self.assertEqual('${{ needs.source.outputs.reviewer_sha }}', run['env']['REVIEW_SOURCE_SHA'])
-        self.assertEqual('${{ github.workflow_sha }}', run['env']['REVIEW_PROFILE_SHA'])
-        self.assertEqual('trusted-agent-profile/.github/agent-review.toml', run['env']['REVIEW_PROFILE_PATH'])
-
 
 
 class SourceBindingTests(unittest.TestCase):
@@ -259,7 +222,7 @@ class SourceBindingTests(unittest.TestCase):
         self.assertNotIn('uses', json.dumps(self.HELPER['jobs']['source']['steps']))
 
     def test_engine_checkout_names_the_repository_the_helper_requires(self):
-        checkout = WORKFLOW['jobs']['review']['steps'][0]
+        checkout = next(s for s in WORKFLOW['jobs']['review']['steps'] if s.get('name') == 'Check out immutable agent-review source')
         self.assertEqual('pipelab-org/agent-review', checkout['with']['repository'])
         self.assertIn('"${WORKFLOW_REPOSITORY}" != pipelab-org/agent-review',
                       self.HELPER['jobs']['source']['steps'][0]['run'])
@@ -338,12 +301,13 @@ class ReplySourceTests(unittest.TestCase):
         self.assertNotIn('uses', steps[0])
         self.assertEqual({'GITHUB_TOKEN', 'LOADED_REVIEW_SOURCE_SHA'}, set(steps[0]['env']))
         selected = '${{ steps.reply-source.outputs.reviewer_sha }}'
-        self.assertEqual(selected, steps[1]['with']['ref'])
-        self.assertEqual('pipelab-org/agent-review', steps[1]['with']['repository'])
+        self.assertEqual(selected, next(s for s in steps if s.get('name') == 'Check out immutable agent-review source')['with']['ref'])
+        self.assertEqual('pipelab-org/agent-review', next(s for s in steps if s.get('name') == 'Check out immutable agent-review source')['with']['repository'])
         consumers = [s['env']['REVIEW_SOURCE_SHA'] for s in steps if 'REVIEW_SOURCE_SHA' in s.get('env', {})]
-        self.assertEqual([selected] * 3, consumers)
+        self.assertTrue(consumers)
+        self.assertEqual({selected}, set(consumers))
         self.assertEqual('${{ needs.source.outputs.reviewer_sha }}',
-                         WORKFLOW['jobs']['review']['steps'][0]['with']['ref'])
+                         next(s for s in WORKFLOW['jobs']['review']['steps'] if s.get('name') == 'Check out immutable agent-review source')['with']['ref'])
 
 
 class LocalCallerTests(unittest.TestCase):
@@ -378,120 +342,6 @@ class LocalCallerTests(unittest.TestCase):
         self.assertEqual(0, self.run_main('pipelab-org/pipelock', remote))
         legacy = remote.replace('pipelab-org/agent-review/', 'pipelab-org/pipelock/')
         self.assertEqual(1, self.run_main('pipelab-org/pipelock', legacy))
-
-
-class ReuseTests(unittest.TestCase):
-    def bound(self, key, findings, head='a' * 40):
-        evidence = {"repository": "example/project", "number": 1, "base": "b" * 40, "head": head,
-                    "depth": "default", "key": key, "summary": 7, "findings": findings}
-        manifest = adapter.result_manifest(evidence)
-        line = adapter.result_comment(manifest)
-        summary_body = "Complete review\n" + line
-        digest = hashlib.sha256(summary_body.encode()).hexdigest()
-        status_body = (f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\n'
-                       f'Complete\n{line}')
-        summary = NS(id=7, body=summary_body, user=NS(login='github-actions[bot]', type='Bot'))
-        status = NS(id=8, user=NS(login='github-actions[bot]', type='Bot'), body=status_body, html_url='summary')
-        return summary, status
-
-    def test_only_bot_owned_terminal_success_is_reusable(self):
-        key = 'a' * 64
-        finding = {"path": "src/file.py", "line": 1, "end_line": 1, "title": "Bug", "body": "real"}
-        summary, good = self.bound(key, [finding])
-        identity = ("example/project", 1, "a" * 40, "b" * 40, "default")
-        self.assertIs(good, adapter.completed_review([good, summary], key, *identity))
-        bare = copy.deepcopy(good)
-        bare.body = bare.body.split("\n", 1)[0] + "\nComplete"
-        summary_bare = copy.deepcopy(summary)
-        summary_bare.body = "Complete review"
-        digest = hashlib.sha256(summary_bare.body.encode()).hexdigest()
-        bare.body = f'<!-- agent-review-status:v1 state=success key={key} summary=7 digest={digest} -->\nComplete'
-        self.assertIsNone(adapter.completed_review([bare, summary_bare], key, *identity))
-        swapped = copy.deepcopy(good)
-        other = adapter.result_comment(adapter.result_manifest(
-            {"repository": "example/project", "number": 1, "base": "b" * 40, "head": "a" * 40,
-             "depth": "default", "key": key, "summary": 7, "findings": []}))
-        swapped.body = swapped.body.replace(adapter.result_comment(adapter.result_manifest(
-            {"repository": "example/project", "number": 1, "base": "b" * 40, "head": "a" * 40,
-             "depth": "default", "key": key, "summary": 7, "findings": [finding]})), other)
-        self.assertIsNone(adapter.completed_review([swapped, summary], key, *identity))
-        for field, value in [('login', 'contributor'), ('type', 'User')]:
-            bad = copy.deepcopy(good)
-            setattr(bad.user, field, value)
-            self.assertIsNone(adapter.completed_review([bad, summary], key, *identity))
-        self.assertIsNone(adapter.completed_review([good], key, *identity))
-        for body in [good.body.replace('success', 'running'), good.body.replace('success', 'failed'),
-                     good.body.replace(key, 'b' * 64), 'quoted\n' + good.body]:
-            bad = copy.deepcopy(good)
-            bad.body = body
-            self.assertIsNone(adapter.completed_review([bad, summary], key, *identity))
-        summary.body = 'A later review replaced this summary'
-        self.assertIsNone(adapter.completed_review([good, summary], key, *identity))
-        summary.body = 'Complete review'
-        summary.user = None
-        self.assertIsNone(adapter.completed_review([good, summary], key, *identity))
-
-    def test_non_integer_identifiers_do_not_suppress_rerun(self):
-        key = 'c' * 64
-        identity = ("example/project", 1, "a" * 40, "b" * 40, "default")
-        good_summary, good = self.bound(key, [])
-        self.assertIs(good, adapter.completed_review([good, good_summary], key, *identity))
-
-        def record(number, summary_value, comment_id):
-            evidence = {"repository": "example/project", "number": number, "base": "b" * 40,
-                        "head": "a" * 40, "depth": "default", "key": key,
-                        "summary": summary_value, "findings": []}
-            manifest = adapter.result_manifest(evidence)
-            line = adapter.result_comment(manifest)
-            body = "Complete review\n" + line
-            digest = hashlib.sha256(body.encode()).hexdigest()
-            summary = NS(id=comment_id, body=body, user=NS(login='github-actions[bot]', type='Bot'))
-            status = NS(id=9, body=(
-                f'<!-- agent-review-status:v1 state=success key={key} summary={comment_id} '
-                f'digest={digest} -->\nComplete\n{line}'),
-                user=NS(login='github-actions[bot]', type='Bot'))
-            return summary, status, manifest
-
-        summary, status, manifest = record(True, 7, 7)
-        self.assertIn('"number":true', base64.b64decode(manifest).decode())
-        self.assertIsNone(adapter.parse_result(summary.body))
-        self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
-        summary, status, manifest = record(1, True, 1)
-        self.assertIn('"summary":true', base64.b64decode(manifest).decode())
-        self.assertIsNone(adapter.parse_result(summary.body))
-        self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
-        for number, summary_value, comment_id in (
-                (1.0, 7, 7), (1, 1.0, 1), ("1", 7, 7), (1, "7", 7),
-                (0, 7, 7), (1, 0, 7), (-1, 7, 7), (False, 7, 7)):
-            summary, status, _manifest = record(number, summary_value, comment_id)
-            self.assertIsNone(adapter.parse_result(summary.body))
-            self.assertIsNone(adapter.completed_review([status, summary], key, *identity))
-
-    def test_profile_exclusions_remain_literal_in_provenance(self):
-        text = adapter.provenance('a' * 40, 'b' * 40, 'c' * 64, ['**/`[name](example)/**'])
-        self.assertIn('\\u0060', text)
-        self.assertNotIn('`[name]', text)
-
-    def test_identity_changes_with_repository_snapshot_source_profile_or_model(self):
-        settings = NS(config=NS(model='gpt-6-luna', fallback_models=[]))
-        env = {'REVIEW_SOURCE_SHA': 'c' * 40, 'REVIEW_PROFILE_SHA': 'd' * 40}
-        with patch.dict(os.environ, env):
-            original = adapter.review_binding(settings, 'example/project', '1', 'a' * 40, 'b' * 40)[0]
-            self.assertEqual(original, adapter.review_binding(settings, 'example/project', '1', 'a' * 40, 'b' * 40)[0])
-            for args in [('example/other', '1', 'a' * 40, 'b' * 40), ('example/project', '2', 'a' * 40, 'b' * 40),
-                         ('example/project', '1', 'e' * 40, 'b' * 40), ('example/project', '1', 'a' * 40, 'e' * 40)]:
-                self.assertNotEqual(original, adapter.review_binding(settings, *args)[0])
-            with patch.dict(os.environ, REVIEW_SOURCE_SHA='e' * 40):
-                self.assertNotEqual(original, adapter.review_binding(settings, 'example/project', '1', 'a' * 40, 'b' * 40)[0])
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory).resolve() / 'profile.toml'
-                path.write_text('[review]\ninstructions="Other review"\n[ignore]\nglob=[]\n')
-                with patch.dict(os.environ, REVIEW_PROFILE_PATH=str(path)):
-                    self.assertNotEqual(original, adapter.review_binding(settings, 'example/project', '1', 'a' * 40, 'b' * 40)[0])
-            settings.config.model = 'anthropic/claude-sonnet-5-5'
-            self.assertNotEqual(original, adapter.review_binding(settings, 'example/project', '1', 'a' * 40, 'b' * 40)[0])
-            with patch.dict(os.environ, REVIEW_SOURCE_SHA='main'), self.assertRaises(adapter.ReviewAbort):
-                adapter.review_binding(settings, 'example/project', '1', 'a' * 40, 'b' * 40)
 
 
 class ReporterTests(unittest.TestCase):
@@ -537,12 +387,12 @@ class ReporterTests(unittest.TestCase):
 
     def test_reporter_is_host_only_and_minimally_privileged(self):
         job = WORKFLOW['jobs']['notify-failure']
-        self.assertEqual(['source', 'admit', 'review'], job['needs'])
+        self.assertEqual(['source', 'admit', 'review', 'publish'], job['needs'])
         self.assertIn('always()', job['if'])
         self.assertEqual({'pull-requests': 'write'}, job['permissions'])
         self.assertNotIn('container', job)
         text = json.dumps(job)
-        for denied in ('secrets.', 'checkout', 'download-artifact', 'pr_agent_review.py'):
+        for denied in ('secrets.', 'checkout', 'download-artifact', 'review_jobs.py'):
             self.assertNotIn(denied, text)
 
     def test_notification_outcome_is_retained_after_a_failed_step(self):

@@ -1,46 +1,44 @@
 # agent-review
 
-A maintainer-gated pull request review command for GitHub Actions. A maintainer comments `/review` on a pull request, and a reusable workflow reviews the diff together with the current source of changed files and of repository files the model requests, posts findings as resolvable inline threads where a changed line can anchor them, keeps the rest in the summary, and preserves each summary plus a completion record naming the exact commits, reviewer source, profile, models, and token usage.
+A maintainer-gated agentic pull request reviewer for GitHub Actions. Comment an exact command on an open, same-repository PR:
 
-Runs [PR-Agent](https://github.com/The-PR-Agent/pr-agent) (MIT) from its published container image.
+| Command | Passes |
+| --- | --- |
+| `/review` | Two independent Sonnet passes: bundle first, then callers first |
+| `/review deep` | One Opus pass |
+| `/review codex` | One Codex pass |
 
-## What it does
+The engine builds a merge-base diff with full changed files, falling back to changed regions when the configured input budget requires it. The reviewer can read related source. Each pass reports concrete introduced defects with a head location, trigger, consequence, repair, and confidence. Findings are merged by location and mechanism. Each pass can return up to six candidates; there is no evidence-challenge veto.
 
-Only the designated maintainer can start a review with an original, unedited `/review` or `/review deep` comment on an open, same-repository pull request. Normal review uses Sonnet 5.5 at medium effort; deep review uses Opus 5.5 at high effort. Both retain the configured OpenAI fallback. Forks, closed PRs, edited events, reruns, bots, and unsupported commands can't start a review. Normal and deep completions have separate identities. The command runs from the default branch, so a pull request can't change the workflow that reviews it.
+Inference jobs have read-only GitHub permissions. A separate publisher validates the result and transcript-derived receipts, rechecks the captured commits and original command, then publishes resolvable inline threads and a preserved summary. Related-source findings stay in the summary when no changed line can anchor them. Immutable completion records support duplicate detection, incremental coverage, and verified follow-up replies.
 
-The review engine loads from this repository at a full commit SHA, and a credential-free helper checks that GitHub loaded that revision before anything else runs. The calling repository's profile and caller are read as bounded data from an immutable default-branch revision, and only Python from this repository executes. The model gets no tools, no environment access, and no authority over credentials or where results are published.
+## Required operator policy
 
-Provider fallback happens only on an explicit billing rejection. Timeouts, rate limits, authentication errors, malformed output, and truncated completions fail without another paid attempt. When a review can't finish, a host-only step posts a fixed status comment so a failed run is never mistaken for a clean one. Repeating the command on an unchanged, verified snapshot reuses its completion chain. New commits can use an immutable delta from the last verified review; missing proof, changed policy, or unsafe ancestry requires a full review. Earlier findings and threads remain for the maintainer's sweep.
+The central [.github/pr-agent.toml](.github/pr-agent.toml) retains its filename for compatibility. Each of `review_depth.default`, `review_depth.deep`, and `review_depth.codex` requires `max_turns` and `max_budget_usd`. The code has no defaults; the shipped policy sets 40 turns, USD 2 per default or codex pass, and USD 4 per deep pass, so reviews run and incur provider charges once the provider secrets are configured. Removing or invalidating either setting fails before inference with the exact config key to set.
 
-Josh or a current organization member can ask a follow-up question in this workflow's verified inline thread. GitHub membership, the unchanged triggering comment, the current PR snapshot, and the original root's workflow artifact must all verify before inference. Replies use the normal model policy and remain static text in the same thread. The model has no tools or configuration access.
+The USD allowance applies **per pass**. A review's configured allowance is its pass count multiplied by that limit. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. The shipped values were approved from measured usage on the evaluation set.
 
-Candidate findings receive a separate evidence challenge before publication within the existing call ceiling. Repeated scenarios and held decisions remain visible without another inline thread.
+## Adoption
 
-Model choice is operator policy, not a quality guarantee. Findings are advice and can be wrong. A completed run doesn't establish review quality or recall.
+1. Install [.github/workflows/agent-review.yaml](.github/workflows/agent-review.yaml), using the exact maintained caller template. External callers must pin the reusable workflow to a full merged commit SHA with the `# main` tracking comment. [The example caller](examples/pipelock/agent-review.yaml) provides that form.
+2. Add `.github/agent-review.toml` with only `[review] instructions` and `[ignore] glob`. Profiles cannot change models, tools, budgets, admission, credentials, or publication.
+3. Configure the centrally approved per-depth limits before adopting the engine.
+4. Map `ANTHROPIC_API_KEY` for Claude and/or `OPENAI_API_KEY` for Codex as named secrets. The existing second Anthropic secret mapping remains accepted for caller compatibility, but the engine never silently retries or changes provider. Optional `ORG_MEMBERS_TOKEN` supplies Members:read for private organization membership checks on replies.
+5. Merge the caller and profile to the default branch, then post a command.
 
-## Adopting it in a repository
-
-1. Add `.github/workflows/agent-review.yaml`. It must match the maintained caller template exactly, with `uses:` pointing at `pipelab-org/agent-review/.github/workflows/agent-review-reusable.yaml` at a full 40-character merged commit SHA followed by ` # main`. [examples/pipelock/agent-review.yaml](examples/pipelock/agent-review.yaml) is a complete caller; replace the SHA placeholder. Never use a branch or tag reference.
-2. Add `.github/agent-review.toml` with exactly two sections: `[review] instructions` for repository-specific review guidance, and `[ignore] glob` for paths to exclude. Anything else is rejected before inference. [examples/pipelock/agent-review.toml](examples/pipelock/agent-review.toml) is a working profile.
-3. Add at least one provider key as a repository or organization secret: `ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY_2` (used only after the first is rejected for billing), or `OPENAI_API_KEY`. Don't use `secrets: inherit` or environment secrets. GitHub repository operations use the caller's own `github.token`. For private organization membership, optionally provide `ORG_MEMBERS_TOKEN` with GitHub's Members:read permission. That token is used only for the membership API; unavailable membership fails closed.
-4. Merge both files to the default branch, then comment `/review` on a pull request.
-
-The caller template fixes who can trigger a review: one maintainer account, matched by login and numeric ID, commenting as an organization member. Changing that identity is a change to this repository's validator and reusable workflow, not to a caller.
-
-Models, budgets, retries, publishing, and the shared review rubric live in [.github/pr-agent.toml](.github/pr-agent.toml). A profile can add instructions and exclusions but can't change any of those.
-
-## Updating a caller
-
-A merge here doesn't move any caller. To adopt a newer engine, update the caller's SHA to a merged commit after it has passed CI and a smoke review. Renovate's GitHub Actions manager can track the SHA through the `# main` comment.
+Only the designated maintainer's original, unedited command is admitted. Fork and closed PRs are explicitly refused before provider work. Reruns, bots, edited events, and unsupported command arguments are ineligible. Models and repository text have no authority over publication.
 
 ## Development
 
+CI uses Python 3.12 on Linux x86_64 with hash-pinned dependencies:
+
 ```bash
-pip install --require-hashes -r .github/requirements-test.txt
-python3 -m unittest discover -s scripts -p 'test_*.py'
+pip install --require-hashes -r .github/requirements-runtime.txt -r .github/requirements-test.txt
+python -m unittest discover -s scripts -p 'test_*.py'
+python -m unittest -v scripts.test_review_engine scripts.test_review_jobs
 ```
 
-The runtime tests skip without PR-Agent installed. CI runs them inside the same digest-pinned image the review job uses. [docs/agent-review.md](docs/agent-review.md) covers the trust model, spending limits, failure reporting, and maintenance in detail.
+All tests run offline with fixture credentials and provider transcripts. The argv harness proves argument forwarding and credential separation. A native CLI dry run also checks tool restrictions, scoped reads, skipped PR hooks/MCP, schema completion, and turn/budget stops against a local fixture API. It does not establish real provider behavior or hosted-runner isolation. See [the operating contract and vendor evidence](docs/agent-review.md).
 
 ## License
 

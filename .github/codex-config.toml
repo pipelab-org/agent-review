@@ -1,0 +1,7 @@
+# Trusted action home only. PR files never supply home configuration.
+# https://developers.openai.com/codex/permissions
+default_permissions = ":read-only"
+approval_policy = "never"
+# https://developers.openai.com/codex/config-reference
+project_doc_max_bytes = 0
+project_doc_fallback_filenames = []

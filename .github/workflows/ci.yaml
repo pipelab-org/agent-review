@@ -1,70 +1,38 @@
 name: CI
-
-on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
 permissions: {}
-
 jobs:
-  # Runs on the pull request that changes the engine, so the admission gate,
-  # permissions, source binding, and caller template are proven before merge.
-  # A review command only ever runs the copy already on the default branch.
   unit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Install pinned test dependencies
+      run: pip install --require-hashes -r .github/requirements-runtime.txt -r .github/requirements-test.txt
+    - name: Unit tests
+      run: python -m unittest discover -s scripts -p 'test_*.py'
+    - name: Offline provider and publication runtime tests
+      run: python -m unittest -v scripts.test_review_engine scripts.test_review_jobs
+    - name: Native Claude tool and budget dry run (local fixture API)
+      run: 'npm install --global @anthropic-ai/claude-code@2.1.312
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
+        claude --version
 
-      - name: Install pinned test dependencies
-        run: pip install --require-hashes -r .github/requirements-test.txt
-
-      - name: Unit tests
-        run: python -m unittest discover -s scripts -p 'test_*.py'
-
-  # The runtime suite exercises the actual handler, parser, billing rollover,
-  # and publication path of the pinned PR-Agent installation with fixture
-  # credentials. It skips silently without PR-Agent, so it runs here in the
-  # same digest-pinned image the reusable workflow uses.
-  runtime:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    container:
-      image: pragent/pr-agent:0.47.0@sha256:7d98954c29289846a08faf00aaea0f1f1375b1676cd8a2ed303e0af07010af7a
-      # Same hardening and hosted-runner UID as the review job.
-      options: --user 1001:1001 --cap-drop=ALL --security-opt=no-new-privileges
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      # Tokenizer data is fetched before the tests run; the tests that reach
-      # provider or GitHub code patch socket connects to fail on any network use.
-      - name: Prepare tokenizer cache
-        env:
-          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
-        run: python -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
-
-      - name: Runtime tests against the pinned PR-Agent
-        env:
-          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken
-        run: |
-          python -c "import pr_agent" || { echo "pinned image has no pr_agent module" >&2; exit 1; }
-          python -m unittest -v scripts.test_pr_agent_runtime scripts.test_followup_runtime scripts.test_review_followups scripts.test_review_reliability scripts.test_review_replay_runtime
+        python scripts/test_provider_dry_run.py --claude "$(command -v claude)"'
+'on':
+  pull_request:
+    branches:
+    - main
+  push:
+    branches:
+    - main
