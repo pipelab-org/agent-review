@@ -525,6 +525,13 @@ def codex_delivered_text(output):
     return result
 
 
+# Wire names of ResponseItem variants the model emits (protocol/src/models.rs, rust-v0.165.0).
+# Harness-written items (tool outputs, config updates, non-assistant messages) are excluded.
+CODEX_MODEL_OUTPUT_ITEMS = frozenset((
+    "function_call", "custom_tool_call", "reasoning", "local_shell_call", "tool_search_call",
+    "web_search_call", "image_generation_call", "compaction"))
+
+
 def codex_progress(home, head, strict=False, model=None, request_limit=None):
     """Read native rollout evidence, never model-authored receipt assertions.
 
@@ -553,7 +560,7 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None):
             # model output and pending tools. Missing API usage reuses the old info,
             # so a non-null last_token_usage alone does not attest this response.
             if (event.get("type") == "response_item"
-                    and (payload.get("type") in ("function_call", "custom_tool_call", "reasoning")
+                    and (payload.get("type") in CODEX_MODEL_OUTPUT_ITEMS
                          or (payload.get("type") == "message" and payload.get("role") == "assistant"))):
                 pending_response = True
             if event.get("type") == "event_msg" and payload.get("type") == "token_count":
