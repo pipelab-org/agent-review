@@ -197,10 +197,10 @@ class ResultTests(unittest.TestCase):
             with self.subTest(item=item), self.assertRaises(e.ReviewAbort):
                 e.validate_result({**result(), "findings": [item]}, POLICY, BUNDLE)
 
-    def test_receipt_check_rejects_unopened_changed_file(self):
+    def test_receipt_check_rejects_unsafe_opened_path(self):
         data = result()
-        data["receipt"]["passes"][0]["files_opened"] = []
-        with self.assertRaisesRegex(e.ReviewAbort, "opened"):
+        data["receipt"]["passes"][0]["files_opened"] = ["../key"]
+        with self.assertRaisesRegex(e.ReviewAbort, "receipt is invalid"):
             e.validate_result(data, POLICY, BUNDLE)
 
     def test_missing_invalid_limit_and_failed_receipts_never_mean_clean(self):
@@ -253,8 +253,11 @@ class ClaudeTests(unittest.TestCase):
             parsed = e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
         self.assertEqual(["src/app.py"], parsed["receipt"]["files_opened"])
         events = [e for e in events if e.get("type") != "user" or e["message"]["content"][0]["tool_use_id"] != "read-1"]
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(e.ReviewAbort, "never opened"):
-            e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
+        # A failed or missing read is not counted, and the summary reports the file.
+        self.assertEqual([], parsed["receipt"]["files_opened"])
+        self.assertEqual(["src/app.py"], e.unopened_regions(BUNDLE, [parsed["receipt"]]))
 
     def test_provider_stops_invalid_schema_model_drift_and_tools_fail_closed(self):
         for subtype in ("error_max_turns", "error_max_budget_usd", "error_during_execution", "error_max_structured_output_retries"):
@@ -267,7 +270,10 @@ class ClaudeTests(unittest.TestCase):
         events = transcript(); events[-1]["modelUsage"] = {"other-model": {}}; variants.append(events)
         events = transcript(); events[0]["message"]["content"][0]["name"] = "Bash"; variants.append(events)
         events = transcript(); events[0]["message"]["content"][0]["name"] = "mcp__github__write"; variants.append(events)
-        events = transcript(); events[1]["message"]["content"][0]["is_error"] = True; variants.append(events)
+        failed_read = transcript(); failed_read[1]["message"]["content"][0]["is_error"] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = e.claude_result(failed_read, POLICY, BUNDLE, "bundle", Path(tmp))
+        self.assertEqual([], parsed["receipt"]["files_opened"])
         variants.extend([transcript()[:-1], transcript() + [transcript()[-1]], transcript() + [{"type": "extra"}]])
         for events in variants:
             with self.subTest(events=events), self.assertRaises(e.ReviewAbort):
@@ -311,19 +317,19 @@ class ClaudeTests(unittest.TestCase):
 
 
 class CoverageTests(unittest.TestCase):
-    def test_bundled_full_text_counts_as_read_and_regions_still_require_a_read(self):
+    def test_unopened_region_files_are_reported_not_refused(self):
         bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "x = 1\n"},
                             {"path": "src/big.py", "deleted": False, "content": None},
                             {"path": "src/gone.py", "deleted": True, "content": None}]}
         r = receipt("bundle")
-        r["files_opened"] = ["src/big.py"]
-        self.assertEqual(r, e.validate_receipt(r, POLICY, bundle, "bundle"))
-        r["files_opened"] = ["src/full.py"]
-        with self.assertRaisesRegex(e.ReviewAbort, "never opened"):
-            e.validate_receipt(r, POLICY, bundle, "bundle")
         r["files_opened"] = []
-        full_only = {"files": [bundle["files"][0]]}
-        self.assertEqual(r, e.validate_receipt(r, POLICY, full_only, "bundle"))
+        # Every changed line is in the bundle, so the pass stands.
+        self.assertEqual(r, e.validate_receipt(r, POLICY, bundle, "bundle"))
+        # Only region-only, undeleted files that no pass opened are reported.
+        self.assertEqual(["src/big.py"], e.unopened_regions(bundle, [r]))
+        other = dict(r, files_opened=["src/big.py"])
+        self.assertEqual([], e.unopened_regions(bundle, [r, other]))
+        self.assertEqual([], e.unopened_regions({"files": [bundle["files"][0]]}, [r]))
 
 
 class CodexTests(unittest.TestCase):
@@ -607,11 +613,10 @@ class CodexTests(unittest.TestCase):
                     reported = {**receipt("callers"), "provider": "codex",
                                 "model": settings["model"], "files_opened": opened}
                     bundle = {"files": [{"path": "target.py", "deleted": False, "content": None}]}
-                    if expected:
-                        e.validate_receipt(reported, settings, bundle, "callers")
-                    else:
-                        with self.assertRaises(e.ReviewAbort):
-                            e.validate_receipt(reported, settings, bundle, "callers")
+                    # The pass stands either way; an uncredited read is reported, not counted.
+                    e.validate_receipt(reported, settings, bundle, "callers")
+                    self.assertEqual([] if expected else ["target.py"],
+                                     e.unopened_regions(bundle, [reported]))
             command["payload"]["item"]["aggregated_output"] = ""
             (home / "sessions/rollout.jsonl").write_text(json.dumps(command))
             self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
@@ -715,7 +720,7 @@ class CodexTests(unittest.TestCase):
 class VacuityTests(unittest.TestCase):
     def test_schema_and_receipt_negative_tests_fail_when_each_guard_is_neutralized(self):
         cases = (("validate_schema", "test_invalid_finding_schema_is_rejected"),
-                 ("validate_receipt", "test_receipt_check_rejects_unopened_changed_file"))
+                 ("validate_receipt", "test_receipt_check_rejects_unsafe_opened_path"))
         for guard, method in cases:
             with patch.object(e, guard, return_value=[]):
                 suite = unittest.TestSuite([ResultTests(method)])

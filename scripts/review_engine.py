@@ -246,12 +246,19 @@ def validate_receipt(receipt, settings, bundle, strategy):
     opened = receipt["files_opened"]
     if not isinstance(opened, list) or any(not safe_path(p) for p in opened):
         raise ReviewAbort("Pass file-read receipt is invalid")
-    # A changed file whose full text is in the bundle was already in the prompt.
-    # Only files sent as changed regions must be opened through the read tool.
-    changed = {f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") is None}
-    if not changed.issubset(set(opened)):
-        raise ReviewAbort("Pass never opened every changed file; inspect Read tools and increase approved turn budget")
     return receipt
+
+
+def unopened_regions(bundle, receipts):
+    """Changed files sent only as regions that no pass opened.
+
+    Every changed line and its context is in the bundle, so an unopened file is
+    reported review depth, not missing coverage: the summary names it instead of
+    discarding the review. Full-text and deleted files are never listed.
+    """
+    opened = {path for r in receipts for path in r["files_opened"]}
+    return sorted(f["path"] for f in bundle["files"]
+                  if not f["deleted"] and f.get("content") is None and f["path"] not in opened)
 
 
 def validate_result(result, settings, bundle):
@@ -391,7 +398,7 @@ def clean_env(settings=None):
 
 
 def region_guidance(bundle, how):
-    """Name changed files sent only as regions; the receipt requires a read of each."""
+    """Name region-only files and request deeper reads without requiring them."""
     paths = [f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") is None]
     if not paths:
         return ""

@@ -327,6 +327,10 @@ def publish_review(repo, pr, ctx, policy, plan, result):
              f"\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
              "\n\nEarlier findings and threads remain for the maintainer's sweep."
              f"\n\nDeclared exclusions: `{json.dumps(plan['bundle']['exclusions']).replace(chr(96), chr(92)+'u0060')}`.")
+    unopened = engine.unopened_regions(plan["bundle"], result["receipt"]["passes"])
+    if unopened:
+        text += ("\n\nSent as changed regions only and not opened by any pass: "
+                 f"`{json.dumps(unopened).replace(chr(96), chr(92)+'u0060')}`.")
     # Check sizes before any success transition; a partial publication is never reusable.
     if len(text.encode()) > followups.MAX_DATA_BYTES:
         raise ReviewAbort("Summary exceeds the existing data budget")

@@ -131,6 +131,15 @@ class JobTests(unittest.TestCase):
         self.assertEqual(["bundle", "callers"], [c.args[2] for c in provider.call_args_list])
         self.assertEqual([], self.pr.writes, "read-only stages attempted a write")
 
+    def test_summary_names_region_files_no_pass_opened(self):
+        self.build([finding(path="app.py")])
+        with patch.object(e, "unopened_regions", return_value=["docs/big.md"]) as unopened:
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(2, len(unopened.call_args.args[1]))
+        summary = next(c.body for c in self.pr.comments.values()
+                       if "Reviewed base" in c.body)
+        self.assertIn('Sent as changed regions only and not opened by any pass: `["docs/big.md"]`.', summary)
+
     def test_complete_passes_publish_inline_summary_and_verifiable_completion(self):
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
