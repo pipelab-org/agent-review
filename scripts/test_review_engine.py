@@ -79,7 +79,7 @@ class PolicyTests(unittest.TestCase):
     def test_shipped_configuration_sets_approved_limits_and_code_has_no_defaults(self):
         import tomllib
         shipped = tomllib.loads(e.CONFIG.read_text())
-        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 2.0)}
+        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 1.0), "codex-deep": (40, 2.0)}
         for depth in e.DEPTHS:
             table = shipped["review_depth"][depth]
             self.assertEqual(approved[depth], (table["max_turns"], table["max_budget_usd"]))
@@ -91,11 +91,17 @@ class PolicyTests(unittest.TestCase):
                 e.policy(depth, stripped)
             self.assertEqual(e.DEPTHS[depth][1], tuple(e.policy(depth, self.data())["passes"]))
         self.assertEqual("codex", e.policy("codex", self.data())["provider"])
+        self.assertEqual("codex", e.policy("codex-deep", self.data())["provider"])
+        # Every shipped Codex model has a sourced price, so no shipped depth fails closed on cost.
+        for depth in ("codex", "codex-deep"):
+            self.assertIn(shipped["review_depth"][depth]["model"], e.CODEX_PRICES)
 
     def test_command_routing_is_exact(self):
-        for command, depth in (("/review", "default"), ("/review deep", "deep"), ("/review codex", "codex")):
+        for command, depth in (("/review", "default"), ("/review deep", "deep"), ("/review codex", "codex"),
+                               ("/review codex deep", "codex-deep")):
             self.assertEqual(depth, jobs.command_depth(command))
-        for bad in ("/review ", "/Review", "/review codex extra", "/review\n", "", None):
+        for bad in ("/review ", "/Review", "/review codex extra", "/review codex deep ", "/review deep codex",
+                    "/review\n", "", None):
             with self.assertRaises(e.ReviewAbort):
                 jobs.command_depth(bad)
 
@@ -318,10 +324,17 @@ class CodexTests(unittest.TestCase):
               {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
                   "input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}}}]
             (sessions / "rollout.jsonl").write_text("\n".join(json.dumps(v) for v in events))
-            turns, usage, opened, cost = e.codex_progress(home, Path("/head"))
+            turns, usage, opened, cost = e.codex_progress(home, Path("/head"), model="gpt-6-luna")
             self.assertEqual(1, turns)
             self.assertEqual(["src/app.py"], opened)
-            self.assertGreater(cost, 0)
+            self.assertAlmostEqual((100 * 0.10 + 20 * 0.50) / 1_000_000, cost)
+            # Prices from https://developers.openai.com/api/docs/pricing , per 1M tokens.
+            for model, rate_in, rate_out in (("gpt-6.1-sol", 2.00, 10.00), ("gpt-6-astra", 10.00, 50.00),
+                                             ("gpt-6.1-terra", 1.00, 5.00)):
+                self.assertAlmostEqual((100 * rate_in + 20 * rate_out) / 1_000_000,
+                                       e.codex_progress(home, Path("/head"), model=model)[3])
+            # A model without a sourced price never yields a cost, so the receipt is refused.
+            self.assertIsNone(e.codex_progress(home, Path("/head"), model="unpriced")[3])
             self.assertEqual(opened, e.codex_progress(home, Path("/head"), strict=True, model="gpt-6-luna")[2])
             with self.assertRaisesRegex(e.ReviewAbort, "configured model"):
                 e.codex_progress(home, Path("/head"), strict=True, model="other")
@@ -391,9 +404,19 @@ class CodexTests(unittest.TestCase):
         # The workspace root holds the trusted base checkout; reads must resolve in the PR head.
         self.assertEqual("/head", command[command.index("--cd")+1])
         self.assertNotIn("--full-auto", command)
-        with self.assertRaises(e.ReviewAbort):
+        with self.assertRaisesRegex(e.ReviewAbort, "no sourced price"):
             e.codex_command(dict(POLICY, model="unknown"), Path("/head"), Path("/home"),
                             Path("/schema"), Path("/out"), Path("/action"))
+        for model in ("gpt-6.1-sol", "gpt-6-astra"):
+            command = e.codex_command(dict(POLICY, model=model), Path("/head"), Path("/home"),
+                                      Path("/schema"), Path("/out"), Path("/action"))
+            self.assertEqual(model, command[command.index("--model")+1])
+        # Above 272K input tokens OpenAI bills long-context rates the estimator does not model.
+        self.assertIsNotNone(e.codex_command(dict(POLICY, model="gpt-6.1-sol", max_model_tokens=272_000),
+                                             Path("/head"), Path("/home"), Path("/schema"), Path("/out"), Path("/action")))
+        with self.assertRaisesRegex(e.ReviewAbort, "short-context"):
+            e.codex_command(dict(POLICY, model="gpt-6.1-sol", max_model_tokens=272_001), Path("/head"),
+                            Path("/home"), Path("/schema"), Path("/out"), Path("/action"))
 
 
 class VacuityTests(unittest.TestCase):

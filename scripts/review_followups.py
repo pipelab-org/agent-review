@@ -127,7 +127,7 @@ def parse_record(comment, comments):
                 or type(ctx["number"]) is not int or not positive(ctx["number"])
                 or not all(full_sha(ctx[k]) for k in ("base", "head", "reviewer", "profile_sha"))
                 or not all(isinstance(ctx[k], str) and re.fullmatch(DIGEST, ctx[k]) for k in ("profile_hash", "common_config"))
-                or ctx["depth"] not in ("default", "deep", "codex")
+                or ctx["depth"] not in ("default", "deep", "codex", "codex-deep")
                 or not isinstance(ctx["models"], list) or not ctx["models"]
                 or any(not isinstance(m, str) or not m for m in ctx["models"])
                 or not isinstance(ctx["repository"], str)

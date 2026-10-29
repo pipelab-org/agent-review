@@ -5,8 +5,14 @@
 # evaluation run: the heaviest Sonnet pass used about 170k tokens and 20 tool
 # steps, the heaviest Opus pass about 170k tokens and 19 steps. Caps are about
 # twice that, priced from https://platform.claude.com/docs/en/about-claude/pricing
-# (Sonnet 5.5 $2/$10, Opus 5.5 $4/$20 per million input/output tokens). The Codex
-# pass uses the same cap as one default pass pending its own measurement.
+# (Sonnet 5.5 $2/$10, Opus 5.5 $4/$20 per million input/output tokens).
+# Codex uses gpt-6.1-terra (owner choice, 2026-10-29) at
+# https://developers.openai.com/api/docs/pricing rates (checked 2026-10-29):
+# $1/$5, half of Sonnet, so the same token allowance is USD 1 per pass.
+# codex-deep runs xhigh effort; Artificial Analysis reports Terra using about
+# twice the tokens at its higher efforts, so its pass gets USD 2.
+# Effort values: https://developers.openai.com/api/docs/models/gpt-6.1-terra .
+# Pending their own measurement.
 [config]
 max_model_tokens = 90000
 max_output_tokens = 16000
@@ -25,7 +31,13 @@ max_turns = 40
 max_budget_usd = 4.0
 
 [review_depth.codex]
-model = "gpt-6-luna"
+model = "gpt-6.1-terra"
 reasoning_effort = "medium"
+max_turns = 40
+max_budget_usd = 1.0
+
+[review_depth.codex-deep]
+model = "gpt-6.1-terra"
+reasoning_effort = "xhigh"
 max_turns = 40
 max_budget_usd = 2.0
