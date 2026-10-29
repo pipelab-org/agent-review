@@ -534,6 +534,7 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None):
     turns, usage, calls, opened = 0, {}, {}, set()
     pending_reads, delivered = [], set()
     previous = -1
+    pending_response = False
     models, sessions = set(), list(sorted(Path(home).glob("sessions/**/*.jsonl")))
     for path in sessions:
         for raw in path.read_text().splitlines():
@@ -548,6 +549,13 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None):
                 raise ReviewAbort("Codex reported an API or runtime error; pass incomplete")
             if event.get("type") == "turn_context":
                 models.add(payload.get("model"))
+            # Pinned core/src/session/turn.rs emits the completion token_count after
+            # model output and pending tools. Missing API usage reuses the old info,
+            # so a non-null last_token_usage alone does not attest this response.
+            if (event.get("type") == "response_item"
+                    and (payload.get("type") in ("function_call", "custom_tool_call", "reasoning")
+                         or (payload.get("type") == "message" and payload.get("role") == "assistant"))):
+                pending_response = True
             if event.get("type") == "event_msg" and payload.get("type") == "token_count":
                 last = (payload.get("info") or {}).get("last_token_usage") or {}
                 # Per-request input, as the Claude path checks: a single request above the
@@ -558,6 +566,11 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None):
                     raise ReviewAbort("Codex request exceeded config.max_model_tokens; review incomplete")
                 total = (payload.get("info") or {}).get("total_token_usage", {})
                 tokens = total.get("total_tokens")
+                if request_limit is not None and pending_response:
+                    if (type(tokens) is not int or tokens <= previous
+                            or not positive_int(last.get("input_tokens"))):
+                        raise ReviewAbort("Codex response has no fresh token usage; review incomplete")
+                    pending_response = False
                 if type(tokens) is int and tokens > previous:
                     previous = tokens
                     turns += 1
@@ -620,6 +633,8 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None):
     # (protocol.rs TokenUsage::non_cached_input) and bills at the cached rate. The
     # reported cache-write rate is added even if already included in input, so the
     # estimate can overstate. Estimate, not billing or a dollar default.
+    if strict and request_limit is not None and pending_response:
+        raise ReviewAbort("Codex response has no fresh token usage; review incomplete")
     if strict and (len(sessions) != 1 or not models or models != {model}):
         raise ReviewAbort("Codex rollout does not attest one fresh pass on the configured model")
     cost = None

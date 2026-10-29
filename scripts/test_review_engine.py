@@ -378,6 +378,42 @@ class CodexTests(unittest.TestCase):
                                                  request_limit=300_000)[0])
             self.assertEqual(1, e.codex_progress(home, Path("/head"), model="gpt-6.1-terra")[0])
 
+    def test_each_completed_response_requires_fresh_usage(self):
+        # Native 0.165.0 retains prior counters when response.completed omits usage.
+        # session/turn.rs emits token_count after response output and pending tools.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            rollout = home / "sessions/rollout.jsonl"
+            response = {"type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "content": []}}
+            usage = {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}
+            count = {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": usage, "total_token_usage": usage}}}
+            for events in ([response, {"type": "event_msg", "payload": {
+                                "type": "token_count", "info": None}}],
+                           [response, count, response, count]):
+                rollout.write_text("\n".join(map(json.dumps, events)))
+                with self.assertRaisesRegex(e.ReviewAbort, "fresh token usage"):
+                    e.codex_progress(home, Path("/head"), request_limit=256_000)
+            context = {"type": "turn_context", "payload": {"model": "gpt-6.1-terra"}}
+            rollout.write_text("\n".join(map(json.dumps, [context, response])))
+            with self.assertRaisesRegex(e.ReviewAbort, "fresh token usage"):
+                e.codex_progress(home, Path("/head"), strict=True,
+                                 model="gpt-6.1-terra", request_limit=256_000)
+            # Rate-limit updates and compaction may repeat counters without new output.
+            events = [response, count, count, {"type": "compacted", "payload": {}}, count]
+            rollout.write_text("\n".join(map(json.dumps, events)))
+            self.assertEqual(1, e.codex_progress(home, Path("/head"), request_limit=256_000)[0])
+            # A second response with fresh usage, including multiple output items, is valid.
+            events = [response, count, response, {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "call_id": "next", "name": "exec", "input": ""}},
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": usage, "total_token_usage": {
+                        "input_tokens": 200, "output_tokens": 40, "total_tokens": 240}}}}]
+            rollout.write_text("\n".join(map(json.dumps, events)))
+            self.assertEqual(2, e.codex_progress(home, Path("/head"), request_limit=256_000)[0])
+
     def test_cached_input_bills_at_the_cached_rate(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
