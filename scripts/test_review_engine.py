@@ -388,12 +388,33 @@ class CodexTests(unittest.TestCase):
         seen = {}
         def capture(command, **kwargs):
             seen.update(kwargs["env"])
+            seen["--cd"] = command[command.index("--cd")+1]
             raise RuntimeError("stop before inference")
         with tempfile.TemporaryDirectory() as tmp,                 patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fixture-not-forwarded"}),                 patch.object(e, "configure_codex"), patch.object(e.subprocess, "Popen", side_effect=capture),                 self.assertRaises(RuntimeError):
             e.run_codex(dict(POLICY, model="gpt-6-luna", provider="codex"), {"files": []}, "callers",
                         Path(tmp), Path(tmp), Path(tmp), Path(tmp))
         self.assertIn("CODEX_HOME", seen)
         self.assertNotIn("ANTHROPIC_API_KEY", seen)
+
+    def test_codex_runner_resolves_a_relative_head_before_launch(self):
+        # The workflow passes --head pr-head while the runner starts in the engine directory.
+        seen = {}
+        def capture(command, **kwargs):
+            seen["cd"], seen["cwd"] = command[command.index("--cd")+1], kwargs["cwd"]
+            raise RuntimeError("stop before inference")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(e, "configure_codex"), \
+                patch.object(e.subprocess, "Popen", side_effect=capture), self.assertRaises(RuntimeError):
+            old = os.getcwd()
+            os.chdir(tmp)
+            try:
+                Path("pr-head").mkdir()
+                e.run_codex(dict(POLICY, model="gpt-6.1-terra", provider="codex"), {"files": []}, "callers",
+                            Path("pr-head"), Path(tmp), Path(tmp), Path(tmp))
+            finally:
+                os.chdir(old)
+        self.assertTrue(Path(seen["cd"]).is_absolute())
+        self.assertEqual((Path(tmp).resolve() / "pr-head").as_posix(), seen["cd"])
+        self.assertNotEqual(Path(seen["cwd"]).resolve(), Path(tmp).resolve())
 
     def test_action_runner_enforces_read_only_and_schema(self):
         command = e.codex_command(dict(POLICY, model="gpt-6-luna"), Path("/head"), Path("/trusted-home"),

@@ -520,6 +520,9 @@ def configure_codex(home, settings):
 def run_codex(settings, bundle, strategy, head, action, home, workspace):
     import selectors
     import time
+    # Codex is launched from the engine directory; a relative head (the workflow
+    # passes pr-head) would resolve there and miss the PR checkout.
+    head = Path(head).resolve()
     configure_codex(home, settings)
     output = Path(workspace) / "codex-output.json"
     schema = Path(workspace) / "schema.json"
