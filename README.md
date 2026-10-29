@@ -17,7 +17,7 @@ Inference jobs have read-only GitHub permissions. A separate publisher validates
 
 The central [.github/pr-agent.toml](.github/pr-agent.toml) retains its filename for compatibility. Each of `review_depth.default`, `review_depth.deep`, `review_depth.codex`, and `review_depth.codex-deep` requires `max_turns` and `max_budget_usd`. The code has no defaults; the shipped policy sets 40 turns, USD 2 per default or codex pass, USD 4 per deep pass, and USD 10 per codex-deep pass, so reviews run and incur provider charges once the provider secrets are configured. Removing or invalidating either setting fails before inference with the exact config key to set.
 
-The USD allowance applies **per pass**. A review's configured allowance is its pass count multiplied by that limit. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. The shipped values were approved from measured usage on the evaluation set.
+The USD allowance applies **per pass**. A review's configured allowance is its pass count multiplied by that limit. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. The shipped Claude limits come from measured evaluation runs. Codex limits use the same token allowance at the configured models' published rates and await their own measurements.
 
 ## Adoption
 
