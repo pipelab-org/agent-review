@@ -19,7 +19,7 @@ The trusted central `.github/pr-agent.toml` contains `review_depth.default`, `re
 | `max_turns` | Positive integer; booleans, strings, and fractional values are invalid | Each independent pass |
 | `max_budget_usd` | Positive finite numeric USD amount; booleans and strings are invalid | Each independent pass |
 
-Errors name the complete key, for example `review_depth.default.max_budget_usd`. There are no defaults or environment overrides. The shipped config deliberately omits both settings for every depth; no example number is production policy. Real values will be set from measured usage on the evaluation set after owner approval. Until then the engine refuses inference.
+Errors name the complete key, for example `review_depth.default.max_budget_usd`. There are no defaults or environment overrides. The shipped config sets both for every depth: 40 turns, and USD 2 per pass for default and codex, USD 4 per pass for deep. The owner approved these values on 2026-10-28 from measured evaluation runs; the derivation is in `.github/pr-agent.toml`. Removing either key makes the engine refuse inference for that depth.
 
 Default review runs two fresh Sonnet processes, one beginning with the bundle and one with callers/helpers. Deep review runs one Opus process. Codex review runs one Codex pass. A review's maximum configured USD allowance is **passes × max_budget_usd**. Claude's client estimate and Codex's monitored usage estimate can overshoot while an API request is in flight; this allowance is not a guaranteed invoice ceiling. Provider account/project limits remain the billing backstop.
 

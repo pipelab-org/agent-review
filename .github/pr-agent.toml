@@ -1,6 +1,12 @@
 # Trusted engine policy. Read only from the immutable shared-engine source.
-# No turn/dollar defaults. Owner-approved measurements must supply both keys
-# max_turns and max_budget_usd in EACH review_depth table before inference.
+# max_turns and max_budget_usd have no code defaults; each review_depth table
+# must set both or inference is refused.
+# Values below were approved by the owner on 2026-10-28 from a measured
+# evaluation run: the heaviest Sonnet pass used about 170k tokens and 20 tool
+# steps, the heaviest Opus pass about 170k tokens and 19 steps. Caps are about
+# twice that, priced from https://platform.claude.com/docs/en/about-claude/pricing
+# (Sonnet 5.5 $2/$10, Opus 5.5 $4/$20 per million input/output tokens). The Codex
+# pass uses the same cap as one default pass pending its own measurement.
 [config]
 max_model_tokens = 90000
 max_output_tokens = 16000
@@ -9,14 +15,17 @@ ai_timeout = 300
 [review_depth.default]
 model = "anthropic/claude-sonnet-5-5"
 reasoning_effort = "medium"
-# max_turns and max_budget_usd are required operator settings, intentionally absent.
+max_turns = 40
+max_budget_usd = 2.0
 
 [review_depth.deep]
 model = "anthropic/claude-opus-5-5"
 reasoning_effort = "high"
-# max_turns and max_budget_usd are required operator settings, intentionally absent.
+max_turns = 40
+max_budget_usd = 4.0
 
 [review_depth.codex]
 model = "gpt-6-luna"
 reasoning_effort = "medium"
-# max_turns and max_budget_usd are required operator settings, intentionally absent.
+max_turns = 40
+max_budget_usd = 2.0

@@ -76,14 +76,19 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(e.ReviewAbort, "max_turns"):
             e.policy("default", data)
 
-    def test_policy_source_and_shipped_configuration_have_no_limit_defaults(self):
+    def test_shipped_configuration_sets_approved_limits_and_code_has_no_defaults(self):
         import tomllib
         shipped = tomllib.loads(e.CONFIG.read_text())
+        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 2.0)}
         for depth in e.DEPTHS:
-            self.assertNotIn("max_turns", shipped["review_depth"][depth])
-            self.assertNotIn("max_budget_usd", shipped["review_depth"][depth])
+            table = shipped["review_depth"][depth]
+            self.assertEqual(approved[depth], (table["max_turns"], table["max_budget_usd"]))
+            resolved = e.policy(depth)
+            self.assertEqual(approved[depth], (resolved["max_turns"], resolved["max_budget_usd"]))
+            stripped = self.data()
+            del stripped["review_depth"][depth]["max_turns"]
             with self.assertRaisesRegex(e.ReviewAbort, "review_depth." + depth + ".max_turns"):
-                e.policy(depth)
+                e.policy(depth, stripped)
             self.assertEqual(e.DEPTHS[depth][1], tuple(e.policy(depth, self.data())["passes"]))
         self.assertEqual("codex", e.policy("codex", self.data())["provider"])
 
