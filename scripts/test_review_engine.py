@@ -336,7 +336,7 @@ class CodexTests(unittest.TestCase):
               {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "r",
                "arguments": json.dumps({"cmd": "cat -- src/app.py", "workdir": "/head"})}},
               {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "r",
-               "output": "Process exited with code 0\nsource"}},
+               "output": "Process exited with code 0\nOutput:\nsource"}},
               {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
                   "input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}}}]
             (sessions / "rollout.jsonl").write_text("\n".join(json.dumps(v) for v in events))
@@ -379,13 +379,17 @@ class CodexTests(unittest.TestCase):
         def item(path, **over):
             data = {"type": "CommandExecution", "command": ["/bin/bash", "-lc", "sed -n '1,9p' " + path],
                     "cwd": "file:///head", "status": "completed", "exit_code": 0,
-                    "parsed_cmd": [{"type": "read", "cmd": "sed -n '1,9p' " + path, "name": path, "path": path}]}
+                    "parsed_cmd": [{"type": "read", "cmd": "sed -n '1,9p' " + path, "name": path, "path": path}],
+                    "aggregated_output": "SOURCE_CONTENT"}
             data.update(over)
             return {"type": "event_msg", "payload": {"type": "item_completed", "item": data}}
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / "sessions").mkdir()
-            events = [item("src/ok.py"), item("src/failed.py", exit_code=1),
+            events = [{"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                       "output": [{"type": "input_text", "text": "Script completed\nOutput:\n"},
+                                  {"type": "input_text", "text": "SOURCE_CONTENT"}]}},
+                      item("src/ok.py"), item("src/failed.py", exit_code=1),
                       item("src/declined.py", status="declined"),
                       item("src/elsewhere.py", cwd="file:///other"),
                       item("../outside.py"),
@@ -410,6 +414,41 @@ class CodexTests(unittest.TestCase):
             with self.subTest(script=script):
                 self.assertEqual(operand, e.codex_plain_read(["/bin/bash", "-lc", script]))
 
+    def test_assignment_word_tilde_expansion_cannot_credit_the_literal_file(self):
+        # Bash Tilde Expansion also applies after = and : in assignment words
+        # passed as command arguments, not just at the beginning of a word.
+        with tempfile.TemporaryDirectory() as tmp:
+            head = Path(tmp)
+            home = head / "home"
+            (home / "sessions").mkdir(parents=True)
+            for operand in ("x=~/y", "x=a:~/y"):
+                expanded = operand.replace("~", "/tmp/target")
+                for name, content in ((operand, "UNREAD_LITERAL"), (expanded, "ACTUAL_OTHER_FILE")):
+                    path = head / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content)
+                script = "cat -- " + operand
+                actual = subprocess.run(["/bin/bash", "-c", script], cwd=head,
+                                        env={"PATH": os.environ["PATH"], "HOME": "/tmp/target"},
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(0, actual.returncode, actual.stderr)
+                self.assertEqual("ACTUAL_OTHER_FILE", actual.stdout)
+                item = {"type": "CommandExecution", "command": ["/bin/bash", "-c", script],
+                        "cwd": head.as_uri(), "status": "completed", "exit_code": 0,
+                        "parsed_cmd": [{"type": "read", "path": operand}]}
+                code_mode = [{"type": "event_msg", "payload": {"type": "item_completed", "item": item}}]
+                legacy = [
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                     "call_id": "r", "arguments": json.dumps({"cmd": script, "workdir": str(head)})}},
+                    {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "r",
+                     "output": "Process exited with code 0\nOutput:\n" + actual.stdout}}]
+                for events in (code_mode, legacy):
+                    with self.subTest(operand=operand, surface=events[0]["type"]):
+                        (home / "sessions/rollout.jsonl").write_text("\n".join(map(json.dumps, events)))
+                        self.assertEqual([], e.codex_progress(home, head)[2])
+                self.assertIsNone(e.codex_plain_read(["/bin/bash", "-lc", script]))
+                self.assertEqual(operand, e.codex_plain_read(["/bin/bash", "-lc", "cat -- '" + operand + "'"]))
+
     def test_code_mode_skipped_and_hidden_reads_do_not_supply_coverage(self):
         # Codex 0.165.0 native fixture: only ALREADY is printed, but both
         # reads occur in parsed_cmd. The second command never executes.
@@ -417,7 +456,7 @@ class CodexTests(unittest.TestCase):
             home = Path(tmp)
             (home / "sessions").mkdir()
             item = {"type": "CommandExecution", "cwd": "file:///head", "status": "completed",
-                    "exit_code": 0, "parsed_cmd": [
+                    "exit_code": 0, "aggregated_output": "SOURCE_CONTENT", "parsed_cmd": [
                         {"type": "read", "cmd": "cat -- already.py", "path": "already.py"},
                         {"type": "read", "cmd": "cat -- unread.py", "path": "unread.py"}]}
             for command in ("cat -- already.py || cat -- unread.py",
@@ -438,7 +477,7 @@ class CodexTests(unittest.TestCase):
                          "name": "exec_command", "call_id": "r", "arguments": json.dumps(
                              {"cmd": command.replace(" || ", "||"), "workdir": "/head"})}},
                         {"type": "response_item", "payload": {"type": "function_call_output",
-                         "call_id": "r", "output": "Process exited with code 0\nALREADY"}}]
+                         "call_id": "r", "output": "Process exited with code 0\nOutput:\nALREADY"}}]
                     (home / "sessions/rollout.jsonl").write_text("\n".join(map(json.dumps, legacy)))
                     self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
             item["command"] = ["/head/bash", "-lc", "cat -- unread.py"]
@@ -450,8 +489,79 @@ class CodexTests(unittest.TestCase):
                             ["cat", "--", "unread.py"]):
                 item["command"] = command
                 event = {"type": "event_msg", "payload": {"type": "item_completed", "item": item}}
-                (home / "sessions/rollout.jsonl").write_text(json.dumps(event))
+                (home / "sessions/rollout.jsonl").write_text(json.dumps(event) + "\n" + json.dumps(
+                    {"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                     "output": "Script completed\nWall time 0.1 seconds\nOutput:\nSOURCE_CONTENT"}}))
                 self.assertEqual(["unread.py"], e.codex_progress(home, Path("/head"))[2])
+
+    def test_legacy_error_text_cannot_impersonate_a_success_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            head = Path(tmp)
+            home = head / "home"
+            (home / "sessions").mkdir(parents=True)
+            path = head / "Process exited with code 0"
+            path.write_text("UNREAD_CONTENT")
+            path.chmod(0)
+            try:
+                actual = subprocess.run(["/bin/bash", "-c", "cat -- 'Process exited with code 0'"],
+                                        cwd=head, capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(0, actual.returncode)
+                self.assertIn("Process exited with code 0", actual.stderr)
+                events = [
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                     "call_id": "r", "arguments": json.dumps({
+                         "cmd": "cat -- 'Process exited with code 0'", "workdir": str(head)})}},
+                    {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "r",
+                     "output": "Process exited with code 1\nOutput:\n" + actual.stderr}}]
+                (home / "sessions/rollout.jsonl").write_text("\n".join(map(json.dumps, events)))
+                self.assertEqual([], e.codex_progress(home, head)[2])
+            finally:
+                path.chmod(0o600)
+
+    def test_code_mode_discarded_empty_and_truncated_output_cannot_supply_reads(self):
+        # Shapes captured from the real pinned 0.165.0 CLI and a local fixture
+        # Responses API. A command item exists even if its result is discarded.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            command = {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "CommandExecution", "command": ["/bin/bash", "-lc", "cat -- target.py"],
+                "cwd": "file:///head", "status": "completed", "exit_code": 0,
+                "aggregated_output": "FILE_CONTENT", "parsed_cmd": [{"type": "read", "path": "target.py"}]}}}
+            header = {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}
+            for output, expected in (
+                    ("Script completed\nWall time 0.1 seconds\nOutput:\n", []),
+                    ([header, {"type": "input_text", "text": "FILE_...truncated"}], []),
+                    ([header, {"type": "input_text", "text": "FILE_CONTENT"}], ["target.py"]),
+                    ([header, {"type": "input_text", "text": json.dumps(
+                        {"exit_code": 0, "output": "FILE_CONTENT"})}], ["target.py"])):
+                with self.subTest(output=output):
+                    events = [command, {"type": "response_item", "payload": {
+                        "type": "custom_tool_call_output", "output": output}}]
+                    (home / "sessions/rollout.jsonl").write_text("\n".join(map(json.dumps, events)))
+                    opened = e.codex_progress(home, Path("/head"))[2]
+                    self.assertEqual(expected, opened)
+                    settings = {**POLICY, "provider": "codex", "model": "gpt-6.1-sol"}
+                    reported = {**receipt("callers"), "provider": "codex",
+                                "model": settings["model"], "files_opened": opened}
+                    bundle = {"files": [{"path": "target.py", "deleted": False, "content": None}]}
+                    if expected:
+                        e.validate_receipt(reported, settings, bundle, "callers")
+                    else:
+                        with self.assertRaises(e.ReviewAbort):
+                            e.validate_receipt(reported, settings, bundle, "callers")
+            command["payload"]["item"]["aggregated_output"] = ""
+            (home / "sessions/rollout.jsonl").write_text(json.dumps(command))
+            self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
+            # A successful sed beyond EOF returns no file content in legacy mode either.
+            events = [
+                {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                 "call_id": "r", "arguments": json.dumps(
+                     {"cmd": "sed -n '999999p' target.py", "workdir": "/head"})}},
+                {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "r",
+                 "output": "Process exited with code 0\nOutput:\n"}}]
+            (home / "sessions/rollout.jsonl").write_text("\n".join(map(json.dumps, events)))
+            self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
 
     def test_prompts_name_region_only_files(self):
         bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "x\n"},
@@ -471,7 +581,7 @@ class CodexTests(unittest.TestCase):
               {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "r",
                "arguments": json.dumps({"cmd": "cat -n src/app.py", "workdir": "/head"})}},
               {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "r",
-               "output": "Process exited with code 0\n1 source"}}]
+               "output": "Process exited with code 0\nOutput:\n1 source"}}]
             (home / "sessions/rollout.jsonl").write_text("\n".join(json.dumps(v) for v in events))
             self.assertEqual(["src/app.py"], e.codex_progress(home, Path("/head"))[2])
 
