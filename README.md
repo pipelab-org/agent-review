@@ -6,7 +6,8 @@ A maintainer-gated agentic pull request reviewer for GitHub Actions. Comment an 
 | --- | --- |
 | `/review` | Two independent Sonnet passes: bundle first, then callers first |
 | `/review deep` | One Opus pass |
-| `/review codex` | One Codex pass |
+| `/review codex` | One Codex pass on GPT-6.1 Sol |
+| `/review codex deep` | One Codex pass on GPT-6 Astra |
 
 The engine builds a merge-base diff with full changed files, falling back to changed regions when the configured input budget requires it. The reviewer can read related source. Each pass reports concrete introduced defects with a head location, trigger, consequence, repair, and confidence. Findings are merged by location and mechanism. Each pass can return up to six candidates; there is no evidence-challenge veto.
 
@@ -14,7 +15,7 @@ Inference jobs have read-only GitHub permissions. A separate publisher validates
 
 ## Required operator policy
 
-The central [.github/pr-agent.toml](.github/pr-agent.toml) retains its filename for compatibility. Each of `review_depth.default`, `review_depth.deep`, and `review_depth.codex` requires `max_turns` and `max_budget_usd`. The code has no defaults; the shipped policy sets 40 turns, USD 2 per default or codex pass, and USD 4 per deep pass, so reviews run and incur provider charges once the provider secrets are configured. Removing or invalidating either setting fails before inference with the exact config key to set.
+The central [.github/pr-agent.toml](.github/pr-agent.toml) retains its filename for compatibility. Each of `review_depth.default`, `review_depth.deep`, `review_depth.codex`, and `review_depth.codex-deep` requires `max_turns` and `max_budget_usd`. The code has no defaults; the shipped policy sets 40 turns, USD 2 per default or codex pass, USD 4 per deep pass, and USD 10 per codex-deep pass, so reviews run and incur provider charges once the provider secrets are configured. Removing or invalidating either setting fails before inference with the exact config key to set.
 
 The USD allowance applies **per pass**. A review's configured allowance is its pass count multiplied by that limit. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. The shipped values were approved from measured usage on the evaluation set.
 

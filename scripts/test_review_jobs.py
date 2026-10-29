@@ -99,7 +99,7 @@ class JobTests(unittest.TestCase):
         # Explicit fixture values only, never a shipped operator config.
         self.config.write_text('[config]\nmax_model_tokens=90000\nmax_output_tokens=16000\nai_timeout=300\n' +
             "\n".join(f'[review_depth.{d}]\nmodel="{POLICY["model"]}"\nreasoning_effort="medium"\nmax_turns=10\nmax_budget_usd=5.0\n'
-                      for d in ("default", "deep", "codex")))
+                      for d in ("default", "deep", "codex", "codex-deep")))
         self.event = {"action": "created", "repository": {"full_name": "example/project"},
                       "issue": {"number": 1, "pull_request": {}},
                       "comment": {"id": 9, "body": "/review", "user": f.JOSH, "author_association": "MEMBER",
@@ -302,9 +302,14 @@ class WorkflowTests(unittest.TestCase):
         # The parent process environment is readable from a same-user child, so the
         # step itself, not only the engine's subprocess environment, must omit it.
         infer = next(s for s in self.workflow["jobs"]["review"]["steps"] if s.get("name") == "Review the admitted diff")
-        self.assertEqual("${{ env.REVIEW_DEPTH != 'codex' && secrets.ANTHROPIC_API_KEY || '' }}",
+        self.assertEqual("${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY || '' }}",
                          infer["env"]["ANTHROPIC_API_KEY"])
-        self.assertEqual("codex", self.workflow["jobs"]["review"]["env"]["REVIEW_DEPTH"].split("'")[3])
+        # Every Codex depth the workflow can select is covered by the prefix test above.
+        literals = self.workflow["jobs"]["review"]["env"]["REVIEW_DEPTH"].split("'")[1::2]
+        depths = dict(zip(literals[0:-1:2], literals[1::2]))
+        self.assertEqual({"/review codex deep": "codex-deep", "/review codex": "codex", "/review deep": "deep"}, depths)
+        self.assertEqual({d for d in e.DEPTHS if e.DEPTHS[d][0] == "codex"},
+                         {d for d in depths.values() if d.startswith("codex")})
         for step in self.workflow["jobs"]["review"]["steps"]:
             if step.get("name") != "Review the admitted diff":
                 self.assertNotIn("ANTHROPIC_API_KEY", json.dumps(step.get("env", {})))

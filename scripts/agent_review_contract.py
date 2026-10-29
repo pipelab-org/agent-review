@@ -43,7 +43,7 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      contains(fromJSON('["/review","/review deep","/review codex"]'), github.event.comment.body)) ||
+      contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) ||
       (github.event_name == 'pull_request_review_comment' &&
       github.event.action == 'created' &&
       github.run_attempt == '1' &&

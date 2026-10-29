@@ -13,13 +13,13 @@ name: Reusable agentic review
 permissions: {}
 jobs:
   source:
-    if: (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex"]'), github.event.comment.body)) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id)
+    if: (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id)
     permissions: {}
     uses: ./.github/workflows/agent-review-source.yaml
   admit:
     needs: source
     name: Admit maintainer command
-    if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex"]'), github.event.comment.body)
+    if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -38,9 +38,9 @@ jobs:
       run: |
         set -euo pipefail
         # GitHub expression string comparisons ignore case. Shell admission
-        # enforces the exact two commands before any provider work.
+        # enforces the exact commands before any provider work.
         case "$REVIEW_COMMAND" in
-          /review|'/review deep'|'/review codex') ;;
+          /review|'/review deep'|'/review codex'|'/review codex deep') ;;
           *) exit 0 ;;
         esac
         pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
@@ -121,12 +121,12 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Install pinned Claude CLI
-      if: ${{ env.REVIEW_DEPTH != 'codex' }}
+      if: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') }}
       run: |-
         npm install --global @anthropic-ai/claude-code@2.1.312
         claude --version
@@ -137,12 +137,12 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Check out pinned Codex action runner
-      if: ${{ env.REVIEW_DEPTH == 'codex' }}
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: openai/codex-action
@@ -156,12 +156,12 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Prepare trusted Codex home
-      if: ${{ env.REVIEW_DEPTH == 'codex' }}
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
       run: |-
         mkdir -p "$RUNNER_TEMP/agent-review-codex-home"
         cp trusted-agent-review/.github/codex-config.toml "$RUNNER_TEMP/agent-review-codex-home/config.toml"
@@ -172,12 +172,12 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Set up pinned read-only Codex runtime
-      if: ${{ env.REVIEW_DEPTH == 'codex' }}
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
       uses: openai/codex-action@c05cfd74ad95c626cdf05c6685e62becc3bf7813
       with:
         openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -193,7 +193,7 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
@@ -204,13 +204,13 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
         # A Codex pass can run read-only shell commands and read process environments.
         # It authenticates through the action's proxy, so it never receives this key.
-        ANTHROPIC_API_KEY: ${{ env.REVIEW_DEPTH != 'codex' && secrets.ANTHROPIC_API_KEY || '' }}
+        ANTHROPIC_API_KEY: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY || '' }}
       run: python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -225,7 +225,7 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
@@ -245,12 +245,12 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     env:
-      REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+      REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
   reply:
     name: Answer an inline review question
     needs: source
@@ -383,7 +383,7 @@ jobs:
         REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Check out pinned Codex action runner
-      if: ${{ env.REVIEW_DEPTH == 'codex' }}
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: openai/codex-action
@@ -402,7 +402,7 @@ jobs:
         REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Prepare trusted Codex home
-      if: ${{ env.REVIEW_DEPTH == 'codex' }}
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
       run: |-
         mkdir -p "$RUNNER_TEMP/agent-review-codex-home"
         cp trusted-agent-review/.github/codex-config.toml "$RUNNER_TEMP/agent-review-codex-home/config.toml"
@@ -418,7 +418,7 @@ jobs:
         REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Set up pinned read-only Codex runtime
-      if: ${{ env.REVIEW_DEPTH == 'codex' }}
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
       uses: openai/codex-action@c05cfd74ad95c626cdf05c6685e62becc3bf7813
       with:
         openai-api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -498,7 +498,7 @@ jobs:
     - review
     - publish
     if: |-
-      always() && github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex"]'), github.event.comment.body) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
+      always() && github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
           needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled')
     runs-on: ubuntu-latest
@@ -609,7 +609,7 @@ jobs:
                     and os.environ["GITHUB_RUN_ATTEMPT"] == "1"
                     and user.get("login") == "luckyPipewrench" and user.get("id") == 142104046
                     and user.get("type") == "User" and comment.get("author_association") == "MEMBER"
-                    and comment.get("body") in ("/review", "/review deep", "/review codex") and issue.get("pull_request")):
+                    and comment.get("body") in ("/review", "/review deep", "/review codex", "/review codex deep") and issue.get("pull_request")):
                 return
             repo, number, run_id = os.environ["GITHUB_REPOSITORY"], issue.get("number"), os.environ["GITHUB_RUN_ID"]
             if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
@@ -754,7 +754,7 @@ jobs:
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
         REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
         REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
-        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json

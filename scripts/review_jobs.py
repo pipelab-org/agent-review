@@ -64,9 +64,10 @@ def check_pr(repo, ctx):
 
 
 def command_depth(command):
-    choices = {"/review": "default", "/review deep": "deep", "/review codex": "codex"}
+    choices = {"/review": "default", "/review deep": "deep", "/review codex": "codex",
+               "/review codex deep": "codex-deep"}
     if command not in choices:
-        raise ReviewAbort("Only exact /review, /review deep and /review codex commands are admitted")
+        raise ReviewAbort("Only exact /review, /review deep, /review codex and /review codex deep commands are admitted")
     return choices[command]
 
 
