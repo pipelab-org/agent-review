@@ -231,6 +231,20 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual([], parsed["findings"])
         self.assertEqual(["src/app.py"], parsed["receipt"]["files_opened"])
 
+    def test_reading_unsafe_paths_inside_head_does_not_discard_the_pass(self):
+        events = transcript()
+        events[1:1] = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "git-1", "name": "Read", "input": {"file_path": ".git/HEAD"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "git-1", "is_error": False, "content": "ref"}]}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
+        self.assertEqual(["src/app.py"], parsed["receipt"]["files_opened"])
+        events = [e for e in events if e.get("type") != "user" or e["message"]["content"][0]["tool_use_id"] != "read-1"]
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(e.ReviewAbort, "never opened"):
+            e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
+
     def test_provider_stops_invalid_schema_model_drift_and_tools_fail_closed(self):
         for subtype in ("error_max_turns", "error_max_budget_usd", "error_during_execution", "error_max_structured_output_retries"):
             events = transcript()
@@ -309,6 +323,18 @@ class CodexTests(unittest.TestCase):
             # Repeated token totals do not count as new inference.
             with (sessions / "rollout.jsonl").open("a") as f: f.write("\n"+json.dumps(events[-1]))
             self.assertEqual(1, e.codex_progress(home, Path("/head"))[0])
+
+    def test_option_words_in_a_cat_read_are_not_receipt_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            events = [
+              {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "r",
+               "arguments": json.dumps({"cmd": "cat -n src/app.py", "workdir": "/head"})}},
+              {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "r",
+               "output": "Process exited with code 0\n1 source"}}]
+            (home / "sessions/rollout.jsonl").write_text("\n".join(json.dumps(v) for v in events))
+            self.assertEqual(["src/app.py"], e.codex_progress(home, Path("/head"))[2])
 
     def test_truncated_or_missing_native_rollout_is_not_a_complete_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:

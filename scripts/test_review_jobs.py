@@ -183,6 +183,11 @@ class JobTests(unittest.TestCase):
         record = json.loads((self.root / "completion.json").read_text())
         self.assertEqual("helper.py", record["findings"][0]["path"])
 
+    def test_finding_on_a_path_absent_at_head_names_the_real_cause(self):
+        with self.assertRaisesRegex(e.ReviewAbort, "absent at the reviewed head"):
+            self.build([finding(path="removed.py")])
+        self.assertEqual([], self.pr.writes)
+
     def test_artifact_receipt_context_and_bundle_tampering_never_publish(self):
         self.build()
         good = json.loads(self.artifact.read_text())

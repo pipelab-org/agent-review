@@ -345,7 +345,9 @@ def claude_result(events, settings, bundle, strategy, head):
                     calls[block["id"]] = relative_read(block.get("input", {}).get("file_path"), head)
             if block.get("type") == "tool_result" and block.get("is_error") is not True:
                 path = calls.get(block.get("tool_use_id"))
-                if path:
+                # Coverage needs only changed files, which are safe paths. Exploring
+                # .git or other unsafe names is not a reason to discard the pass.
+                if path and safe_path(path):
                     opened.add(path)
     output = final.get("structured_output")
     findings = validate_schema(output)
@@ -458,7 +460,8 @@ def codex_progress(home, head, strict=False, model=None):
                 else:
                     success = isinstance(output, str) and ("Exit code: 0" in output or "Process exited with code 0" in output)
                 if success:
-                    opened.update(p for p in calls.get(payload.get("call_id"), []) if p)
+                    # Option words such as -n resolve to unsafe paths; skip them.
+                    opened.update(p for p in calls.get(payload.get("call_id"), []) if p and safe_path(p))
     # Conservative standard-price estimate: no read-cache discounts, plus
     # the reported cache-write surcharge even if already included in input.
     # Official gpt-6-luna model page, checked 2026-10-28: input $0.10 / output

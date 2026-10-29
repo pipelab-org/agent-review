@@ -363,6 +363,8 @@ def validate_locations(result, repo, head):
         path = finding.get("path")
         if not engine.safe_path(path):
             raise ReviewAbort("Invalid finding path")
+        if not engine.git(repo, "ls-tree", head, "--", path):
+            raise ReviewAbort("A finding cites a path absent at the reviewed head; review incomplete")
         raw = engine.git(repo, "show", head + ":" + path, binary=True)
         try:
             lines = raw.decode("utf-8").splitlines()
