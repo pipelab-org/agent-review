@@ -390,11 +390,54 @@ class CodexTests(unittest.TestCase):
                       item("src/elsewhere.py", cwd="file:///other"),
                       item("../outside.py"),
                       item("src/search.py", parsed_cmd=[{"type": "search", "cmd": "rg x", "path": "src/search.py"}]),
-                      item("src/nested.py", cwd="file:///head/src", parsed_cmd=[
+                      item("src/nested.py", cwd="file:///head/src", command=["/bin/bash", "-lc", "cat nested.py"], parsed_cmd=[
                           {"type": "read", "cmd": "cat nested.py", "name": "nested.py", "path": "nested.py"}]),
                       {"type": "response_item", "payload": {"type": "item_completed", "item": item("src/x.py")}}]
             (home / "sessions/rollout.jsonl").write_text("\n".join(json.dumps(v) for v in events))
             self.assertEqual(["src/nested.py", "src/ok.py"], e.codex_progress(home, Path("/head"))[2])
+
+    def test_code_mode_skipped_and_hidden_reads_do_not_supply_coverage(self):
+        # Codex 0.165.0 native fixture: only ALREADY is printed, but both
+        # reads occur in parsed_cmd. The second command never executes.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            item = {"type": "CommandExecution", "cwd": "file:///head", "status": "completed",
+                    "exit_code": 0, "parsed_cmd": [
+                        {"type": "read", "cmd": "cat -- already.py", "path": "already.py"},
+                        {"type": "read", "cmd": "cat -- unread.py", "path": "unread.py"}]}
+            for command in ("cat -- already.py || cat -- unread.py",
+                            "cat -- unread.py > /dev/null",
+                            "cat -- already.py; cat -- unread.py",
+                            "cat -- unread.py | head -n 0",
+                            "cat -- already.py\ncat -- unread.py",
+                            "cat --help unread.py"):
+                with self.subTest(command=command):
+                    item["command"] = ["/bin/bash", "-lc", command]
+                    event = {"type": "event_msg", "payload": {"type": "item_completed", "item": item}}
+                    (home / "sessions/rollout.jsonl").write_text(json.dumps(event))
+                    self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
+                    # Legacy function calls must not bypass the same guard, even
+                    # when operators are adjacent to their operands.
+                    legacy = [
+                        {"type": "response_item", "payload": {"type": "function_call",
+                         "name": "exec_command", "call_id": "r", "arguments": json.dumps(
+                             {"cmd": command.replace(" || ", "||"), "workdir": "/head"})}},
+                        {"type": "response_item", "payload": {"type": "function_call_output",
+                         "call_id": "r", "output": "Process exited with code 0\nALREADY"}}]
+                    (home / "sessions/rollout.jsonl").write_text("\n".join(map(json.dumps, legacy)))
+                    self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
+            item["command"] = ["/head/bash", "-lc", "cat -- unread.py"]
+            event = {"type": "event_msg", "payload": {"type": "item_completed", "item": item}}
+            (home / "sessions/rollout.jsonl").write_text(json.dumps(event))
+            self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
+            for command in (["/bin/bash", "-lc", "cat -- unread.py"],
+                            ["/bin/bash", "-lc", "sed -n '1,9p' unread.py"],
+                            ["cat", "--", "unread.py"]):
+                item["command"] = command
+                event = {"type": "event_msg", "payload": {"type": "item_completed", "item": item}}
+                (home / "sessions/rollout.jsonl").write_text(json.dumps(event))
+                self.assertEqual(["unread.py"], e.codex_progress(home, Path("/head"))[2])
 
     def test_prompts_name_region_only_files(self):
         bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "x\n"},
