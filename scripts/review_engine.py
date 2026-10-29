@@ -398,7 +398,7 @@ def clean_env(settings=None):
 
 
 def region_guidance(bundle, how):
-    """Name changed files sent only as regions; the receipt requires a read of each."""
+    """Name region-only files and request deeper reads without requiring them."""
     paths = [f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") is None]
     if not paths:
         return ""
