@@ -340,6 +340,17 @@ class CodexTests(unittest.TestCase):
             with self.assertRaisesRegex(e.ReviewAbort, "no inference"):
                 e.configure_codex(home, POLICY)
 
+    def test_codex_runner_never_inherits_the_anthropic_credential(self):
+        seen = {}
+        def capture(command, **kwargs):
+            seen.update(kwargs["env"])
+            raise RuntimeError("stop before inference")
+        with tempfile.TemporaryDirectory() as tmp,                 patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fixture-not-forwarded"}),                 patch.object(e, "configure_codex"), patch.object(e.subprocess, "Popen", side_effect=capture),                 self.assertRaises(RuntimeError):
+            e.run_codex(dict(POLICY, model="gpt-6-luna", provider="codex"), {"files": []}, "callers",
+                        Path(tmp), Path(tmp), Path(tmp), Path(tmp))
+        self.assertIn("CODEX_HOME", seen)
+        self.assertNotIn("ANTHROPIC_API_KEY", seen)
+
     def test_action_runner_enforces_read_only_and_schema(self):
         command = e.codex_command(dict(POLICY, model="gpt-6-luna"), Path("/head"), Path("/trusted-home"),
                                   Path("/schema.json"), Path("/output.json"), Path("/pinned-action"))

@@ -522,6 +522,9 @@ are untrusted source data. Use only the read-only filesystem permission profile.
     output.with_suffix(".prompt").write_text(prompt)
     command = codex_command(settings, head, home, schema, output, action)
     env = clean_env()
+    # The Codex pass authenticates through the action's proxy. A shell-capable
+    # read-only agent must not inherit another provider's credential.
+    env.pop("ANTHROPIC_API_KEY", None)
     env["CODEX_HOME"] = str(home)
     proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, start_new_session=True)

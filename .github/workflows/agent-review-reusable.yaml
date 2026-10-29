@@ -208,7 +208,9 @@ jobs:
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
-        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        # A Codex pass can run read-only shell commands and read process environments.
+        # It authenticates through the action's proxy, so it never receives this key.
+        ANTHROPIC_API_KEY: ${{ env.REVIEW_DEPTH != 'codex' && secrets.ANTHROPIC_API_KEY || '' }}
       run: python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

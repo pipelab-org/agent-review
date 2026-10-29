@@ -282,6 +282,17 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("OPENAI_API_KEY", text)
             self.assertIn("Download this run's inference artifact", text)
 
+    def test_codex_depth_step_never_receives_the_anthropic_key(self):
+        # The parent process environment is readable from a same-user child, so the
+        # step itself, not only the engine's subprocess environment, must omit it.
+        infer = next(s for s in self.workflow["jobs"]["review"]["steps"] if s.get("name") == "Review the admitted diff")
+        self.assertEqual("${{ env.REVIEW_DEPTH != 'codex' && secrets.ANTHROPIC_API_KEY || '' }}",
+                         infer["env"]["ANTHROPIC_API_KEY"])
+        self.assertEqual("codex", self.workflow["jobs"]["review"]["env"]["REVIEW_DEPTH"].split("'")[3])
+        for step in self.workflow["jobs"]["review"]["steps"]:
+            if step.get("name") != "Review the admitted diff":
+                self.assertNotIn("ANTHROPIC_API_KEY", json.dumps(step.get("env", {})))
+
     def test_vendor_actions_and_runtime_versions_are_pinned(self):
         for job in self.workflow["jobs"].values():
             for step in job.get("steps", []):
