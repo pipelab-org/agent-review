@@ -358,6 +358,26 @@ class CodexTests(unittest.TestCase):
             with (sessions / "rollout.jsonl").open("a") as f: f.write("\n"+json.dumps(events[-1]))
             self.assertEqual(1, e.codex_progress(home, Path("/head"))[0])
 
+    def test_zsh_wrapper_never_supplies_a_read(self):
+        for shell in ("zsh", "/bin/zsh"):
+            self.assertIsNone(e.codex_plain_read([shell, "-lc", "cat -- src/app.py"]))
+        self.assertEqual("src/app.py", e.codex_plain_read(["/bin/bash", "-lc", "cat -- src/app.py"]))
+
+    def test_single_request_above_the_allowance_aborts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            event = {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 300_000, "output_tokens": 10, "total_tokens": 300_010},
+                "last_token_usage": {"input_tokens": 300_000, "output_tokens": 10, "total_tokens": 300_010}}}}
+            (home / "sessions/rollout.jsonl").write_text(json.dumps(event))
+            with self.assertRaisesRegex(e.ReviewAbort, "exceeded config.max_model_tokens"):
+                e.codex_progress(home, Path("/head"), model="gpt-6.1-terra", request_limit=256_000)
+            # At the allowance it is accepted; without a limit (old callers) it is unchanged.
+            self.assertEqual(1, e.codex_progress(home, Path("/head"), model="gpt-6.1-terra",
+                                                 request_limit=300_000)[0])
+            self.assertEqual(1, e.codex_progress(home, Path("/head"), model="gpt-6.1-terra")[0])
+
     def test_cached_input_bills_at_the_cached_rate(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
