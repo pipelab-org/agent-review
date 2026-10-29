@@ -358,20 +358,32 @@ def publish_review(repo, pr, ctx, policy, plan, result):
     followups.write_completion(os.environ["REVIEW_COMPLETION_PATH"], dict(evidence, digest=digest))
 
 
+UNVERIFIED_LOCATION_NOTE = "_Location could not be confirmed at the reviewed head; listed in the summary only._"
+
+
 def validate_locations(result, repo, head):
+    """Keep a finding whose location cannot be confirmed instead of discarding the review.
+
+    An unsafe path still aborts: it can only come from tampering or prompt injection. A
+    finding that cites a missing file or a line past the end of the file keeps its text,
+    is marked unverified, and never gets an inline anchor, because publish_review anchors
+    only lines present in the changed-file patch. The note makes this idempotent across
+    the inference and publication jobs, which both call this function.
+    """
     for finding in result["findings"]:
         path = finding.get("path")
         if not engine.safe_path(path):
             raise ReviewAbort("Invalid finding path")
-        if not engine.git(repo, "ls-tree", head, "--", path):
-            raise ReviewAbort("A finding cites a path absent at the reviewed head; review incomplete")
-        raw = engine.git(repo, "show", head + ":" + path, binary=True)
-        try:
-            lines = raw.decode("utf-8").splitlines()
-        except UnicodeError:
-            raise ReviewAbort("Finding source is not UTF-8") from None
-        if finding.get("end_line", 0) > len(lines):
-            raise ReviewAbort("Finding location is outside current head source")
+        confirmed = bool(engine.git(repo, "ls-tree", head, "--", path))
+        if confirmed:
+            raw = engine.git(repo, "show", head + ":" + path, binary=True)
+            try:
+                lines = raw.decode("utf-8").splitlines()
+            except UnicodeError:
+                raise ReviewAbort("Finding source is not UTF-8") from None
+            confirmed = finding.get("end_line", 0) <= len(lines)
+        if not confirmed and UNVERIFIED_LOCATION_NOTE not in finding["consequence"]:
+            finding["consequence"] = finding["consequence"].rstrip() + "\n\n" + UNVERIFIED_LOCATION_NOTE
 
 
 def publish_artifact(path, head_dir):

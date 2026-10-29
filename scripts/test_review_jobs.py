@@ -183,9 +183,20 @@ class JobTests(unittest.TestCase):
         record = json.loads((self.root / "completion.json").read_text())
         self.assertEqual("helper.py", record["findings"][0]["path"])
 
-    def test_finding_on_a_path_absent_at_head_names_the_real_cause(self):
-        with self.assertRaisesRegex(e.ReviewAbort, "absent at the reviewed head"):
-            self.build([finding(path="removed.py")])
+    def test_unconfirmed_locations_stay_in_summary_without_discarding_the_review(self):
+        self.build([finding(path="removed.py"), finding(path="app.py", line=900, end_line=900), finding(path="app.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        record = json.loads((self.root / "completion.json").read_text())
+        self.assertEqual(3, len(record["findings"]))
+        notes = {(f["path"], f["line"]): f["body"].count(j.UNVERIFIED_LOCATION_NOTE) for f in record["findings"]}
+        self.assertEqual({("removed.py", 1): 1, ("app.py", 900): 1, ("app.py", 1): 0}, notes)
+        anchored = {(getattr(c, "path", None), getattr(c, "line", None)) for c in self.pr.roots}
+        self.assertNotIn(("removed.py", 1), anchored)
+        self.assertNotIn(("app.py", 900), anchored)
+
+    def test_unsafe_finding_path_still_aborts(self):
+        with self.assertRaisesRegex(e.ReviewAbort, "Invalid finding"):
+            self.build([finding(path="../escape.py")])
         self.assertEqual([], self.pr.writes)
 
     def test_artifact_receipt_context_and_bundle_tampering_never_publish(self):
