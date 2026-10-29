@@ -388,6 +388,8 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(":read-only", command[command.index("--permission-profile")+1])
         self.assertEqual("/schema.json", command[command.index("--output-schema-file")+1])
         self.assertEqual("drop-sudo", command[command.index("--safety-strategy")+1])
+        # The workspace root holds the trusted base checkout; reads must resolve in the PR head.
+        self.assertEqual("/head", command[command.index("--cd")+1])
         self.assertNotIn("--full-auto", command)
         with self.assertRaises(e.ReviewAbort):
             e.codex_command(dict(POLICY, model="unknown"), Path("/head"), Path("/home"),

@@ -14,9 +14,9 @@ Inference jobs have read-only GitHub permissions. A separate publisher validates
 
 ## Required operator policy
 
-The central [.github/pr-agent.toml](.github/pr-agent.toml) retains its filename for compatibility. Each of `review_depth.default`, `review_depth.deep`, and `review_depth.codex` requires `max_turns` and `max_budget_usd`. Neither has a default, and both are intentionally absent from shipped policy. Missing or invalid settings fail before inference with the exact config key to set.
+The central [.github/pr-agent.toml](.github/pr-agent.toml) retains its filename for compatibility. Each of `review_depth.default`, `review_depth.deep`, and `review_depth.codex` requires `max_turns` and `max_budget_usd`. The code has no defaults; the shipped policy sets 40 turns, USD 2 per default or codex pass, and USD 4 per deep pass, so reviews run and incur provider charges once the provider secrets are configured. Removing or invalidating either setting fails before inference with the exact config key to set.
 
-The USD allowance applies **per pass**. A review's configured allowance is its pass count multiplied by that limit. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. Real limits will be selected from measured usage on the evaluation set after owner approval.
+The USD allowance applies **per pass**. A review's configured allowance is its pass count multiplied by that limit. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. The shipped values were approved from measured usage on the evaluation set.
 
 ## Adoption
 

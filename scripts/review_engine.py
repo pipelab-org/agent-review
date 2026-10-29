@@ -482,7 +482,7 @@ def codex_command(settings, head, home, schema, output, action):
     # No shell interpolation. The action supplies the read-only profile and schema.
     return ["node", str(Path(action).resolve() / "dist/main.js"), "run-codex-exec",
             "--prompt", "", "--prompt-file", str(Path(output).with_suffix(".prompt")),
-            "--output-file", str(output), "--codex-home", str(home), "--cd", str(head.parent),
+            "--output-file", str(output), "--codex-home", str(home), "--cd", str(head),
             "--extra-args", '["--json"]', "--output-schema", "", "--output-schema-file", str(schema),
             "--sandbox", "", "--permission-profile", ":read-only", "--model", settings["model"],
             "--effort", settings["reasoning_effort"], "--safety-strategy", "drop-sudo", "--codex-user", ""]
