@@ -245,7 +245,9 @@ def validate_receipt(receipt, settings, bundle, strategy):
     opened = receipt["files_opened"]
     if not isinstance(opened, list) or any(not safe_path(p) for p in opened):
         raise ReviewAbort("Pass file-read receipt is invalid")
-    changed = {f["path"] for f in bundle["files"] if not f["deleted"]}
+    # A changed file whose full text is in the bundle was already in the prompt.
+    # Only files sent as changed regions must be opened through the read tool.
+    changed = {f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") is None}
     if not changed.issubset(set(opened)):
         raise ReviewAbort("Pass never opened every changed file; inspect Read tools and increase approved turn budget")
     return receipt

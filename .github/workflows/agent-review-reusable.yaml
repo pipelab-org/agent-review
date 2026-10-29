@@ -185,7 +185,10 @@ jobs:
         codex-version: 0.165.0
         codex-home: ${{ runner.temp }}/agent-review-codex-home
         output-schema-file: trusted-agent-review/.github/review-output.schema.json
-        safety-strategy: drop-sudo
+        # Setup-only must keep sudo. The engine's run-codex-exec drop-sudo removes it
+        # at launch and starts Codex under setpriv with no_new_privs and no capabilities;
+        # a setup-time drop makes that launch refuse to start.
+        safety-strategy: read-only
       env:
         GITHUB_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
@@ -426,7 +429,10 @@ jobs:
         codex-version: 0.165.0
         codex-home: ${{ runner.temp }}/agent-review-codex-home
         output-schema-file: trusted-agent-review/.github/review-output.schema.json
-        safety-strategy: drop-sudo
+        # Setup-only must keep sudo. The engine's run-codex-exec drop-sudo removes it
+        # at launch and starts Codex under setpriv with no_new_privs and no capabilities;
+        # a setup-time drop makes that launch refuse to start.
+        safety-strategy: read-only
       env:
         GITHUB_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}

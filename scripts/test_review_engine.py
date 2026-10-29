@@ -310,6 +310,22 @@ class ClaudeTests(unittest.TestCase):
             self.assertEqual(1, run.call_count)
 
 
+class CoverageTests(unittest.TestCase):
+    def test_bundled_full_text_counts_as_read_and_regions_still_require_a_read(self):
+        bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "x = 1\n"},
+                            {"path": "src/big.py", "deleted": False, "content": None},
+                            {"path": "src/gone.py", "deleted": True, "content": None}]}
+        r = receipt("bundle")
+        r["files_opened"] = ["src/big.py"]
+        self.assertEqual(r, e.validate_receipt(r, POLICY, bundle, "bundle"))
+        r["files_opened"] = ["src/full.py"]
+        with self.assertRaisesRegex(e.ReviewAbort, "never opened"):
+            e.validate_receipt(r, POLICY, bundle, "bundle")
+        r["files_opened"] = []
+        full_only = {"files": [bundle["files"][0]]}
+        self.assertEqual(r, e.validate_receipt(r, POLICY, full_only, "bundle"))
+
+
 class CodexTests(unittest.TestCase):
     def test_native_rollout_usage_read_success_and_per_pass_cost(self):
         with tempfile.TemporaryDirectory() as tmp:

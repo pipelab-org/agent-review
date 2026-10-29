@@ -322,7 +322,10 @@ class WorkflowTests(unittest.TestCase):
         job = self.workflow["jobs"]["review"]
         action = next(s for s in job["steps"] if s.get("name") == "Set up pinned read-only Codex runtime")
         self.assertEqual(":read-only", action["with"]["permission-profile"])
-        self.assertEqual("drop-sudo", action["with"]["safety-strategy"])
+        # Setup keeps sudo so the engine launch can drop it; the launch itself uses drop-sudo.
+        self.assertEqual("read-only", action["with"]["safety-strategy"])
+        for other in job["steps"]:
+            self.assertNotIn("drop-sudo", json.dumps(other.get("with", {})))
         self.assertEqual("0.165.0", action["with"]["codex-version"])
         self.assertIn("output-schema-file", action["with"])
         self.assertIn("2.1.312", json.dumps(job))
