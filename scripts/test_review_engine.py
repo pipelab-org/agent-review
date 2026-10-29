@@ -401,7 +401,8 @@ class CodexTests(unittest.TestCase):
             with self.assertRaisesRegex(e.ReviewAbort, "fresh token usage"):
                 e.codex_progress(home, Path("/head"), strict=True,
                                  model="gpt-6.1-terra", request_limit=256_000)
-            for kind in sorted(e.CODEX_MODEL_OUTPUT_ITEMS):
+            for kind in ("function_call", "custom_tool_call", "reasoning", "local_shell_call",
+                         "tool_search_call", "web_search_call", "image_generation_call", "compaction"):
                 item = {"type": "response_item", "payload": {"type": kind}}
                 rollout.write_text("\n".join(map(json.dumps, [response, count, item, count])))
                 with self.assertRaisesRegex(e.ReviewAbort, "fresh token usage", msg=kind):
