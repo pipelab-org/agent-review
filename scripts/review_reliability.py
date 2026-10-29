@@ -6,7 +6,7 @@
 Publisher contracts:
 https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api
 https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
-PyGithub 2.10.0 (the pinned image): github.GithubRetry, github.Requester.createException
+PyGithub 2.10.0 (the hash-pinned runtime): github.GithubRetry, github.Requester.createException
 and github.GithubException.RateLimitExceededExceedsMaxWait.
 
 Policy, from the first document: serial requests; at least one second between
@@ -230,8 +230,8 @@ class WaitBudget:
 
 
 def budget_seconds(config=CONFIG):
-    """One provider-call timeout. The review job's 25-minute limit minus its three
-    completion-call timeouts leaves twice this; the rest is job setup and publication."""
+    """One provider-pass timeout from the central operator policy.
+    The workflow's job timeout also bounds setup, inference, reads and publication."""
     return tomllib.loads(Path(config).read_text(encoding="utf-8"))["config"]["ai_timeout"]
 
 
@@ -576,23 +576,9 @@ def github_client(auth, base_url, *, seconds_between_requests, seconds_between_w
 
 @contextlib.contextmanager
 def runtime():
-    """Install the policy for the pinned provider and observe GitHub errors for one run."""
+    """Install the policy for the GitHub client and observe GitHub errors for one run."""
     from github.Requester import Requester
-    from pr_agent.config_loader import get_settings
-    from pr_agent.git_providers.github_provider import GithubProvider
-
-    original_client = GithubProvider._get_github_client
     original_error = Requester.createException
-
-    def policy_client(provider):
-        # The provider validates its auth settings and stores provider.auth. Its own
-        # client enables retries for every method, so build ours from that auth.
-        stock = original_client(provider)
-        stock.close()
-        github = get_settings().github
-        return github_client(provider.auth, provider.base_url,
-                             seconds_between_requests=github.get("seconds_between_requests", 0),
-                             seconds_between_writes=github.get("seconds_between_writes", 1))
 
     def observed(cls, status, headers, output):
         error = original_error(status, headers, output)
@@ -603,12 +589,10 @@ def runtime():
     loggers = [(logging.getLogger(name), logging.getLogger(name).level) for name in ("github", "urllib3")]
     for logger, _ in loggers:
         logger.setLevel(logging.ERROR)
-    GithubProvider._get_github_client = policy_client
     Requester.createException = classmethod(observed)
     try:
         yield
     finally:
-        GithubProvider._get_github_client = original_client
         Requester.createException = classmethod(original_error.__func__)
         for logger, level in loggers:
             logger.setLevel(level)

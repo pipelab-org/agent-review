@@ -18,7 +18,7 @@ import tomllib
 MAX_DATA_BYTES = 65536
 LOCAL_CALL = "./.github/workflows/agent-review-reusable.yaml"
 REMOTE_CALL = "pipelab-org/agent-review/.github/workflows/agent-review-reusable.yaml@"
-EXPECTED_CALLER = r"""name: PR-Agent review
+EXPECTED_CALLER = r"""name: Agentic review
 
 on:
   # Commands run on the default branch; inline replies have independent admission.
@@ -43,7 +43,7 @@ jobs:
       github.event.comment.user.type == 'User' &&
       github.event.comment.author_association == 'MEMBER' &&
       github.event.issue.pull_request &&
-      contains(fromJSON('["/review","/review deep"]'), github.event.comment.body)) ||
+      contains(fromJSON('["/review","/review deep","/review codex"]'), github.event.comment.body)) ||
       (github.event_name == 'pull_request_review_comment' &&
       github.event.action == 'created' &&
       github.run_attempt == '1' &&
