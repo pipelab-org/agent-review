@@ -430,6 +430,32 @@ def save(path, data):
     target.chmod(0o600)
 
 
+def unquoted_shell_syntax(script):
+    """True when bash would expand or reinterpret an unquoted word, so the literal
+    operand shlex returns may name a different file than the one read."""
+    quote, start, i = None, True, 0
+    while i < len(script):
+        char = script[i]
+        if quote == "'":
+            quote = None if char == "'" else quote
+        elif quote == '"':
+            if char == "\\":
+                i += 1
+            elif char == '"':
+                quote = None
+        elif char == "\\":
+            i += 1
+            start = False
+        elif char in "'\"":
+            quote, start = char, False
+        elif char in "*?[{;&|<>()" or (start and char in "~#"):
+            return True
+        else:
+            start = char in " \t"
+        i += 1
+    return quote is not None
+
+
 def codex_plain_read(command):
     """Admit the prompt's literal cat/sed forms, not lossy command summaries."""
     import shlex
@@ -442,6 +468,8 @@ def codex_plain_read(command):
         # failure, or redirect its output. ParsedCommand is display metadata,
         # not proof that each summarized operation ran (pinned parse_command.rs).
         if any(char in script for char in ("$", "`", "\n", "\r")):
+            return None
+        if unquoted_shell_syntax(script):
             return None
         try:
             lexer = shlex.shlex(script, posix=True, punctuation_chars=True)

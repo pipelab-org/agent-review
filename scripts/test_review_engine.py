@@ -396,6 +396,20 @@ class CodexTests(unittest.TestCase):
             (home / "sessions/rollout.jsonl").write_text("\n".join(json.dumps(v) for v in events))
             self.assertEqual(["src/nested.py", "src/ok.py"], e.codex_progress(home, Path("/head"))[2])
 
+    def test_expanded_or_reinterpreted_operands_are_not_literal_reads(self):
+        # Bash expands these words before cat runs, so the literal operand is not
+        # necessarily the file that was read. Quoted forms are literal and stay admitted.
+        for script in ("cat -- pages/[id].tsx", "cat -- a?", "cat -- {x,y}", "cat -- ~",
+                       "cat -- #a", "cat -- ;", "cat -- *", "sed -n 1,5p [ab]",
+                       "cat -- 'a", "cat -- a'b"):
+            with self.subTest(script=script):
+                self.assertIsNone(e.codex_plain_read(["/bin/bash", "-lc", script]))
+        for script, operand in (("cat -- 'pages/[id].tsx'", "pages/[id].tsx"),
+                                ('cat -- "~"', "~"), ("cat -- a\\*", "a*"),
+                                ("sed -n '1,9p' 'x{y}'", "x{y}"), ("cat -- a#b", "a#b")):
+            with self.subTest(script=script):
+                self.assertEqual(operand, e.codex_plain_read(["/bin/bash", "-lc", script]))
+
     def test_code_mode_skipped_and_hidden_reads_do_not_supply_coverage(self):
         # Codex 0.165.0 native fixture: only ALREADY is printed, but both
         # reads occur in parsed_cmd. The second command never executes.
