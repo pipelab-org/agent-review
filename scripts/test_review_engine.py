@@ -79,7 +79,7 @@ class PolicyTests(unittest.TestCase):
     def test_shipped_configuration_sets_approved_limits_and_code_has_no_defaults(self):
         import tomllib
         shipped = tomllib.loads(e.CONFIG.read_text())
-        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 2.0), "codex-deep": (40, 10.0)}
+        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 1.0), "codex-deep": (40, 2.0)}
         for depth in e.DEPTHS:
             table = shipped["review_depth"][depth]
             self.assertEqual(approved[depth], (table["max_turns"], table["max_budget_usd"]))

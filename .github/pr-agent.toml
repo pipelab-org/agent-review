@@ -6,12 +6,13 @@
 # steps, the heaviest Opus pass about 170k tokens and 19 steps. Caps are about
 # twice that, priced from https://platform.claude.com/docs/en/about-claude/pricing
 # (Sonnet 5.5 $2/$10, Opus 5.5 $4/$20 per million input/output tokens).
-# Codex caps follow the same token allowance priced from
-# https://developers.openai.com/api/docs/pricing (checked 2026-10-29):
-# gpt-6.1-sol $2/$10 matches Sonnet, so USD 2; gpt-6-astra $10/$50 is five
-# times Sonnet, so USD 10. Model choice follows OpenAI's Codex model guide,
-# https://learn.chatgpt.com/docs/models : Sol for repeated heavy coding work,
-# Astra for the hardest tasks (start at low effort). Pending their own measurement.
+# Codex uses gpt-6.1-terra (owner choice, 2026-10-29) at
+# https://developers.openai.com/api/docs/pricing rates (checked 2026-10-29):
+# $1/$5, half of Sonnet, so the same token allowance is USD 1 per pass.
+# codex-deep runs xhigh effort; Artificial Analysis reports Terra using about
+# twice the tokens at its higher efforts, so its pass gets USD 2.
+# Effort values: https://developers.openai.com/api/docs/models/gpt-6.1-terra .
+# Pending their own measurement.
 [config]
 max_model_tokens = 90000
 max_output_tokens = 16000
@@ -30,13 +31,13 @@ max_turns = 40
 max_budget_usd = 4.0
 
 [review_depth.codex]
-model = "gpt-6.1-sol"
+model = "gpt-6.1-terra"
 reasoning_effort = "medium"
 max_turns = 40
-max_budget_usd = 2.0
+max_budget_usd = 1.0
 
 [review_depth.codex-deep]
-model = "gpt-6-astra"
-reasoning_effort = "low"
+model = "gpt-6.1-terra"
+reasoning_effort = "xhigh"
 max_turns = 40
-max_budget_usd = 10.0
+max_budget_usd = 2.0
