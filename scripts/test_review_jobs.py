@@ -319,16 +319,21 @@ class WorkflowTests(unittest.TestCase):
             for step in job.get("steps", []):
                 if "uses" in step:
                     self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
-        job = self.workflow["jobs"]["review"]
-        action = next(s for s in job["steps"] if s.get("name") == "Set up pinned read-only Codex runtime")
-        self.assertEqual(":read-only", action["with"]["permission-profile"])
-        # Setup keeps sudo so the engine launch can drop it; the launch itself uses drop-sudo.
-        self.assertEqual("read-only", action["with"]["safety-strategy"])
-        for other in job["steps"]:
-            self.assertNotIn("drop-sudo", json.dumps(other.get("with", {})))
-        self.assertEqual("0.165.0", action["with"]["codex-version"])
-        self.assertIn("output-schema-file", action["with"])
-        self.assertIn("2.1.312", json.dumps(job))
+        # Both jobs that run Codex (review and inline reply) carry their own setup copy.
+        setups = [(name, step) for name, job in self.workflow["jobs"].items() for step in job.get("steps", [])
+                  if "openai/codex-action@" in step.get("uses", "")]
+        self.assertEqual(["reply", "review"], sorted(name for name, _ in setups))
+        for name, action in setups:
+            with self.subTest(job=name):
+                self.assertEqual(":read-only", action["with"]["permission-profile"])
+                # Setup keeps sudo so the engine launch can drop it; the launch itself uses drop-sudo.
+                self.assertEqual("read-only", action["with"]["safety-strategy"])
+                self.assertEqual("0.165.0", action["with"]["codex-version"])
+                self.assertIn("output-schema-file", action["with"])
+        for each_job in self.workflow["jobs"].values():
+            for other in each_job.get("steps", []):
+                self.assertNotIn("drop-sudo", json.dumps(other.get("with", {})))
+        self.assertIn("2.1.312", json.dumps(self.workflow["jobs"]["review"]))
 
     def test_root_base_head_subdirectory_and_trusted_policy_binding(self):
         for name in ("review", "reply", "publish", "publish-reply"):

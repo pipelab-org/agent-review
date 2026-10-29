@@ -358,6 +358,54 @@ class CodexTests(unittest.TestCase):
             with (sessions / "rollout.jsonl").open("a") as f: f.write("\n"+json.dumps(events[-1]))
             self.assertEqual(1, e.codex_progress(home, Path("/head"))[0])
 
+    def test_cached_input_bills_at_the_cached_rate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            usage = {"input_tokens": 1000, "cached_input_tokens": 800, "output_tokens": 10, "total_tokens": 1010}
+            (home / "sessions/rollout.jsonl").write_text(json.dumps(
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage}}}))
+            # gpt-6.1-terra per 1M: input 1.00, cached input 0.05, output 5.00 (OpenAI pricing page).
+            self.assertAlmostEqual((200 * 1.00 + 800 * 0.05 + 10 * 5.00) / 1_000_000,
+                                   e.codex_progress(home, Path("/head"), model="gpt-6.1-terra")[3])
+            # A cached count above the input total cannot make the input charge negative.
+            usage["cached_input_tokens"] = 5000
+            (home / "sessions/rollout.jsonl").write_text(json.dumps(
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage}}}))
+            self.assertAlmostEqual((1000 * 0.05 + 10 * 5.00) / 1_000_000,
+                                   e.codex_progress(home, Path("/head"), model="gpt-6.1-terra")[3])
+
+    def test_code_mode_command_items_supply_reads_only_when_successful(self):
+        def item(path, **over):
+            data = {"type": "CommandExecution", "command": ["/bin/bash", "-lc", "sed -n '1,9p' " + path],
+                    "cwd": "file:///head", "status": "completed", "exit_code": 0,
+                    "parsed_cmd": [{"type": "read", "cmd": "sed -n '1,9p' " + path, "name": path, "path": path}]}
+            data.update(over)
+            return {"type": "event_msg", "payload": {"type": "item_completed", "item": data}}
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            events = [item("src/ok.py"), item("src/failed.py", exit_code=1),
+                      item("src/declined.py", status="declined"),
+                      item("src/elsewhere.py", cwd="file:///other"),
+                      item("../outside.py"),
+                      item("src/search.py", parsed_cmd=[{"type": "search", "cmd": "rg x", "path": "src/search.py"}]),
+                      item("src/nested.py", cwd="file:///head/src", parsed_cmd=[
+                          {"type": "read", "cmd": "cat nested.py", "name": "nested.py", "path": "nested.py"}]),
+                      {"type": "response_item", "payload": {"type": "item_completed", "item": item("src/x.py")}}]
+            (home / "sessions/rollout.jsonl").write_text("\n".join(json.dumps(v) for v in events))
+            self.assertEqual(["src/nested.py", "src/ok.py"], e.codex_progress(home, Path("/head"))[2])
+
+    def test_prompts_name_region_only_files(self):
+        bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "x\n"},
+                            {"path": "src/big.py", "deleted": False, "content": None},
+                            {"path": "src/gone.py", "deleted": True, "content": None}]}
+        text = e.region_guidance(bundle, "with ranged reads")
+        self.assertIn("src/big.py", text)
+        self.assertNotIn("src/full.py", text)
+        self.assertNotIn("src/gone.py", text)
+        self.assertEqual("", e.region_guidance({"files": [bundle["files"][0]]}, "with ranged reads"))
+
     def test_option_words_in_a_cat_read_are_not_receipt_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
