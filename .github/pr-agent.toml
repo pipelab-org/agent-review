@@ -13,8 +13,14 @@
 # twice the tokens at its higher efforts, so its pass gets USD 2.
 # Effort values: https://developers.openai.com/api/docs/models/gpt-6.1-terra .
 # Pending their own measurement.
+# max_model_tokens is the largest allowance billed at standard rates by both
+# providers: OpenAI bills above 272K input tokens at long-context rates
+# (https://developers.openai.com/api/docs/pricing), and Claude 4.6+ models other
+# than Haiku 5.5 bill their full 1M window at standard rates
+# (https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing).
+# At 90000, Pipelock changes touching its largest files could not be reviewed.
 [config]
-max_model_tokens = 90000
+max_model_tokens = 272000
 max_output_tokens = 16000
 ai_timeout = 300
 
