@@ -114,8 +114,8 @@ def prepare(head_dir, output, reply=False):
     scope = followups.scope_for(repo, ctx, proof)
     bundle = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy,
                                  profile["ignore"]["glob"],
-                                 start=scope["from"] if scope["kind"] == "incremental" else None)
-    bundle["instructions"] = profile["review"]["instructions"]
+                                 start=scope["from"] if scope["kind"] == "incremental" else None,
+                                 instructions=profile["review"]["instructions"])
     plan = {"context": ctx, "scope": scope, "bundle": bundle, "kind": "review"}
     engine.save(output, plan)
     # Fixed output values only, never model/PR text in Actions commands.
@@ -209,7 +209,7 @@ def infer_reply(policy, plan, head_dir):
     if (len(finals) != 1 or events[-1] != finals[0] or finals[0].get("subtype") != "success"
             or finals[0].get("is_error") is not False):
         raise ReviewAbort("Reply completion missing, truncated or stopped on a limit")
-    if any(b.get("type") == "tool_use" and b.get("name") != "StructuredOutput" for e in events for b in e.get("message", {}).get("content", [])
+    if any(b.get("type") == "tool_use" and b.get("name") != "StructuredOutput" for e in events for b in (engine.event_message(e).get("content") or [])
            if isinstance(b, dict)):
         raise ReviewAbort("Reply attempted a forbidden tool")
     final = finals[0]
@@ -406,8 +406,8 @@ def publish_artifact(path, head_dir):
         publish_reply(repo, pr, ctx, policy, plan, result)
     elif plan["kind"] == "review":
         expected = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy, profile["ignore"]["glob"],
-                                      start=plan["scope"]["from"] if plan["scope"]["kind"] == "incremental" else None)
-        expected["instructions"] = profile["review"]["instructions"]
+                                      start=plan["scope"]["from"] if plan["scope"]["kind"] == "incremental" else None,
+                                      instructions=profile["review"]["instructions"])
         if expected != plan["bundle"]:
             raise ReviewAbort("Artifact bundle differs from immutable source")
         if result is not None:

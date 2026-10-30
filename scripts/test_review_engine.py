@@ -157,6 +157,53 @@ class BundleTests(unittest.TestCase):
         self.assertIn("new first", file["regions"][0]["content"])
         self.assertIn("new last", file["regions"][1]["content"])
 
+    def test_operator_instructions_count_toward_the_bundle_allowance(self):
+        lines = [f"line {i}" for i in range(3000)]
+        (self.root / "app.py").write_text("\n".join(lines) + "\n")
+        self.base = self.commit()
+        lines[1500] = "changed"
+        (self.root / "app.py").write_text("\n".join(lines) + "\n")
+        self.commit()
+        limited = dict(POLICY, max_model_tokens=40000, max_output_tokens=1000)  # fixture operator budget
+        self.assertIsNotNone(self.bundle(limited)["files"][0]["content"])
+        instructions = "Check every guard. " * 500
+        bundle = self.bundle(limited, instructions=instructions)
+        # Instructions that no longer leave room for the whole file demote it to regions,
+        # and every prompt the passes send then fits instead of failing at launch.
+        self.assertIsNone(bundle["files"][0]["content"])
+        available = limited["max_model_tokens"] - limited["max_output_tokens"]
+        for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
+            self.assertLessEqual(e.token_bound(prompt + json.dumps(e.OUTPUT_SCHEMA)), available)
+
+    def test_each_pass_gets_its_own_focus_and_codex_gets_both(self):
+        (self.root / "app.py").write_text("changed\n")
+        self.commit()
+        bundle = self.bundle()
+        first, second, codex = e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)
+        self.assertIn(e.BOUNDARY_FOCUS, first)
+        self.assertNotIn(e.LIFECYCLE_FOCUS, first)
+        self.assertIn(e.LIFECYCLE_FOCUS, second)
+        self.assertNotIn(e.BOUNDARY_FOCUS, second)
+        self.assertIn(e.BOUNDARY_FOCUS, codex)
+        self.assertIn(e.LIFECYCLE_FOCUS, codex)
+
+    def test_prompts_state_the_schema_findings_cap(self):
+        (self.root / "app.py").write_text("changed\n")
+        self.commit()
+        bundle = self.bundle()
+        cap = f"Return at most {e.MAX_FINDINGS} findings"
+        self.assertEqual(e.MAX_FINDINGS, e.OUTPUT_SCHEMA["properties"]["findings"]["maxItems"])
+        for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
+            self.assertIn(cap, prompt)
+
+    def test_prompts_carry_operator_instructions_once(self):
+        (self.root / "app.py").write_text("changed\n")
+        self.commit()
+        bundle = self.bundle(instructions="UNIQUE-OPERATOR-CRITERIA")
+        for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
+            self.assertEqual(1, prompt.count("UNIQUE-OPERATOR-CRITERIA"))
+            self.assertIn("Operator review criteria:", prompt)
+
     def test_diff_cannot_fit_is_incomplete_not_clean(self):
         (self.root / "app.py").write_text("new content " * 1000)
         self.commit()
@@ -258,6 +305,14 @@ class ClaudeTests(unittest.TestCase):
         # A failed or missing read is not counted, and the summary reports the file.
         self.assertEqual([], parsed["receipt"]["files_opened"])
         self.assertEqual(["src/app.py"], e.unopened_regions(BUNDLE, [parsed["receipt"]]))
+
+    def test_text_message_events_are_tolerated_without_crediting_reads(self):
+        events = transcript()
+        # Claude Code stream-json can emit an event whose message is plain text.
+        events[1:1] = [{"type": "system", "message": "context compacted"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
+        self.assertEqual(["src/app.py"], parsed["receipt"]["files_opened"])
 
     def test_provider_stops_invalid_schema_model_drift_and_tools_fail_closed(self):
         for subtype in ("error_max_turns", "error_max_budget_usd", "error_during_execution", "error_max_structured_output_retries"):
