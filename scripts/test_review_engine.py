@@ -285,6 +285,14 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual([], parsed["receipt"]["files_opened"])
         self.assertEqual(["src/app.py"], e.unopened_regions(BUNDLE, [parsed["receipt"]]))
 
+    def test_text_message_events_are_tolerated_without_crediting_reads(self):
+        events = transcript()
+        # Claude Code stream-json can emit an event whose message is plain text.
+        events[1:1] = [{"type": "system", "message": "context compacted"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            parsed = e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
+        self.assertEqual(["src/app.py"], parsed["receipt"]["files_opened"])
+
     def test_provider_stops_invalid_schema_model_drift_and_tools_fail_closed(self):
         for subtype in ("error_max_turns", "error_max_budget_usd", "error_during_execution", "error_max_structured_output_retries"):
             events = transcript()

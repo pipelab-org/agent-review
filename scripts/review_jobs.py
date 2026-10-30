@@ -209,7 +209,7 @@ def infer_reply(policy, plan, head_dir):
     if (len(finals) != 1 or events[-1] != finals[0] or finals[0].get("subtype") != "success"
             or finals[0].get("is_error") is not False):
         raise ReviewAbort("Reply completion missing, truncated or stopped on a limit")
-    if any(b.get("type") == "tool_use" and b.get("name") != "StructuredOutput" for e in events for b in e.get("message", {}).get("content", [])
+    if any(b.get("type") == "tool_use" and b.get("name") != "StructuredOutput" for e in events for b in (engine.event_message(e).get("content") or [])
            if isinstance(b, dict)):
         raise ReviewAbort("Reply attempted a forbidden tool")
     final = finals[0]

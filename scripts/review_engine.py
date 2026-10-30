@@ -321,6 +321,12 @@ def relative_read(path, head):
         return None
 
 
+def event_message(event):
+    """The event's message object; stream-json also emits events whose message is text."""
+    message = event.get("message") if isinstance(event, dict) else None
+    return message if isinstance(message, dict) else {}
+
+
 def claude_result(events, settings, bundle, strategy, head):
     results = [e for e in events if e.get("type") == "result"]
     if len(results) != 1 or events[-1] != results[0]:
@@ -333,7 +339,7 @@ def claude_result(events, settings, bundle, strategy, head):
         raise ReviewAbort("Claude transcript does not attest the configured model")
     opened, calls = set(), {}
     for event in events:
-        usage = event.get("message", {}).get("usage")
+        usage = event_message(event).get("usage")
         if usage is not None:
             # Anthropic Messages usage contract includes cached input separately.
             # https://platform.claude.com/docs/en/api/messages
@@ -345,7 +351,7 @@ def claude_result(events, settings, bundle, strategy, head):
                 raise ReviewAbort("Claude request exceeded config.max_model_tokens; review incomplete")
             if usage.get("output_tokens", 0) > settings["max_output_tokens"]:
                 raise ReviewAbort("Claude request exceeded config.max_output_tokens; review incomplete")
-        content = event.get("message", {}).get("content", [])
+        content = event_message(event).get("content", [])
         if not isinstance(content, list):
             continue
         for block in content:
