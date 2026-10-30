@@ -44,7 +44,10 @@ Missing context alone is not a finding.
 Report file and line at head, trigger, consequence, repair and confidence. Rank by confidence.
 Read every available changed file, then explore related code. Do not execute repository code.
 Return only the requested JSON object. Findings are advice, not approval or proof of safety.
-"""
+""" + (
+    # The schema rejects a longer list; unstated, a large change produced seven findings,
+    # the CLI's one structured-output retry was exhausted and the whole pass was lost.
+    f"Return at most {MAX_FINDINGS} findings; if you have more, keep the highest-confidence ones.\n")
 # Each pass investigates a different failure family; identical passes repeated one search.
 BOUNDARY_FOCUS = """
 This pass: investigate changed decisions and their boundary inputs. Trace where actual callers

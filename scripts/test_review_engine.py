@@ -187,6 +187,15 @@ class BundleTests(unittest.TestCase):
         self.assertIn(e.BOUNDARY_FOCUS, codex)
         self.assertIn(e.LIFECYCLE_FOCUS, codex)
 
+    def test_prompts_state_the_schema_findings_cap(self):
+        (self.root / "app.py").write_text("changed\n")
+        self.commit()
+        bundle = self.bundle()
+        cap = f"Return at most {e.MAX_FINDINGS} findings"
+        self.assertEqual(e.MAX_FINDINGS, e.OUTPUT_SCHEMA["properties"]["findings"]["maxItems"])
+        for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
+            self.assertIn(cap, prompt)
+
     def test_prompts_carry_operator_instructions_once(self):
         (self.root / "app.py").write_text("changed\n")
         self.commit()
