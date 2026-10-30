@@ -157,6 +157,32 @@ class BundleTests(unittest.TestCase):
         self.assertIn("new first", file["regions"][0]["content"])
         self.assertIn("new last", file["regions"][1]["content"])
 
+    def test_operator_instructions_count_toward_the_bundle_allowance(self):
+        lines = [f"line {i}" for i in range(3000)]
+        (self.root / "app.py").write_text("\n".join(lines) + "\n")
+        self.base = self.commit()
+        lines[1500] = "changed"
+        (self.root / "app.py").write_text("\n".join(lines) + "\n")
+        self.commit()
+        limited = dict(POLICY, max_model_tokens=40000, max_output_tokens=1000)  # fixture operator budget
+        self.assertIsNotNone(self.bundle(limited)["files"][0]["content"])
+        instructions = "Check every guard. " * 500
+        bundle = self.bundle(limited, instructions=instructions)
+        # Instructions that no longer leave room for the whole file demote it to regions,
+        # and every prompt the passes send then fits instead of failing at launch.
+        self.assertIsNone(bundle["files"][0]["content"])
+        available = limited["max_model_tokens"] - limited["max_output_tokens"]
+        for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
+            self.assertLessEqual(e.token_bound(prompt + json.dumps(e.OUTPUT_SCHEMA)), available)
+
+    def test_prompts_carry_operator_instructions_once(self):
+        (self.root / "app.py").write_text("changed\n")
+        self.commit()
+        bundle = self.bundle(instructions="UNIQUE-OPERATOR-CRITERIA")
+        for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
+            self.assertEqual(1, prompt.count("UNIQUE-OPERATOR-CRITERIA"))
+            self.assertIn("Operator review criteria:", prompt)
+
     def test_diff_cannot_fit_is_incomplete_not_clean(self):
         (self.root / "app.py").write_text("new content " * 1000)
         self.commit()
