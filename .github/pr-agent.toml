@@ -24,9 +24,12 @@ max_model_tokens = 272000
 max_output_tokens = 16000
 ai_timeout = 300
 
+# High effort: at medium, Sonnet answered from the bundle in 2-7 turns and opened 0-2 files;
+# at high it traced producers and consumers (10-37 turns) and recall rose from 2/6 to 5/6 on
+# historical known-bug changes while each review stayed between $0.09 and $1.73.
 [review_depth.default]
 model = "anthropic/claude-sonnet-5-5"
-reasoning_effort = "medium"
+reasoning_effort = "high"
 max_turns = 40
 max_budget_usd = 2.0
 

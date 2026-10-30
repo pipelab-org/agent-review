@@ -175,6 +175,18 @@ class BundleTests(unittest.TestCase):
         for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
             self.assertLessEqual(e.token_bound(prompt + json.dumps(e.OUTPUT_SCHEMA)), available)
 
+    def test_each_pass_gets_its_own_focus_and_codex_gets_both(self):
+        (self.root / "app.py").write_text("changed\n")
+        self.commit()
+        bundle = self.bundle()
+        first, second, codex = e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)
+        self.assertIn(e.BOUNDARY_FOCUS, first)
+        self.assertNotIn(e.LIFECYCLE_FOCUS, first)
+        self.assertIn(e.LIFECYCLE_FOCUS, second)
+        self.assertNotIn(e.BOUNDARY_FOCUS, second)
+        self.assertIn(e.BOUNDARY_FOCUS, codex)
+        self.assertIn(e.LIFECYCLE_FOCUS, codex)
+
     def test_prompts_carry_operator_instructions_once(self):
         (self.root / "app.py").write_text("changed\n")
         self.commit()
