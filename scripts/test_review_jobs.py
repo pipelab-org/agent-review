@@ -414,6 +414,10 @@ class JobTests(unittest.TestCase):
         self.assertEqual({"minimizeComment"}, {name for name, _ in calls})
         self.assertTrue(all(data["classifier"] == "OUTDATED" for _, data in calls))
         self.assertEqual(old, f.parse_record(status, self.pr.comments))
+        # The run's own status, at exactly status_id, must stay visible for the failure notifier.
+        calls.clear()
+        j.collapse_earlier(self.pr, status.id, summary.id, {123: old})
+        self.assertEqual(set(), {data["subjectId"] for _, data in calls})
 
     def test_full_review_omitting_a_finding_keeps_its_earlier_summary_visible(self):
         hidden = set()
