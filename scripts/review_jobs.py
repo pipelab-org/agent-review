@@ -355,7 +355,7 @@ def publish_review(repo, pr, ctx, policy, plan, result):
     if not followups.identity(actual.user, followups.BOT) or actual.body != body:
         raise ReviewAbort("Success publication could not be verified")
     followups.write_completion(os.environ["REVIEW_COMPLETION_PATH"], dict(evidence, digest=digest))
-    collapse_earlier(pr, status.id, summary.id, proof, scope["kind"] == "full")
+    collapse_earlier(pr, status.id, summary.id, proof)
 
 
 def overlap_groups(findings, indexes):
@@ -431,13 +431,12 @@ def summary_text(ctx, scope, bundle, result, findings, placement):
     return text + "\n\n<details><summary>Review details</summary>\n\n" + details + "\n\n</details>"
 
 
-def collapse_earlier(pr, status_id, summary_id, proof, full):
+def collapse_earlier(pr, status_id, summary_id, proof):
     """Hide superseded reviewer comments backed by verified completion records.
 
-    Earlier success statuses are bookkeeping and always qualify. Earlier summaries
-    qualify only after a full review, which restates every finding and coverage gap at
-    this head; an incremental review covers only the delta, so older summaries hold the
-    only text of their findings and gaps and stay visible.
+    Only earlier success statuses qualify; they are bookkeeping. Earlier summaries stay
+    visible: a later review that omits a finding or a coverage gap does not establish
+    that it was resolved, even when the later scope is full.
     GitHub's minimizeComment changes visibility only, never the body, so digest-bound
     records stay verifiable. It is cosmetic: a refusal leaves remaining comments visible and never
     fails a review that already published. This run's status stays visible because
@@ -453,8 +452,6 @@ def collapse_earlier(pr, status_id, summary_id, proof, full):
             if record is None or proof.get(record["run_id"]) != record:
                 continue
             eligible.add(comment.id)
-            if full:
-                eligible.add(record["summary"])
         for comment in comments.values():
             if (comment.id == summary_id or comment.id >= status_id
                     or not followups.identity(comment.user, followups.BOT)

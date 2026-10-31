@@ -407,16 +407,30 @@ class JobTests(unittest.TestCase):
         pending = Comment(52, "<!-- agent-review-notice:v1 run=9 -->\nPublication pending", NS(**f.BOT), {"node_id": "PENDING"})
         later = Comment(500, status.body, NS(**f.BOT), {"node_id": "LATER"})
         self.pr.comments.update({50: other, 51: human, 52: pending, 500: later})
-        j.collapse_earlier(self.pr, 400, 401, {}, True)
+        j.collapse_earlier(self.pr, 400, 401, {})
         self.assertEqual([], calls, "a parseable record is not immutable workflow proof")
-        j.collapse_earlier(self.pr, 400, 401, {123: old}, True)
-        self.assertEqual({"STATUS", "SUMMARY"}, {data["subjectId"] for _, data in calls})
+        j.collapse_earlier(self.pr, 400, 401, {123: old})
+        self.assertEqual({"STATUS"}, {data["subjectId"] for _, data in calls})
         self.assertEqual({"minimizeComment"}, {name for name, _ in calls})
         self.assertTrue(all(data["classifier"] == "OUTDATED" for _, data in calls))
-        calls.clear()
-        j.collapse_earlier(self.pr, 400, 401, {123: old}, False)
-        self.assertEqual({"STATUS"}, {data["subjectId"] for _, data in calls})
         self.assertEqual(old, f.parse_record(status, self.pr.comments))
+
+    def test_full_review_omitting_a_finding_keeps_its_earlier_summary_visible(self):
+        hidden = set()
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
+        self.build([finding(path="helper.py", mechanism="Only copy of this advice")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+        status.raw_data["node_id"] = "OLD-STATUS"
+        self.pr.comments[old["summary"]].raw_data["node_id"] = "OLD-SUMMARY"
+        self.advance_head("app.py")
+        full = {"kind": "full", "from": self.pr.base.sha, "to": self.pr.head.sha, "full_head": True, "parent": None}
+        with patch.object(j, "records", return_value={123: old}), \
+                patch.object(j.followups, "scope_for", return_value=full):
+            self.build()
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual({"OLD-STATUS"}, hidden)
 
     def test_incremental_review_keeps_every_earlier_summary_visible(self):
         hidden = set()
