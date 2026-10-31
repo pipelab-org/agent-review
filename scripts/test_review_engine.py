@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -79,7 +80,7 @@ class PolicyTests(unittest.TestCase):
     def test_shipped_configuration_sets_approved_limits_and_code_has_no_defaults(self):
         import tomllib
         shipped = tomllib.loads(e.CONFIG.read_text())
-        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 1.0), "codex-deep": (40, 2.0)}
+        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 2.0), "codex-deep": (40, 2.0)}
         for depth in e.DEPTHS:
             table = shipped["review_depth"][depth]
             self.assertEqual(approved[depth], (table["max_turns"], table["max_budget_usd"]))
@@ -95,6 +96,16 @@ class PolicyTests(unittest.TestCase):
         # Every shipped Codex model has a sourced price, so no shipped depth fails closed on cost.
         for depth in ("codex", "codex-deep"):
             self.assertIn(shipped["review_depth"][depth]["model"], e.CODEX_PRICES)
+
+    def test_documented_allowances_match_shipped_policy(self):
+        expected = {depth: e.policy(depth)["max_budget_usd"] for depth in e.DEPTHS}
+        for path in ("README.md", "docs/agent-review.md"):
+            with self.subTest(path=path):
+                text = (e.ROOT / path).read_text()
+                entries = re.findall(
+                    r"\bUSD (\d+(?:\.\d+)?) per (default|deep|codex|codex-deep) pass\b", text)
+                self.assertEqual(len(expected), len(entries), "Document each depth's allowance once")
+                self.assertEqual(expected, {depth: float(amount) for amount, depth in entries})
 
     def test_command_routing_is_exact(self):
         for command, depth in (("/review", "default"), ("/review deep", "deep"), ("/review codex", "codex"),
