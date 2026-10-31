@@ -351,7 +351,7 @@ class JobTests(unittest.TestCase):
         self.pr.comments[later.id] = later
         calls.clear()
         j.collapse_earlier(self.pr, status.id, summary.id)
-        self.assertEqual({"OLD", "STATUS"}, {data["subjectId"] for _, data in calls})
+        self.assertEqual({"OLD"}, {data["subjectId"] for _, data in calls})
 
     def test_collapse_refusal_never_fails_a_published_review(self):
         def refuse(*_):
@@ -361,6 +361,42 @@ class JobTests(unittest.TestCase):
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
         self.assertTrue((self.root / "completion.json").is_file())
+
+    def test_failed_completion_upload_keeps_the_notifier_warning_visible(self):
+        import io
+        hidden = set()
+        create = self.pr.create_issue_comment
+        def create_with_node(body):
+            comment = create(body)
+            comment.raw_data["node_id"] = str(comment.id)
+            return comment
+        self.pr.create_issue_comment = create_with_node
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
+        self.build([finding(path="app.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+
+        # Run the shipped notifier as it runs after the completion upload fails.
+        workflow = yaml.load((Path(__file__).resolve().parents[1] /
+                              ".github/workflows/agent-review-reusable.yaml").read_text(), Loader=yaml.BaseLoader)
+        script = workflow["jobs"]["notify-failure"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        def request(req):
+            if req.full_url.endswith("/pulls/1"):
+                value = {"state": "open", "head": {"sha": self.pr.head.sha, "repo": {"full_name": self.repo.full_name, "fork": False}},
+                         "base": {"sha": self.pr.base.sha, "repo": {"full_name": self.repo.full_name}}}
+            elif req.method == "GET":
+                value = [{"id": c.id, "body": c.body, "user": vars(c.user)} for c in self.pr.comments.values()]
+            else:
+                self.assertEqual("PATCH", req.method)
+                self.assertTrue(req.full_url.endswith("/" + str(status.id)))
+                status.edit(json.loads(req.data)["body"])
+                value = {"id": status.id}
+            return io.BytesIO(json.dumps(value).encode())
+        with patch.dict(os.environ, {"GH_TOKEN": "fixture", "ADMISSION_RESULT": "success"}), \
+                patch("urllib.request.urlopen", side_effect=request):
+            exec(compile(script, "<trusted-notifier>", "exec"), {})
+        self.assertIn("Treat this run as incomplete", status.body)
+        self.assertNotIn(str(status.id), hidden)
 
 
 class WorkflowTests(unittest.TestCase):

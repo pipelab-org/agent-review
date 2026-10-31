@@ -432,18 +432,19 @@ COLLAPSIBLE_PREFIXES = ("<!-- agent-review-status:v1", "<!-- agent-review-notice
 
 
 def collapse_earlier(pr, status_id, summary_id):
-    """Hide this run's status line and earlier reviewer comments as outdated.
+    """Hide earlier reviewer comments as outdated.
 
     GitHub's minimizeComment changes visibility only, never the body, so digest-bound
     records stay verifiable. It is cosmetic: a refusal leaves comments visible and never
-    fails a review that already published. Comments created after this run's status
-    belong to a concurrent run and are left alone.
+    fails a review that already published. This run's status stays visible because
+    a later upload failure makes the notifier edit it into an incomplete warning.
+    Comments created after this run's status belong to a concurrent run and stay visible.
     Source: https://docs.github.com/en/graphql/reference/mutations#minimizecomment
     """
     try:
         for comment in pr.get_issue_comments():
             body = comment.body if isinstance(comment.body, str) else ""
-            if (comment.id == summary_id or comment.id > status_id
+            if (comment.id == summary_id or comment.id >= status_id
                     or not followups.identity(comment.user, followups.BOT)
                     or not (body.startswith(COLLAPSIBLE_PREFIXES) or publish.RESULT_MARKER in body)):
                 continue
