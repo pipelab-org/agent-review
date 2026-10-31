@@ -310,6 +310,18 @@ class JobTests(unittest.TestCase):
         j.publish_artifact(self.artifact, self.head_dir)
         self.assertIn("| a \\| b c |", self.summary())
 
+    def test_table_location_and_raw_html_title_keep_the_row_intact(self):
+        title = "literal </td></tr></table><details><summary>Hidden</summary>"
+        self.build([finding(path="helper|table.py", title=title)])
+        j.publish_artifact(self.artifact, self.head_dir)
+        row = next(line for line in self.summary().splitlines() if line.startswith("| high |"))
+        self.assertIn("| `helper\\|table.py:1` | below |", row)
+        self.assertNotIn("<", row)
+        self.assertIn("&lt;/td&gt;", row)
+        self.assertEqual(r"a\\\|b", j.cell(r"a\|b"))
+        self.assertEqual("`` a`b ``", j.code("a`b"))
+        self.assertEqual(r"`a\nb`", j.code("a\nb"))
+
     def test_overlapping_findings_share_one_thread_and_keep_both_records(self):
         self.build([finding(path="app.py", title="First", mechanism="One mechanism"),
                     finding(path="app.py", title="Second", mechanism="Another mechanism", confidence="low")])

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 from pathlib import Path
@@ -387,11 +388,13 @@ def inline_comment(group):
 
 
 def code(text):
-    return "`" + text.replace("`", "'") + "`"
+    text = text.replace("\r", r"\r").replace("\n", r"\n")
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    return fence + (" " + text + " " if "`" in text else text) + fence
 
 
 def cell(text):
-    return " ".join(text.split()).replace("|", "\\|")
+    return html.escape(" ".join(text.split()), quote=False).replace("\\", "\\\\").replace("|", "\\|")
 
 
 WHERE = {"inline": "inline thread", "earlier": "earlier thread", "summary": "below"}
@@ -407,7 +410,7 @@ def summary_text(ctx, scope, bundle, result, findings, placement):
             counts[item["confidence"]] = counts.get(item["confidence"], 0) + 1
         tally = ", ".join(f"{counts[c]} {c}" for c in ("high", "medium", "low") if c in counts)
         noun = "finding" if len(findings) == 1 else "findings"
-        rows = [f"| {item['confidence']} | {cell(f['title'])} | {code(f['path'] + ':' + str(f['line']))} | {WHERE[where]} |"
+        rows = [f"| {item['confidence']} | {cell(f['title'])} | {code(f['path'] + ':' + str(f['line'])).replace('|', chr(92) + '|')} | {WHERE[where]} |"
                 for item, f, where in zip(result["findings"], findings, placement)]
         text = (f"**AI review:** {len(findings)} {noun} ({tally}).\n\n"
                 "| Confidence | Finding | Location | Discussion |\n|---|---|---|---|\n" + "\n".join(rows))
