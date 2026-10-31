@@ -596,6 +596,87 @@ CODEX_MODEL_OUTPUT_ITEMS = frozenset((
     "web_search_call", "image_generation_call", "compaction"))
 
 
+# Codex's own error classification, never provider text. Variant names and wire
+# shape (a snake_case string, or a one-key object carrying http_status_code):
+# https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/protocol/src/codex_error_info.rs
+CODEX_ERROR_CAUSES = {
+    "rate_limit_exceeded": "OpenAI rate limit; request the review again after it resets",
+    "usage_limit_exceeded": "OpenAI usage limit; request the review again after it resets",
+    "flex_unavailable": "OpenAI capacity unavailable; request the review again later",
+    "server_overloaded": "OpenAI server overloaded; request the review again later",
+    "http_connection_failed": "OpenAI connection failed; request the review again",
+    "response_stream_connection_failed": "OpenAI response stream failed to connect; request the review again",
+    "response_stream_disconnected": "OpenAI response stream disconnected; request the review again",
+    "response_too_many_failed_attempts": "OpenAI requests kept failing; request the review again",
+    "internal_server_error": "OpenAI server error; request the review again",
+    "unauthorized": "OpenAI rejected the API key; check the OPENAI_API_KEY secret",
+    "model_not_found": "configured Codex model is unavailable to this OpenAI key",
+    "bad_request": "OpenAI rejected the request",
+    "invalid_prompt": "OpenAI rejected the prompt",
+    "context_window_exceeded": "Codex context window exceeded",
+    "session_budget_exceeded": "Codex session budget exceeded",
+    "cyber_policy": "OpenAI policy refusal",
+    "bio_policy": "OpenAI policy refusal",
+    "misalignment_policy_violation": "OpenAI policy refusal",
+    "sandbox_error": "Codex read-only sandbox refused a command",
+    "too_many_denials": "Codex read-only sandbox refused too many commands",
+    "active_turn_not_steerable": "unclassified Codex error; inspect the Actions log",
+    "thread_rollback_failed": "unclassified Codex error; inspect the Actions log",
+    "other": "unclassified Codex error; inspect the Actions log",
+}
+
+
+def codex_error_cause(error):
+    """Map a recorded Codex error object to a fixed operator message, or None."""
+    info = error.get("codex_error_info") if isinstance(error, dict) else None
+    status = None
+    if isinstance(info, dict) and len(info) == 1:
+        (info, detail), = info.items()
+        code = detail.get("http_status_code") if isinstance(detail, dict) else None
+        status = code if type(code) is int and 100 <= code <= 599 else None
+    if not isinstance(info, str) or info not in CODEX_ERROR_CAUSES:
+        return None
+    suffix = f", HTTP {status}" if status else ""
+    return f"{CODEX_ERROR_CAUSES[info]} (codex_error_info={info}{suffix}); no paid retry"
+
+
+def codex_failure_cause(home, ignore=frozenset()):
+    """The first classified error this pass recorded, or None; never raises.
+
+    A best-effort diagnostic must not replace the fixed failure message, so
+    unreadable files and non-object records count as no evidence. The first
+    error matches codex_progress, which aborts on the first error event.
+    Rollouts in `ignore` predate this pass, so a shared home cannot lend an
+    earlier pass's cause to a later failure.
+    """
+    try:
+        paths = sorted(Path(home).glob("sessions/**/*.jsonl"))
+    except OSError:
+        return None
+    for path in paths:
+        if path in ignore:
+            continue
+        try:
+            lines = path.read_text().splitlines()
+        except (OSError, ValueError):  # ValueError includes UnicodeDecodeError
+            continue
+        for raw in lines:
+            try:
+                event = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if not isinstance(payload, dict) or event.get("type") != "event_msg":
+                continue
+            # protocol.rs: ErrorEvent carries codex_error_info directly; TaskComplete under "error".
+            error = payload if payload.get("type") == "error" else (
+                payload.get("error") if payload.get("type") == "task_complete" else None)
+            cause = codex_error_cause(error)
+            if cause:
+                return cause
+    return None
+
+
 def codex_progress(home, head, strict=False, model=None, request_limit=None):
     """Read native rollout evidence, never model-authored receipt assertions.
 
@@ -617,7 +698,8 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None):
                 continue  # concurrently written lines are inspected again on the final read
             payload = event.get("payload", {})
             if event.get("type") == "event_msg" and payload.get("type") == "error":
-                raise ReviewAbort("Codex reported an API or runtime error; pass incomplete")
+                raise ReviewAbort(codex_error_cause(payload)
+                                  or "Codex reported an API or runtime error; pass incomplete")
             if event.get("type") == "turn_context":
                 models.add(payload.get("model"))
             # Pinned core/src/session/turn.rs emits the completion token_count after
@@ -767,6 +849,7 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace):
         raise ReviewAbort("Codex prompt exceeds config.max_model_tokens")
     output.with_suffix(".prompt").write_text(prompt)
     command = codex_command(settings, head, home, schema, output, action)
+    earlier = frozenset(Path(home).glob("sessions/**/*.jsonl"))
     env = clean_env()
     # The Codex pass authenticates through the action's proxy. A shell-capable
     # read-only agent must not inherit another provider's credential.
@@ -794,7 +877,8 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace):
             if not chunk:
                 selector.unregister(proc.stdout)
         if proc.wait(timeout=max(deadline - time.monotonic(), 0)) != 0:
-            raise ReviewAbort("Codex action failed; inspect provider account, read-only sandbox and schema")
+            raise ReviewAbort(codex_failure_cause(home, earlier)
+                              or "Codex action failed; inspect provider account, read-only sandbox and schema")
     except BaseException:
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)

@@ -424,6 +424,100 @@ class CodexTests(unittest.TestCase):
             self.assertIsNone(e.codex_plain_read([shell, "-lc", "cat -- src/app.py"]))
         self.assertEqual("src/app.py", e.codex_plain_read(["/bin/bash", "-lc", "cat -- src/app.py"]))
 
+    def test_codex_error_cause_uses_codex_classification_never_provider_text(self):
+        secret = "provider body req_fixture-only"
+        self.assertEqual("OpenAI rate limit; request the review again after it resets "
+                         "(codex_error_info=rate_limit_exceeded); no paid retry",
+                         e.codex_error_cause({"message": secret, "codex_error_info": "rate_limit_exceeded"}))
+        disconnected = e.codex_error_cause({"message": secret, "codex_error_info": {
+            "response_stream_disconnected": {"http_status_code": 502}}})
+        self.assertIn("codex_error_info=response_stream_disconnected, HTTP 502", disconnected)
+        # Status is a published integer range; anything else is dropped, not echoed.
+        for code in (None, 99, 600, "502", True):
+            cause = e.codex_error_cause({"codex_error_info": {"http_connection_failed": {"http_status_code": code}}})
+            self.assertTrue(cause.startswith("OpenAI connection failed"))
+            self.assertNotIn("HTTP", cause)
+        self.assertIn("unclassified Codex error", e.codex_error_cause({"codex_error_info": "other"}))
+        for value in ({"codex_error_info": "not_a_variant"}, {"codex_error_info": {"a": {}, "b": {}}},
+                      {"codex_error_info": ["rate_limit_exceeded"]}, {"message": secret}, None, "other"):
+            self.assertIsNone(e.codex_error_cause(value))
+        for cause in map(e.codex_error_cause, ({"codex_error_info": k} for k in e.CODEX_ERROR_CAUSES)):
+            self.assertNotIn(secret, cause)
+
+    def test_codex_failure_cause_reads_the_last_recorded_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertIsNone(e.codex_failure_cause(home))
+            (home / "sessions/2026/10/30").mkdir(parents=True)
+            events = [
+                {"type": "event_msg", "payload": {"type": "error", "message": "x", "codex_error_info": "server_overloaded"}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": None,
+                 "error": {"message": "stream disconnected before completion", "codex_error_info": "unauthorized"}}},
+            ]
+            (home / "sessions/2026/10/30/rollout.jsonl").write_text(
+                "\n".join(json.dumps(v) for v in events) + "\n{truncated")
+            cause = e.codex_failure_cause(home)
+            # First classified error, matching codex_progress, which aborts on the first error event.
+            self.assertTrue(cause.startswith("OpenAI server overloaded"))
+            self.assertNotIn("stream disconnected", cause)
+            # A turn that completed without an error object leaves no cause.
+            (home / "sessions/2026/10/30/rollout.jsonl").write_text(json.dumps(
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "done"}}))
+            self.assertIsNone(e.codex_failure_cause(home))
+
+    def test_codex_failure_cause_never_raises_on_bad_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            classified = json.dumps({"type": "event_msg", "payload": {"type": "error", "codex_error_info": "unauthorized"}})
+            (home / "sessions/a.jsonl").write_text('null\n[]\n5\n"text"\n' + "[" * 100000 + "\n")
+            (home / "sessions/b.jsonl").write_bytes(b"\xff\xfe not utf-8\n")
+            self.assertIsNone(e.codex_failure_cause(home))
+            (home / "sessions/c.jsonl").write_text(classified)
+            self.assertTrue(e.codex_failure_cause(home).startswith("OpenAI rejected the API key"))
+            (home / "sessions/d.jsonl").mkdir()  # an unreadable entry matching the glob
+            self.assertTrue(e.codex_failure_cause(home).startswith("OpenAI rejected the API key"))
+            # A rollout from an earlier pass in a shared home is not this pass's cause.
+            self.assertIsNone(e.codex_failure_cause(home, frozenset({home / "sessions/c.jsonl"})))
+
+    def test_codex_progress_names_the_classified_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            rollout = home / "sessions/rollout.jsonl"
+            rollout.write_text(json.dumps({"type": "event_msg", "payload": {
+                "type": "error", "message": "private", "codex_error_info": "rate_limit_exceeded"}}))
+            with self.assertRaisesRegex(e.ReviewAbort, r"OpenAI rate limit.*codex_error_info=rate_limit_exceeded"):
+                e.codex_progress(home, Path("/head"))
+            rollout.write_text(json.dumps({"type": "event_msg", "payload": {"type": "error", "message": "private"}}))
+            with self.assertRaisesRegex(e.ReviewAbort, "^Codex reported an API or runtime error; pass incomplete$"):
+                e.codex_progress(home, Path("/head"))
+
+    def test_failed_codex_exit_reports_the_recorded_cause(self):
+        settings = dict(POLICY, model="gpt-6.1-terra", provider="codex")
+        with tempfile.TemporaryDirectory() as tmp:
+            home, workspace = Path(tmp) / "home", Path(tmp) / "work"
+            (home / "sessions").mkdir(parents=True); workspace.mkdir()
+            python = os.environ.get("PYTHON", "python3")
+            failing = [python, "-c", "import sys; sys.exit(1)"]
+            # Like Codex, this process writes its own rollout during the pass, then fails.
+            recorded = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "error": {
+                "message": "private", "codex_error_info": {"response_stream_disconnected": {"http_status_code": None}}}}})
+            writes_then_fails = [python, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2]); "
+                                 "sys.exit(1)", str(home / "sessions/rollout.jsonl"), recorded]
+            # A rollout left by an earlier pass in the shared home.
+            (home / "sessions/earlier.jsonl").write_text(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "error": {"codex_error_info": "unauthorized"}}}))
+            with patch.object(e, "configure_codex"):
+                with patch.object(e, "codex_command", return_value=failing), \
+                        self.assertRaisesRegex(e.ReviewAbort, "^Codex action failed; inspect provider account"):
+                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
+                with patch.object(e, "codex_command", return_value=writes_then_fails), \
+                        self.assertRaisesRegex(e.ReviewAbort,
+                                               r"^OpenAI response stream disconnected; request the review again "
+                                               r"\(codex_error_info=response_stream_disconnected\); no paid retry$"):
+                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
+
     def test_single_request_above_the_allowance_aborts(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
