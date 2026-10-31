@@ -330,6 +330,41 @@ class ReplyAdmissionTests(unittest.TestCase):
 
 
 class ThreadStateTests(unittest.TestCase):
+    def target_page(self, ids=(10,), **updates):
+        value = {"id": "THREAD", "isResolved": False, "isOutdated": True,
+            "comments": {"nodes": [{"databaseId": i} for i in ids],
+                         "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+        value.update(updates)
+        return {"data": {"node": value}}
+
+    def test_target_snapshot_paginates_only_its_comments(self):
+        first, second = self.target_page(), self.target_page((11,))
+        first["data"]["node"]["comments"]["pageInfo"] = {"hasNextPage": True, "endCursor": "next"}
+        query = MagicMock(side_effect=[({}, first), ({}, second)])
+        fetch = MagicMock(side_effect=lambda i: NS(raw_data={"id": i}))
+        pr = NS(get_review_comment=fetch, requester=NS(graphql_query=query))
+        state, comments = f.thread_snapshot(pr, "THREAD", 10)
+        self.assertEqual([{"id": 10}, {"id": 11}], comments)
+        self.assertEqual({"id": "THREAD", "isResolved": False, "isOutdated": True}, state)
+        self.assertEqual({"id": "THREAD", "cursor": "next"}, query.call_args.args[1])
+        self.assertEqual([10, 11], [call.args[0] for call in fetch.call_args_list])
+
+    def test_target_snapshot_rejects_unbound_partial_or_looped_state(self):
+        bad = [dict(self.target_page(), errors=[{"message": "private"}]), self.target_page(()),
+               self.target_page((99,)), self.target_page((True,)), self.target_page((10, 10))]
+        for updates in ({"id": "other"}, {"isResolved": None}, {"isOutdated": 1}):
+            bad.append(self.target_page(**updates))
+        for page in ({"hasNextPage": None, "endCursor": "x"}, {"hasNextPage": True, "endCursor": ""}):
+            data = self.target_page(); data["data"]["node"]["comments"]["pageInfo"] = page; bad.append(data)
+        for data in bad:
+            pr = NS(requester=NS(graphql_query=MagicMock(return_value=({}, data))))
+            with self.subTest(data=data), self.assertRaises(f.FollowupAbort): f.thread_snapshot(pr, "THREAD", 10)
+        first, second = self.target_page(), self.target_page((11,))
+        for data in (first, second):
+            data["data"]["node"]["comments"]["pageInfo"] = {"hasNextPage": True, "endCursor": "same"}
+        pr = NS(requester=NS(graphql_query=MagicMock(side_effect=[({}, first), ({}, second)])))
+        with self.assertRaises(f.FollowupAbort): f.thread_snapshot(pr, "THREAD", 10)
+
     def page(self, root=10, **updates):
         thread = dict(id="THREAD", isResolved=False, isOutdated=False, comments={"nodes": [{"databaseId": root}]})
         thread.update(updates)

@@ -413,9 +413,67 @@ def verification_marker(root, head):
 
 
 def resolution_marker(root):
-    # Source: docs/agent-review.md inline reply contract. Closes a reply that
-    # resolves its thread, so later verification never reopens the decision.
+    # Source: docs/agent-review.md inline reply contract. Records a resolution
+    # attempt, not a success claim; later automatic checks leave it to a person.
     return f"<!-- agent-review-resolved:v1 root={root} -->"
+
+
+def model_text(text):
+    # Source: docs/agent-review.md publisher marker contract. Model-controlled
+    # HTML comments cannot supply publisher state, even inside a code fence.
+    return text.replace("<!--", "&lt;!--")
+
+
+def listed_comments(pr):
+    # PyGithub 2.10.0 CompletableGithubObject.raw_data calls _completeIfNeeded,
+    # even for populated list entries. Read the received REST fields without I/O.
+    # https://github.com/PyGithub/PyGithub/blob/v2.10.0/github/GithubObject.py
+    return [comment._rawData for comment in pr.get_review_comments()]
+
+
+def thread_snapshot(pr, thread_id, root_id):
+    """Refresh state and comments of one thread, never the PR-wide comment list.
+
+    Sources: https://docs.github.com/en/graphql/reference/pulls#object-pullrequestreviewthread
+    https://docs.github.com/en/graphql/guides/using-pagination-in-the-graphql-api
+    first:100 uses the published maximum connection page size.
+    """
+    query = """query($id: ID!, $cursor: String) {
+      node(id: $id) { ... on PullRequestReviewThread {
+        id isResolved isOutdated
+        comments(first: 100, after: $cursor) {
+          nodes { databaseId }
+          pageInfo { hasNextPage endCursor }
+        }
+      } }
+    }"""
+    cursor, seen, ids = None, set(), []
+    while True:
+        _, data = pr.requester.graphql_query(query, {"id": thread_id, "cursor": cursor})
+        if data.get("errors"):
+            raise FollowupAbort("Review thread state unavailable")
+        thread = data["data"]["node"]
+        if (thread["id"] != thread_id or type(thread["isResolved"]) is not bool
+                or type(thread["isOutdated"]) is not bool):
+            raise FollowupAbort("Review thread state unavailable")
+        for comment in thread["comments"]["nodes"]:
+            value = comment["databaseId"]
+            if not positive(value) or value in ids:
+                raise FollowupAbort("Review thread comments unavailable")
+            ids.append(value)
+        page = thread["comments"]["pageInfo"]
+        if page["hasNextPage"] is False:
+            break
+        cursor = page["endCursor"]
+        if page["hasNextPage"] is not True or not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise FollowupAbort("Review thread pagination unavailable")
+        seen.add(cursor)
+    if not ids or ids[0] != root_id:
+        raise FollowupAbort("Review thread root changed")
+    # These GETs are confined to the target's own comments. raw_data completes
+    # each target once; unrelated list entries never cause completion requests.
+    return ({k: thread[k] for k in ("id", "isResolved", "isOutdated")},
+            [pr.get_review_comment(value).raw_data for value in ids])
 
 
 def review_threads(pr):
