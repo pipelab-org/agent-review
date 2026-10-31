@@ -608,6 +608,63 @@ class JobTests(unittest.TestCase):
         self.assertIn("app.py:1", answer.body)
         self.assertIn("The value is preserved", answer.body)
 
+    def test_human_reopened_verified_thread_is_not_resolved_again_on_a_later_head(self):
+        proof, root = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        self.publish_verified(proof, plan, self.verified(plan))
+        self.assertTrue(self.pr.threads[root.id]["isResolved"])
+        # A maintainer disagrees and reopens the thread; the bot must not fight that.
+        self.pr.threads[root.id]["isResolved"] = False
+        self.advance_head("later.py")
+        later = self.prepare_verification(proof)
+        self.assertEqual([], later["threads"])
+        self.publish_verified(proof, later, self.verified(plan))
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertEqual(0, sum(k == "resolve" for k, _ in self.pr.writes))
+
+    def test_publication_rechecks_only_the_target_thread_and_loads_proof_once(self):
+        # Each fixed thread is rechecked several times before it resolves. Reloading
+        # every completion record and every open thread on each recheck multiplies
+        # GitHub requests by open threads times fixed threads.
+        proof, root = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        with patch.object(j, "records", return_value={123: proof}) as loaded, \
+                patch.object(j, "collect_threads", side_effect=AssertionError("full scan")):
+            j.publish_verification(self.repo, self.pr, ctx, policy, plan, self.verified(plan), self.head_dir)
+        self.assertEqual(1, loaded.call_count)
+        self.assertTrue(self.pr.threads[root.id]["isResolved"])
+
+    def test_root_original_commit_must_match_the_recorded_commit(self):
+        # Isolates the immutable original_commit_id binding: the record, review,
+        # path and body still match, so only that check can refuse the root.
+        proof, root = self.prior_threads()
+        self.assertEqual(1, len(j.collect_threads(self.pr, {123: proof})))
+        root.raw_data["original_commit_id"] = self.pr.head.sha
+        self.assertEqual([], j.collect_threads(self.pr, {123: proof}))
+        with self.assertRaises(f.FollowupAbort):
+            f.verify_root(self.pr, root, {123: proof})
+
+    def test_reply_resolved_thread_reopened_by_a_person_is_never_verified_again(self):
+        proof, root = self.prior_threads()
+        plan = self.reply_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        with patch.object(j, "records", return_value={123: proof}):
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("finding_wrong"), self.head_dir)
+        self.assertTrue(self.pr.threads[root.id]["isResolved"])
+        self.pr.threads[root.id]["isResolved"] = False
+        self.advance_head("later.py")
+        self.assertEqual([], j.collect_threads(self.pr, {123: proof}))
+        # An answer that did not resolve leaves the thread eligible for verification.
+        self.pr.roots = [root]
+        self.pr.threads[root.id]["isResolved"] = False
+        self.advance_head("again.py")
+        plan = self.reply_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        with patch.object(j, "records", return_value={123: proof}):
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer(), self.head_dir)
+        self.assertEqual(1, len(j.collect_threads(self.pr, {123: proof})))
+
     def test_present_unclear_and_model_silence_never_resolve(self):
         proof, root = self.prior_threads()
         plan = self.prepare_verification(proof)
@@ -761,7 +818,7 @@ class JobTests(unittest.TestCase):
                 "resolve": (self.pr.requester, "graphql_named_mutation", refuse),
                 "reply": (self.pr, "create_review_comment_reply", RuntimeError("private")),
                 "reply_readback": (j, "publish_answer", RuntimeError("private")),
-                "root_changed": (j, "collect_threads", lambda *a: []),
+                "root_changed": (j, "thread_item", lambda *a: None),
                 "head_moved": (j, "check_pr", RuntimeError("moved")),
             }[failure]
             policy, depth = j.settings(); ctx, _ = j.context(policy, depth)

@@ -412,6 +412,12 @@ def verification_marker(root, head):
     return f"<!-- agent-review-verified:v1 root={root} head={head} -->"
 
 
+def resolution_marker(root):
+    # Source: docs/agent-review.md inline reply contract. Closes a reply that
+    # resolves its thread, so later verification never reopens the decision.
+    return f"<!-- agent-review-resolved:v1 root={root} -->"
+
+
 def review_threads(pr):
     """Map GraphQL thread IDs to their first (root) REST comment ID.
 

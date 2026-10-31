@@ -255,7 +255,10 @@ def publish_reply(repo, pr, ctx, policy, plan, result, head_dir=None):
     def fresh():
         current = check_pr(repo, ctx)
         reply_check(repo, current, ctx, policy)
-    publish_answer(pr, root.id, marker, answer["answer"], fresh)
+    text = answer["answer"]
+    if answer["resolve"]:
+        text += "\n\n" + followups.resolution_marker(root.id)
+    publish_answer(pr, root.id, marker, text, fresh)
     if answer["resolve"]:
         try:
             fresh()
@@ -432,18 +435,44 @@ def reconstruct_root(root, record):
 def collect_threads(pr, proof):
     if not any(record["roots"] for record in proof.values()):
         return []
-    threads, result = followups.review_threads(pr), []
-    for root_id, thread in threads.items():
-        if thread["isResolved"]:
-            continue
-        try:
-            root = pr.get_review_comment(root_id)
-            record, entry = followups.verify_root(pr, root, proof)
-            findings = reconstruct_root(root, record)
-        except (followups.FollowupAbort, ReviewAbort):
-            continue
-        result.append({"thread": thread["id"], "root": entry, "findings": findings})
+    threads, judged = followups.review_threads(pr), judged_roots(pr)
+    result = [item for root_id, thread in threads.items()
+              if (item := thread_item(pr, proof, root_id, thread, judged)) is not None]
     return sorted(result, key=lambda item: item["thread"])
+
+
+def judged_roots(pr):
+    """Roots this workflow already verified fixed on an earlier head.
+
+    An open thread after that was reopened by a person, or its resolution
+    failed; either way a later head never resolves it again.
+    """
+    judged = set()
+    for comment in pr.get_review_comments():
+        if not isinstance(comment.body, str) or not followups.identity(comment.user, followups.BOT):
+            continue
+        parent = comment.raw_data.get("in_reply_to_id")
+        lines = comment.body.split("\n")
+        match = re.fullmatch(r"<!-- agent-review-verified:v1 root=([1-9][0-9]*) head=([0-9a-f]{40}) -->", lines[0])
+        if match and parent == int(match[1]) and match[2] != pr.head.sha:
+            judged.add(parent)
+        # A reply that resolved its thread decides it at every head.
+        resolved = re.fullmatch(r"<!-- agent-review-resolved:v1 root=([1-9][0-9]*) -->", lines[-1])
+        if resolved and parent == int(resolved[1]):
+            judged.add(parent)
+    return judged
+
+
+def thread_item(pr, proof, root_id, thread, judged):
+    if thread["isResolved"] or root_id in judged:
+        return None
+    try:
+        root = pr.get_review_comment(root_id)
+        record, entry = followups.verify_root(pr, root, proof)
+        findings = reconstruct_root(root, record)
+    except (followups.FollowupAbort, ReviewAbort):
+        return None
+    return {"thread": thread["id"], "root": entry, "findings": findings}
 
 
 def verification_prompt(plan):
@@ -574,17 +603,22 @@ def publish_verification(repo, pr, ctx, policy, plan, verification, head_dir):
         return
     try:
         value = validate_verification_result(verification, plan["threads"], policy, head_dir, ctx["head"])
-        def fresh():
-            current = check_pr(repo, ctx)
-            live = collect_threads(current, records(repo, current, ctx, policy, all_depths=True))
-            return {item["thread"]: item for item in live}
+        # Completion records are immutable proof: load them once. Each recheck
+        # reads only the target thread so GitHub requests do not grow with the
+        # number of open threads times the number of fixed ones.
+        proof = records(repo, pr, ctx, policy, all_depths=True)
         expected = {item["thread"]: item for item in plan["threads"]}
         for item in value["threads"]:
             if item["status"] != "fixed":
                 continue
             target = expected[item["thread"]]
             def bound():
-                if fresh().get(item["thread"]) != target:
+                current = check_pr(repo, ctx)
+                root_id = target["root"]["id"]
+                thread = followups.review_threads(current).get(root_id)
+                live = (thread_item(current, proof, root_id, thread, judged_roots(current))
+                        if thread is not None else None)
+                if live != target:
                     raise ReviewAbort("Verification target changed or is no longer open")
             bound()
             marker = followups.verification_marker(target["root"]["id"], ctx["head"])
