@@ -292,17 +292,34 @@ class ReplyAdmissionTests(unittest.TestCase):
         with self.assertRaises(f.FollowupAbort):
             self.admit()
 
+    def test_earlier_commit_reply_still_requires_exact_event_and_full_commits(self):
+        self.pr.head.sha = "9" * 40
+        self.assertIs(self.live, self.admit())
+        for field in ("commit_id", "original_commit_id"):
+            original = self.event["comment"][field]
+            for value in (None, "invalid"):
+                self.live.raw_data[field] = self.event["comment"][field] = value
+                with self.assertRaises(f.FollowupAbort): self.admit()
+            self.live.raw_data[field] = self.event["comment"][field] = original
+
     def test_exact_root_manifest_review_and_digest_required(self):
         record = evidence()
         root = NS(id=10, user=NS(**f.BOT), body="Finding", path="src/file.py", commit_id=HEAD,
-                  raw_data={"pull_request_review_id": 7})
+                  raw_data={"pull_request_review_id": 7, "original_commit_id": HEAD})
         review = NS(user=NS(**f.BOT), commit_id=HEAD, state="COMMENTED")
         self.pr.get_review_comment = lambda i: root
         self.pr.get_review = lambda i: review
         record["roots"] = [dict(id=10, review_id=7, digest=f.digest(root.body), path=root.path, commit=HEAD)]
         self.assertIs(root, f.owned_root(self.pr, self.live, {123: record}))
         with self.assertRaises(f.FollowupAbort): f.owned_root(self.pr, self.live, {})
-        for obj, field, value in ((root, "body", "edited"), (root, "commit_id", "9" * 40),
+        # commit_id follows the live head without changing the original identity.
+        root.commit_id = "9" * 40
+        self.pr.head.sha = root.commit_id
+        self.assertIs(root, f.owned_root(self.pr, self.live, {123: record}))
+        root.raw_data["original_commit_id"] = "8" * 40
+        with self.assertRaises(f.FollowupAbort): f.owned_root(self.pr, self.live, {123: record})
+        root.raw_data["original_commit_id"] = HEAD
+        for obj, field, value in ((root, "body", "edited"),
                                   (root.user, "id", 1), (review, "state", "PENDING"),
                                   (root, "path", "other.py")):
             old = getattr(obj, field)
@@ -310,6 +327,83 @@ class ReplyAdmissionTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(f.FollowupAbort):
                 f.owned_root(self.pr, self.live, {123: record})
             setattr(obj, field, old)
+
+
+class ThreadStateTests(unittest.TestCase):
+    def target_page(self, ids=(10,), **updates):
+        value = {"id": "THREAD", "isResolved": False, "isOutdated": True,
+            "comments": {"nodes": [{"databaseId": i} for i in ids],
+                         "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+        value.update(updates)
+        return {"data": {"node": value}}
+
+    def test_target_snapshot_paginates_only_its_comments(self):
+        first, second = self.target_page(), self.target_page((11,))
+        first["data"]["node"]["comments"]["pageInfo"] = {"hasNextPage": True, "endCursor": "next"}
+        query = MagicMock(side_effect=[({}, first), ({}, second)])
+        fetch = MagicMock(side_effect=lambda i: NS(raw_data={"id": i}))
+        pr = NS(get_review_comment=fetch, requester=NS(graphql_query=query))
+        state, comments = f.thread_snapshot(pr, "THREAD", 10)
+        self.assertEqual([{"id": 10}, {"id": 11}], comments)
+        self.assertEqual({"id": "THREAD", "isResolved": False, "isOutdated": True}, state)
+        self.assertEqual({"id": "THREAD", "cursor": "next"}, query.call_args.args[1])
+        self.assertEqual([10, 11], [call.args[0] for call in fetch.call_args_list])
+
+    def test_target_snapshot_rejects_unbound_partial_or_looped_state(self):
+        bad = [dict(self.target_page(), errors=[{"message": "private"}]), self.target_page(()),
+               self.target_page((99,)), self.target_page((True,)), self.target_page((10, 10))]
+        for updates in ({"id": "other"}, {"isResolved": None}, {"isOutdated": 1}):
+            bad.append(self.target_page(**updates))
+        for page in ({"hasNextPage": None, "endCursor": "x"}, {"hasNextPage": True, "endCursor": ""}):
+            data = self.target_page(); data["data"]["node"]["comments"]["pageInfo"] = page; bad.append(data)
+        for data in bad:
+            pr = NS(requester=NS(graphql_query=MagicMock(return_value=({}, data))))
+            with self.subTest(data=data), self.assertRaises(f.FollowupAbort): f.thread_snapshot(pr, "THREAD", 10)
+        first, second = self.target_page(), self.target_page((11,))
+        for data in (first, second):
+            data["data"]["node"]["comments"]["pageInfo"] = {"hasNextPage": True, "endCursor": "same"}
+        pr = NS(requester=NS(graphql_query=MagicMock(side_effect=[({}, first), ({}, second)])))
+        with self.assertRaises(f.FollowupAbort): f.thread_snapshot(pr, "THREAD", 10)
+
+    def page(self, root=10, **updates):
+        thread = dict(id="THREAD", isResolved=False, isOutdated=False, comments={"nodes": [{"databaseId": root}]})
+        thread.update(updates)
+        return {"data": {"node": {"reviewThreads": {"nodes": [thread],
+            "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
+
+    def test_graphql_pagination_and_resolve_response_are_verified(self):
+        first, second = self.page(), self.page(11, id="NEXT")
+        first["data"]["node"]["reviewThreads"]["pageInfo"] = {"hasNextPage": True, "endCursor": "cursor"}
+        query = MagicMock(side_effect=[({}, first), ({}, second)])
+        mutation = MagicMock(return_value=({}, {"thread": {"id": "THREAD", "isResolved": True}}))
+        pr = NS(node_id="PR", requester=NS(graphql_query=query, graphql_named_mutation=mutation))
+        self.assertEqual({10, 11}, set(f.review_threads(pr)))
+        self.assertEqual({"id": "PR", "cursor": "cursor"}, query.call_args.args[1])
+        f.resolve_thread(pr, "THREAD")
+        self.assertEqual(("resolveReviewThread", {"threadId": "THREAD"}, "thread { id isResolved }"), mutation.call_args.args)
+        for response in ({}, {"thread": {"id": "other", "isResolved": True}},
+                         {"thread": {"id": "THREAD", "isResolved": False}}):
+            mutation.return_value = {}, response
+            with self.assertRaises(f.FollowupAbort): f.resolve_thread(pr, "THREAD")
+
+    def test_graphql_partial_malformed_or_repeated_state_fails_closed(self):
+        bad = [dict(self.page(), errors=[{"message": "private"}])]
+        for updates in ({"id": ""}, {"isResolved": None}, {"isOutdated": 1},
+                        {"comments": {"nodes": []}}, {"comments": {"nodes": [{"databaseId": True}]}}):
+            bad.append(self.page(**updates))
+        for page in ({"hasNextPage": None, "endCursor": "cursor"},
+                     {"hasNextPage": True, "endCursor": ""}):
+            data = self.page(); data["data"]["node"]["reviewThreads"]["pageInfo"] = page; bad.append(data)
+        for data in bad:
+            pr = NS(node_id="PR", requester=NS(graphql_query=MagicMock(return_value=({}, data))))
+            with self.subTest(data=data), self.assertRaises(f.FollowupAbort): f.review_threads(pr)
+        data = self.page()
+        data["data"]["node"]["reviewThreads"]["pageInfo"] = {"hasNextPage": True, "endCursor": "cursor"}
+        second = self.page(11, id="NEXT")
+        second["data"]["node"]["reviewThreads"]["pageInfo"] = {"hasNextPage": True, "endCursor": "cursor"}
+        for pages in ([data, data], [data, second]):
+            pr = NS(node_id="PR", requester=NS(graphql_query=MagicMock(side_effect=[({}, p) for p in pages])))
+            with self.assertRaises(f.FollowupAbort): f.review_threads(pr)
 
 
 if __name__ == "__main__":

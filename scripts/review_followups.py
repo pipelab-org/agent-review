@@ -364,8 +364,8 @@ def admit_reply(event, env, repo, pr, membership):
             or not isinstance(updated, str) or not updated
             or not isinstance(live.body, str) or not live.body.strip()
             or not positive(comment.get("in_reply_to_id"))
-            or comment.get("commit_id") != pr.head.sha
-            or comment.get("original_commit_id") != pr.head.sha
+            or not full_sha(comment.get("commit_id"))
+            or not full_sha(comment.get("original_commit_id"))
             or comment.get("pull_request_url") != f"https://api.github.com/repos/{repo.full_name}/pulls/{number}"):
         raise FollowupAbort("Reply event changed or is not an inline reply")
     if not all(user.get(k) == v for k, v in JOSH.items()):
@@ -377,24 +377,151 @@ def admit_reply(event, env, repo, pr, membership):
 def owned_root(pr, live, records):
     root_id = live.raw_data["in_reply_to_id"]
     root = pr.get_review_comment(root_id)
+    verify_root(pr, root, records, path=live.path)
+    return root
+
+
+def verify_root(pr, root, records, *, path=None):
+    """Bind immutable original commit, never GitHub's movable commit_id.
+
+    Source: https://docs.github.com/en/graphql/reference/pulls#object-pullrequestreviewcomment
+    originalCommit identifies the original commit; REST calls it original_commit_id.
+    """
     for record in records.values():
         for entry in record["roots"]:
-            if entry["id"] != root_id:
+            if entry["id"] != root.id:
                 continue
             review = pr.get_review(entry["review_id"])
             if (identity(root.user, BOT) and identity(review.user, BOT)
                     and root.raw_data.get("in_reply_to_id") is None
                     and root.raw_data.get("pull_request_review_id") == entry["review_id"]
-                    and root.commit_id == entry["commit"] == pr.head.sha
-                    and root.path == entry["path"] == live.path
+                    and root.raw_data.get("original_commit_id") == entry["commit"] == record["head"]
+                    and root.path == entry["path"] and (path is None or path == root.path)
                     and digest(root.body) == entry["digest"]
-                    and review.commit_id == pr.head.sha and review.state == "COMMENTED"):
-                return root
+                    and review.commit_id == entry["commit"] and review.state == "COMMENTED"):
+                return record, entry
     raise FollowupAbort("Inline root has no verified workflow provenance")
 
 
 def reply_marker(trigger, root):
     return f"<!-- agent-review-reply:v1 trigger={trigger} root={root} -->"
+
+
+def verification_marker(root, head):
+    # Source: docs/agent-review.md thread verification publication contract.
+    return f"<!-- agent-review-verified:v1 root={root} head={head} -->"
+
+
+def resolution_marker(root):
+    # Source: docs/agent-review.md inline reply contract. Records a resolution
+    # attempt, not a success claim; later automatic checks leave it to a person.
+    return f"<!-- agent-review-resolved:v1 root={root} -->"
+
+
+def model_text(text):
+    # Source: docs/agent-review.md publisher marker contract. Model-controlled
+    # HTML comments cannot supply publisher state, even inside a code fence.
+    return text.replace("<!--", "&lt;!--")
+
+
+def listed_comments(pr):
+    # PyGithub 2.10.0 CompletableGithubObject.raw_data calls _completeIfNeeded,
+    # even for populated list entries. Read the received REST fields without I/O.
+    # https://github.com/PyGithub/PyGithub/blob/v2.10.0/github/GithubObject.py
+    return [comment._rawData for comment in pr.get_review_comments()]
+
+
+def thread_snapshot(pr, thread_id, root_id):
+    """Refresh state and comments of one thread, never the PR-wide comment list.
+
+    Sources: https://docs.github.com/en/graphql/reference/pulls#object-pullrequestreviewthread
+    https://docs.github.com/en/graphql/guides/using-pagination-in-the-graphql-api
+    first:100 uses the published maximum connection page size.
+    """
+    query = """query($id: ID!, $cursor: String) {
+      node(id: $id) { ... on PullRequestReviewThread {
+        id isResolved isOutdated
+        comments(first: 100, after: $cursor) {
+          nodes { databaseId }
+          pageInfo { hasNextPage endCursor }
+        }
+      } }
+    }"""
+    cursor, seen, ids = None, set(), []
+    while True:
+        _, data = pr.requester.graphql_query(query, {"id": thread_id, "cursor": cursor})
+        if data.get("errors"):
+            raise FollowupAbort("Review thread state unavailable")
+        thread = data["data"]["node"]
+        if (thread["id"] != thread_id or type(thread["isResolved"]) is not bool
+                or type(thread["isOutdated"]) is not bool):
+            raise FollowupAbort("Review thread state unavailable")
+        for comment in thread["comments"]["nodes"]:
+            value = comment["databaseId"]
+            if not positive(value) or value in ids:
+                raise FollowupAbort("Review thread comments unavailable")
+            ids.append(value)
+        page = thread["comments"]["pageInfo"]
+        if page["hasNextPage"] is False:
+            break
+        cursor = page["endCursor"]
+        if page["hasNextPage"] is not True or not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise FollowupAbort("Review thread pagination unavailable")
+        seen.add(cursor)
+    if not ids or ids[0] != root_id:
+        raise FollowupAbort("Review thread root changed")
+    # These GETs are confined to the target's own comments. raw_data completes
+    # each target once; unrelated list entries never cause completion requests.
+    return ({k: thread[k] for k in ("id", "isResolved", "isOutdated")},
+            [pr.get_review_comment(value).raw_data for value in ids])
+
+
+def review_threads(pr):
+    """Map GraphQL thread IDs to their first (root) REST comment ID.
+
+    Sources: https://docs.github.com/en/graphql/reference/pulls#object-pullrequestreviewthread
+    https://docs.github.com/en/graphql/guides/using-pagination-in-the-graphql-api
+    Connections allow at most 100 nodes per page. first:1 selects only the root;
+    all replies are read through the existing paginated REST comment API.
+    """
+    query = """query($id: ID!, $cursor: String) {
+      node(id: $id) { ... on PullRequest {
+        reviewThreads(first: 100, after: $cursor) {
+          nodes { id isResolved isOutdated comments(first: 1) { nodes { databaseId } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      } }
+    }"""
+    result, cursor, seen = {}, None, set()
+    while True:
+        _, data = pr.requester.graphql_query(query, {"id": pr.node_id, "cursor": cursor})
+        if data.get("errors"):
+            raise FollowupAbort("Review thread state unavailable")
+        connection = data["data"]["node"]["reviewThreads"]
+        for thread in connection["nodes"]:
+            roots = thread["comments"]["nodes"]
+            if (not isinstance(thread["id"], str) or not thread["id"]
+                    or type(thread["isResolved"]) is not bool or type(thread["isOutdated"]) is not bool
+                    or len(roots) != 1 or not positive(roots[0]["databaseId"])
+                    or roots[0]["databaseId"] in result):
+                raise FollowupAbort("Review thread state unavailable")
+            result[roots[0]["databaseId"]] = {k: thread[k] for k in ("id", "isResolved", "isOutdated")}
+        page = connection["pageInfo"]
+        if page["hasNextPage"] is False:
+            return result
+        cursor = page["endCursor"]
+        if page["hasNextPage"] is not True or not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise FollowupAbort("Review thread pagination unavailable")
+        seen.add(cursor)
+
+
+def resolve_thread(pr, thread):
+    # Source: https://docs.github.com/en/graphql/reference/pulls#mutation-resolvereviewthread
+    _, result = pr.requester.graphql_named_mutation(
+        "resolveReviewThread", {"threadId": thread}, "thread { id isResolved }")
+    if (result.get("thread", {}).get("id") != thread
+            or result["thread"].get("isResolved") is not True):
+        raise FollowupAbort("Review thread resolution could not be verified")
 
 
 def write_completion(path, evidence):

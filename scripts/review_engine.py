@@ -353,7 +353,8 @@ def event_message(event):
     return message if isinstance(message, dict) else {}
 
 
-def claude_result(events, settings, bundle, strategy, head):
+def claude_result(events, settings, bundle, strategy, head, *, validate_output=validate_schema,
+                  output_key="findings"):
     results = [e for e in events if e.get("type") == "result"]
     if len(results) != 1 or events[-1] != results[0]:
         raise ReviewAbort("Claude result missing, extra, or truncated; inspect provider output")
@@ -387,7 +388,7 @@ def claude_result(events, settings, bundle, strategy, head):
                 # Pinned CLI's schema formatter has no I/O capability. Its exact
                 # contract is exercised by the native CLI dry harness.
                 if block.get("name") == "StructuredOutput":
-                    validate_schema(block.get("input"))
+                    validate_output(block.get("input"))
                     continue
                 if block.get("name") not in ("Read", "Grep", "Glob"):
                     raise ReviewAbort("Claude attempted a forbidden tool; restricted configuration was not honored")
@@ -400,7 +401,7 @@ def claude_result(events, settings, bundle, strategy, head):
                 if path and safe_path(path):
                     opened.add(path)
     output = final.get("structured_output")
-    findings = validate_schema(output)
+    findings = validate_output(output)
     receipt = {"provider": "claude", "model": settings["model"], "strategy": strategy,
                "status": "complete", "turns": final.get("num_turns"), "files_opened": sorted(opened),
                "usage": final.get("usage"), "cost_usd": final.get("total_cost_usd")}
@@ -408,7 +409,7 @@ def claude_result(events, settings, bundle, strategy, head):
     if isinstance(receipt["usage"], dict):
         receipt["usage"] = {k: v for k, v in receipt["usage"].items() if type(v) is int}
     validate_receipt(receipt, settings, bundle, strategy)
-    return {"findings": findings, "receipt": receipt}
+    return {output_key: findings, "receipt": receipt}
 
 
 def clean_env(settings=None):
@@ -469,12 +470,13 @@ def codex_prompt(bundle):
             + "Operator review criteria:\n" + bundle.get("instructions", "") + "\n" + bundle_json(bundle))
 
 
-def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHEMA):
+def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHEMA, *,
+               validate_output=validate_schema, output_key="findings"):
     text = prompt or claude_prompt(bundle, strategy)
     if token_bound(text + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
         raise ReviewAbort("Complete prompt exceeds config.max_model_tokens")
     try:
-        result = subprocess.run(claude_args(settings, schema, tools=prompt is None), input=text,
+        result = subprocess.run(claude_args(settings, schema), input=text,
                                 cwd=head, env=clean_env(settings), capture_output=True, text=True,
                                 timeout=settings["ai_timeout"], check=False)
     except subprocess.TimeoutExpired:
@@ -484,7 +486,8 @@ def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHE
     events = [strict_json(line) for line in result.stdout.splitlines() if line.strip()]
     if not events or any(not isinstance(e, dict) for e in events):
         raise ReviewAbort("Invalid Claude transcript")
-    return claude_result(events, settings, bundle, strategy, head)
+    return claude_result(events, settings, bundle, strategy, head,
+                         validate_output=validate_output, output_key=output_key)
 
 
 def save(path, data):
@@ -677,7 +680,7 @@ def codex_failure_cause(home, ignore=frozenset()):
     return None
 
 
-def codex_progress(home, head, strict=False, model=None, request_limit=None):
+def codex_progress(home, head, strict=False, model=None, request_limit=None, ignore=frozenset()):
     """Read native rollout evidence, never model-authored receipt assertions.
 
     Sources: Codex protocol EventMsg::TokenCount / FunctionCall / FunctionCallOutput,
@@ -687,7 +690,7 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None):
     pending_reads, delivered = [], set()
     previous = -1
     pending_response = False
-    models, sessions = set(), list(sorted(Path(home).glob("sessions/**/*.jsonl")))
+    models, sessions = set(), sorted(set(Path(home).glob("sessions/**/*.jsonl")) - ignore)
     for path in sessions:
         for raw in path.read_text().splitlines():
             try:
@@ -824,6 +827,12 @@ def configure_codex(home, settings):
     name = "codex-action-responses-proxy"
     path = Path(home) / "config.toml"
     text = path.read_text()
+    # This runner's exact serialization permits another strategy on the same
+    # trusted home. Different limits or retry settings still fail closed.
+    prefix = "model_context_window = " + str(settings["max_model_tokens"]) + "\n"
+    suffix = "\nrequest_max_retries = 0\nstream_max_retries = 0\n"
+    if text.startswith(prefix) and text.endswith(suffix):
+        text = text[len(prefix):-len(suffix)]
     data = tomllib.loads(text)
     provider = data.get("model_providers", {}).get(name, {})
     if (data.get("model_provider") != name or provider.get("wire_api") != "responses"
@@ -832,23 +841,23 @@ def configure_codex(home, settings):
             or any(k in provider for k in ("request_max_retries", "stream_max_retries"))):
         raise ReviewAbort("Trusted Codex action proxy config changed; no inference requested")
     # Source: existing operator token budget, not the model's advertised window.
-    prefix = "model_context_window = " + str(settings["max_model_tokens"]) + "\n"
-    path.write_text(prefix + text + "\nrequest_max_retries = 0\nstream_max_retries = 0\n")
+    path.write_text(prefix + text + suffix)
 
 
-def run_codex(settings, bundle, strategy, head, action, home, workspace):
+def run_codex(settings, bundle, strategy, head, action, home, workspace, *, prompt=None,
+              schema=OUTPUT_SCHEMA, validate_output=validate_schema, output_key="findings"):
     limit = settings["max_model_tokens"] - settings["max_output_tokens"]
     import selectors
     import time
     configure_codex(home, settings)
     output = Path(workspace) / "codex-output.json"
-    schema = Path(workspace) / "schema.json"
-    save(schema, OUTPUT_SCHEMA)
-    prompt = codex_prompt(bundle)
-    if token_bound(prompt + json.dumps(OUTPUT_SCHEMA)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
+    schema_path = Path(workspace) / "schema.json"
+    save(schema_path, schema)
+    prompt = codex_prompt(bundle) if prompt is None else prompt
+    if token_bound(prompt + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
         raise ReviewAbort("Codex prompt exceeds config.max_model_tokens")
     output.with_suffix(".prompt").write_text(prompt)
-    command = codex_command(settings, head, home, schema, output, action)
+    command = codex_command(settings, head, home, schema_path, output, action)
     earlier = frozenset(Path(home).glob("sessions/**/*.jsonl"))
     env = clean_env()
     # The Codex pass authenticates through the action's proxy. A shell-capable
@@ -869,7 +878,7 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace):
                 raise ReviewAbort("Codex exceeded config.ai_timeout; no paid retry")
             # Drain without interpreting or logging model text or workflow commands.
             chunk = os.read(proc.stdout.fileno(), 65536)  # existing MAX_DATA_BYTES I/O buffer
-            turns, _, _, cost = codex_progress(home, head, model=settings["model"], request_limit=limit)
+            turns, _, _, cost = codex_progress(home, head, model=settings["model"], request_limit=limit, ignore=earlier)
             if turns > settings["max_turns"]:
                 raise ReviewAbort("Codex reached the review_depth max_turns; pass incomplete")
             if cost is not None and cost > settings["max_budget_usd"]:
@@ -889,10 +898,10 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace):
         proc.stdout.close()
     if not output.is_file():
         raise ReviewAbort("Codex findings output file is missing")
-    findings = validate_schema(strict_json(output.read_text()))
+    findings = validate_output(strict_json(output.read_text()))
     turns, usage, opened, cost = codex_progress(home, head, strict=True, model=settings["model"],
-                                                request_limit=limit)
+                                                request_limit=limit, ignore=earlier)
     receipt = {"provider": "codex", "model": settings["model"], "strategy": strategy,
                "status": "complete", "turns": turns, "files_opened": opened, "usage": usage, "cost_usd": cost}
     validate_receipt(receipt, settings, bundle, strategy)
-    return {"findings": findings, "receipt": receipt}
+    return {output_key: findings, "receipt": receipt}

@@ -838,9 +838,44 @@ class CodexTests(unittest.TestCase):
             provider = data["model_providers"]["codex-action-responses-proxy"]
             self.assertEqual(0, provider["request_max_retries"])
             self.assertEqual(0, provider["stream_max_retries"])
+            configured = config.read_text()
+            e.configure_codex(home, POLICY)
+            self.assertEqual(configured, config.read_text())
+            config.write_text(configured.replace("request_max_retries = 0", "request_max_retries = 1"))
+            with self.assertRaises(e.ReviewAbort): e.configure_codex(home, POLICY)
             config.write_text('model_provider="untrusted"')
             with self.assertRaisesRegex(e.ReviewAbort, "no inference"):
                 e.configure_codex(home, POLICY)
+
+    def test_codex_followup_uses_its_schema_and_only_the_new_rollout(self):
+        import sys
+        settings = dict(POLICY, model="gpt-6.1-terra", provider="codex")
+        value = {"threads": [{"thread": "THREAD", "status": "present", "evidence": []}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            home, workspace = Path(tmp) / "home", Path(tmp) / "work"
+            (home / "sessions").mkdir(parents=True)
+            (home / "config.toml").write_text('model_provider="codex-action-responses-proxy"\n'
+                '[model_providers.codex-action-responses-proxy]\nbase_url="http://127.0.0.1:12345/v1"\nwire_api="responses"\n')
+            events = [
+                {"type": "turn_context", "payload": {"model": settings["model"]}},
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": 100, "output_tokens": 20},
+                    "total_token_usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}}}]
+            def command(settings, head, home, schema, output, action):
+                self.assertEqual(jobs.VERIFICATION_SCHEMA, json.loads(schema.read_text()))
+                self.assertEqual("Read the head checkout.", output.with_suffix(".prompt").read_text())
+                index = len(list((home / "sessions").glob("*.jsonl")))
+                return [sys.executable, "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2]); "
+                    "pathlib.Path(sys.argv[3]).write_text(sys.argv[4]); print('done')",
+                    str(output), json.dumps(value), str(home / f"sessions/{index}.jsonl"), "\n".join(map(json.dumps, events))]
+            for strategy in ("first", "verify-threads"):
+                with patch.object(e, "codex_command", side_effect=command):
+                    result = e.run_codex(settings, {"files": []}, strategy, Path(tmp), "/action", home,
+                        workspace / strategy, prompt="Read the head checkout.", schema=jobs.VERIFICATION_SCHEMA,
+                        validate_output=jobs.validate_verification, output_key="output")
+                self.assertEqual(value, result["output"])
+                self.assertEqual(1, result["receipt"]["turns"])
+                self.assertEqual(strategy, result["receipt"]["strategy"])
 
     def test_codex_runner_never_inherits_the_anthropic_credential(self):
         seen = {}
