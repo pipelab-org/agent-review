@@ -1287,6 +1287,21 @@ class JobTests(unittest.TestCase):
         self.assertIn(j.COMMAND_NOT_ATTEMPTED_NOTE, self.pr.roots[-1].body)
         self.assertNotIn("awaiting GitHub confirmation", self.pr.roots[-1].body)
 
+    def test_authority_revoked_only_at_the_final_recheck_never_resolves(self):
+        # Admission, the first recheck and the snapshot pass; authority is lost
+        # only at the check immediately before the mutation.
+        proof, root = self.prior_threads()
+        plan = self.resolve_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        answers = iter(["write", "write"])
+        self.repo.get_collaborator_permission = lambda login: next(answers, "read")
+        with patch.object(j, "records", return_value={123: proof}), patch.object(f, "resolve_thread") as resolve, \
+                patch("sys.stdout", new_callable=io.StringIO):
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, None, self.head_dir)
+        resolve.assert_not_called()
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertIn(j.COMMAND_NOT_ATTEMPTED_NOTE, self.pr.roots[-1].body)
+
     def test_pending_or_incomplete_verification_reply_is_not_a_decision(self):
         proof, root = self.prior_threads()
         marker = f.verification_marker(root.id, "a" * 40)
