@@ -288,6 +288,245 @@ class JobTests(unittest.TestCase):
             self.assertEqual(count, len(self.pr.writes))
             self.assertTrue(any("The resolved local value" in c.body for c in self.pr.roots))
 
+    def summary(self):
+        return next(c.body for c in self.pr.comments.values()
+                    if f.RESULT.search(c.body) and not c.body.startswith("<!-- agent-review-status:v1"))
+
+    def test_summary_is_a_table_and_inline_text_is_not_repeated(self):
+        self.build([finding(path="app.py", mechanism="Inline mechanism text"),
+                    finding(path="helper.py", title="Related helper", mechanism="Helper mechanism text",
+                            confidence="medium")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        summary = self.summary()
+        self.assertTrue(summary.startswith("**AI review:** 2 findings (1 high, 1 medium)."))
+        self.assertIn("| high | Missing state transfer | `app.py:1` | inline thread |", summary)
+        self.assertIn("| medium | Related helper | `helper.py:1` | below |", summary)
+        self.assertNotIn("Inline mechanism text", summary)
+        self.assertIn("Helper mechanism text", summary.split("<details>")[0])
+        self.assertIn("Reviewed base", summary.split("<details>")[1])
+
+    def test_table_and_full_text_show_each_findings_line_range(self):
+        self.build([finding(path="helper.py", line=1, end_line=3, title="Spanning helper")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        summary = self.summary().split("<details>")[0]
+        self.assertIn("| `helper.py:1-3` | below |", summary)
+        self.assertIn("**Spanning helper** (`helper.py:1-3`)", summary)
+
+    def test_table_cells_cannot_break_the_table(self):
+        self.build([finding(path="app.py", title="a | b\nc")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertIn("| a \\| b c |", self.summary())
+
+    def test_table_location_and_raw_html_title_keep_the_row_intact(self):
+        title = "literal </td></tr></table><details><summary>Hidden</summary>"
+        self.build([finding(path="helper|table.py", title=title)])
+        j.publish_artifact(self.artifact, self.head_dir)
+        row = next(line for line in self.summary().splitlines() if line.startswith("| high |"))
+        self.assertIn("| `helper\\|table.py:1` | below |", row)
+        self.assertNotIn("<", row)
+        self.assertIn("&lt;/td&gt;", row)
+        self.assertEqual(r"a\\\|b", j.cell(r"a\|b"))
+        self.assertEqual("`` a`b ``", j.code("a`b"))
+        self.assertEqual(r"`a\nb`", j.code("a\nb"))
+
+    def test_overlapping_findings_share_one_thread_and_keep_both_records(self):
+        self.build([finding(path="app.py", title="First", mechanism="One mechanism"),
+                    finding(path="app.py", title="Second", mechanism="Another mechanism", confidence="low")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len(self.pr.roots))
+        body = self.pr.roots[0].body
+        self.assertTrue(body.startswith("**2 findings on these lines**"))
+        self.assertIn("One mechanism", body)
+        self.assertIn("Another mechanism", body)
+        record = json.loads((self.root / "completion.json").read_text())
+        self.assertEqual(2, len(record["findings"]))
+        self.assertEqual(1, len(record["roots"]))
+
+    def test_overlap_groups_merge_transitively_and_keep_separate_ranges_apart(self):
+        items = [{"path": "a", "line": 1, "end_line": 3}, {"path": "a", "line": 10, "end_line": 12},
+                 {"path": "a", "line": 3, "end_line": 10}, {"path": "b", "line": 1, "end_line": 3},
+                 {"path": "a", "line": 20, "end_line": 20}]
+        self.assertEqual([[0, 1, 2], [3], [4]], j.overlap_groups(items, [0, 1, 2, 3, 4]))
+        self.assertEqual([[0], [1]], j.overlap_groups(items, [0, 1]))
+        merged = j.inline_comment([dict(items[0], title="x", body="y"), dict(items[2], title="z", body="w")])
+        self.assertEqual((1, 10), (merged["start_line"], merged["line"]))
+
+    def advance_head(self, path):
+        (self.head_dir / path).write_text("next\n")
+        e.git(self.head_dir, "add", "--", path)
+        e.git(self.head_dir, "commit", "-qm", "next")
+        self.pr.head.sha = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        os.environ.update(REVIEW_HEAD=self.pr.head.sha, GITHUB_RUN_ID="124")
+        self.pr.writes.clear()
+
+    def test_prior_summary_finding_keeps_full_text_when_it_becomes_anchorable(self):
+        item = finding(path="helper.py", mechanism="Only copy of this mechanism")
+        self.build([item])
+        j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        self.assertEqual([], old["roots"])
+        self.advance_head("helper.py")
+        with patch.object(j, "records", return_value={123: old}):
+            self.build([item])
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual([], self.pr.roots, "an identical prior finding opened another thread")
+        newest = self.summary_after(old["summary"])
+        self.assertIn("| below |", newest)
+        self.assertIn("Only copy of this mechanism", newest.split("<details>")[0])
+
+    def test_prior_thread_findings_repeat_full_text_when_github_moves_or_outdates_the_root(self):
+        # GitHub moves a live root's commit_id to the new head and outdates a root whose
+        # line is rewritten; neither state may leave a finding with no visible text.
+        items = [finding(path="app.py", title="First", mechanism="One mechanism"),
+                 finding(path="app.py", title="Second", mechanism="Another mechanism")]
+        self.build(items)
+        j.publish_artifact(self.artifact, self.head_dir)
+        record = json.loads((self.root / "completion.json").read_text())
+        root = self.pr.roots[0]
+        self.assertIs(root, f.owned_root(self.pr, NS(raw_data={"in_reply_to_id": root.id}, path=root.path), {123: record}))
+        self.advance_head("app.py")
+        root.commit_id = self.pr.head.sha
+        root.raw_data["line"] = None
+        with patch.object(j, "records", return_value={123: record}):
+            self.build(items)
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len(self.pr.roots), "grouped findings were posted twice")
+        newest = self.summary_after(record["summary"]).split("<details>")[0]
+        self.assertEqual(2, newest.count("| below |"))
+        self.assertIn("One mechanism", newest)
+        self.assertIn("Another mechanism", newest)
+
+    def summary_after(self, old_summary):
+        return max((c for c in self.pr.comments.values() if c.id != old_summary and f.RESULT.search(c.body)
+                    and not c.body.startswith("<!-- agent-review-status:v1")), key=lambda c: c.id).body
+
+    def test_success_collapses_status_and_earlier_reviewer_comments_only(self):
+        calls = []
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: calls.append((name, data)))
+        self.build([finding(path="app.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+        summary = next(c for c in self.pr.comments.values() if f.RESULT.search(c.body) and c is not status)
+        status.raw_data["node_id"], summary.raw_data["node_id"] = "STATUS", "SUMMARY"
+        other = Comment(50, "Other workflow quoted agent-review-result:v1", NS(**f.BOT), {"node_id": "OTHER"})
+        human = Comment(51, summary.body, NS(**f.JOSH), {"node_id": "HUMAN"})
+        pending = Comment(52, "<!-- agent-review-notice:v1 run=9 -->\nPublication pending", NS(**f.BOT), {"node_id": "PENDING"})
+        later = Comment(500, status.body, NS(**f.BOT), {"node_id": "LATER"})
+        self.pr.comments.update({50: other, 51: human, 52: pending, 500: later})
+        j.collapse_earlier(self.pr, 400, 401, {})
+        self.assertEqual([], calls, "a parseable record is not immutable workflow proof")
+        j.collapse_earlier(self.pr, 400, 401, {123: old})
+        self.assertEqual({"STATUS"}, {data["subjectId"] for _, data in calls})
+        self.assertEqual({"minimizeComment"}, {name for name, _ in calls})
+        self.assertTrue(all(data["classifier"] == "OUTDATED" for _, data in calls))
+        self.assertEqual(old, f.parse_record(status, self.pr.comments))
+        # The run's own status, at exactly status_id, must stay visible for the failure notifier.
+        calls.clear()
+        j.collapse_earlier(self.pr, status.id, summary.id, {123: old})
+        self.assertEqual(set(), {data["subjectId"] for _, data in calls})
+
+    def test_full_review_omitting_a_finding_keeps_its_earlier_summary_visible(self):
+        hidden = set()
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
+        self.build([finding(path="helper.py", mechanism="Only copy of this advice")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+        status.raw_data["node_id"] = "OLD-STATUS"
+        self.pr.comments[old["summary"]].raw_data["node_id"] = "OLD-SUMMARY"
+        self.advance_head("app.py")
+        full = {"kind": "full", "from": self.pr.base.sha, "to": self.pr.head.sha, "full_head": True, "parent": None}
+        with patch.object(j, "records", return_value={123: old}), \
+                patch.object(j.followups, "scope_for", return_value=full):
+            self.build()
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual({"OLD-STATUS"}, hidden)
+
+    def test_incremental_review_keeps_every_earlier_summary_visible(self):
+        hidden = set()
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
+        for findings in ([finding(path="helper.py")], [finding(path="app.py")], []):
+            with self.subTest(findings=len(findings)):
+                hidden.clear()
+                self.pr.comments = {k: v for k, v in self.pr.comments.items() if k == 9}
+                self.pr.roots.clear()
+                self.pr.writes.clear()
+                os.environ.update(REVIEW_HEAD=self.env["REVIEW_HEAD"], GITHUB_RUN_ID="123")
+                self.pr.head.sha = self.env["REVIEW_HEAD"]
+                e.git(self.head_dir, "checkout", "-q", self.env["REVIEW_HEAD"])
+                # A zero-finding summary can hold the only disclosure of a coverage gap.
+                with patch.object(e, "unopened_regions", return_value=["docs/big.md"]):
+                    self.build(findings)
+                    j.publish_artifact(self.artifact, self.head_dir)
+                old = json.loads((self.root / "completion.json").read_text())
+                status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+                status.raw_data["node_id"] = "OLD-STATUS"
+                self.pr.comments[old["summary"]].raw_data["node_id"] = "OLD-SUMMARY"
+                self.advance_head("app.py")
+                with patch.object(j, "records", return_value={123: old}):
+                    self.build()
+                    j.publish_artifact(self.artifact, self.head_dir)
+                self.assertEqual({"OLD-STATUS"}, hidden)
+
+    def test_collapse_refusal_never_fails_a_published_review(self):
+        import io
+        from github import GithubException
+        calls = []
+        def refuse(*_):
+            calls.append(True)
+            raise GithubException(403, {"message": "private response detail"})
+        self.pr.requester = NS(graphql_named_mutation=refuse)
+        self.build([finding(path="app.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+        status.raw_data["node_id"] = "OLD-STATUS"
+        self.advance_head("app.py")
+        output = io.StringIO()
+        with patch.object(j, "records", return_value={123: old}), patch("sys.stdout", output):
+            self.build([finding(path="app.py")])
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertTrue((self.root / "completion.json").is_file())
+        self.assertEqual([True], calls)
+        self.assertEqual("Earlier review comments were left visible (GithubException)\n", output.getvalue())
+
+    def test_failed_completion_upload_keeps_the_notifier_warning_visible(self):
+        import io
+        hidden = set()
+        create = self.pr.create_issue_comment
+        def create_with_node(body):
+            comment = create(body)
+            comment.raw_data["node_id"] = str(comment.id)
+            return comment
+        self.pr.create_issue_comment = create_with_node
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
+        self.build([finding(path="app.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+
+        # Run the shipped notifier as it runs after the completion upload fails.
+        workflow = yaml.load((Path(__file__).resolve().parents[1] /
+                              ".github/workflows/agent-review-reusable.yaml").read_text(), Loader=yaml.BaseLoader)
+        script = workflow["jobs"]["notify-failure"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        def request(req):
+            if req.full_url.endswith("/pulls/1"):
+                value = {"state": "open", "head": {"sha": self.pr.head.sha, "repo": {"full_name": self.repo.full_name, "fork": False}},
+                         "base": {"sha": self.pr.base.sha, "repo": {"full_name": self.repo.full_name}}}
+            elif req.method == "GET":
+                value = [{"id": c.id, "body": c.body, "user": vars(c.user)} for c in self.pr.comments.values()]
+            else:
+                self.assertEqual("PATCH", req.method)
+                self.assertTrue(req.full_url.endswith("/" + str(status.id)))
+                status.edit(json.loads(req.data)["body"])
+                value = {"id": status.id}
+            return io.BytesIO(json.dumps(value).encode())
+        with patch.dict(os.environ, {"GH_TOKEN": "fixture", "ADMISSION_RESULT": "success"}), \
+                patch("urllib.request.urlopen", side_effect=request):
+            exec(compile(script, "<trusted-notifier>", "exec"), {})
+        self.assertIn("Treat this run as incomplete", status.body)
+        self.assertNotIn(str(status.id), hidden)
+
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
