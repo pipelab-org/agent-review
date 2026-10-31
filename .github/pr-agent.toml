@@ -13,7 +13,8 @@
 # 2026-10-30 (one run per historical case before the provider usage limit stopped it),
 # Terra high reviews cost $0.32-$1.29 in 10-26 turns and Sol medium $0.26-$1.19 in
 # 7-20 turns, so both passes get USD 2. Provisional until a full 3-run scoring.
-# Effort values: https://developers.openai.com/api/docs/models/gpt-6.1-terra .
+# Effort values: https://developers.openai.com/api/docs/models/gpt-6.1-terra and
+# https://developers.openai.com/api/docs/models/gpt-6.1-sol .
 # max_model_tokens is the largest allowance billed at standard rates by both
 # providers: OpenAI bills above 272K input tokens at long-context rates
 # (https://developers.openai.com/api/docs/pricing), and Claude 4.6+ models other
