@@ -640,18 +640,22 @@ def codex_error_cause(error):
     return f"{CODEX_ERROR_CAUSES[info]} (codex_error_info={info}{suffix}); no paid retry"
 
 
-def codex_failure_cause(home):
-    """The first classified error Codex recorded, or None; never raises.
+def codex_failure_cause(home, ignore=frozenset()):
+    """The first classified error this pass recorded, or None; never raises.
 
     A best-effort diagnostic must not replace the fixed failure message, so
     unreadable files and non-object records count as no evidence. The first
     error matches codex_progress, which aborts on the first error event.
+    Rollouts in `ignore` predate this pass, so a shared home cannot lend an
+    earlier pass's cause to a later failure.
     """
     try:
         paths = sorted(Path(home).glob("sessions/**/*.jsonl"))
     except OSError:
         return None
     for path in paths:
+        if path in ignore:
+            continue
         try:
             lines = path.read_text().splitlines()
         except (OSError, ValueError):  # ValueError includes UnicodeDecodeError
@@ -845,6 +849,7 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace):
         raise ReviewAbort("Codex prompt exceeds config.max_model_tokens")
     output.with_suffix(".prompt").write_text(prompt)
     command = codex_command(settings, head, home, schema, output, action)
+    earlier = frozenset(Path(home).glob("sessions/**/*.jsonl"))
     env = clean_env()
     # The Codex pass authenticates through the action's proxy. A shell-capable
     # read-only agent must not inherit another provider's credential.
@@ -872,7 +877,7 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace):
             if not chunk:
                 selector.unregister(proc.stdout)
         if proc.wait(timeout=max(deadline - time.monotonic(), 0)) != 0:
-            raise ReviewAbort(codex_failure_cause(home)
+            raise ReviewAbort(codex_failure_cause(home, earlier)
                               or "Codex action failed; inspect provider account, read-only sandbox and schema")
     except BaseException:
         if proc.poll() is None:

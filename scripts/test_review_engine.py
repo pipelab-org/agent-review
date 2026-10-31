@@ -477,6 +477,8 @@ class CodexTests(unittest.TestCase):
             self.assertTrue(e.codex_failure_cause(home).startswith("OpenAI rejected the API key"))
             (home / "sessions/d.jsonl").mkdir()  # an unreadable entry matching the glob
             self.assertTrue(e.codex_failure_cause(home).startswith("OpenAI rejected the API key"))
+            # A rollout from an earlier pass in a shared home is not this pass's cause.
+            self.assertIsNone(e.codex_failure_cause(home, frozenset({home / "sessions/c.jsonl"})))
 
     def test_codex_progress_names_the_classified_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -496,16 +498,24 @@ class CodexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home, workspace = Path(tmp) / "home", Path(tmp) / "work"
             (home / "sessions").mkdir(parents=True); workspace.mkdir()
-            failing = [os.environ.get("PYTHON", "python3"), "-c", "import sys; sys.exit(1)"]
-            with patch.object(e, "configure_codex"), patch.object(e, "codex_command", return_value=failing):
-                with self.assertRaisesRegex(e.ReviewAbort, "^Codex action failed; inspect provider account"):
+            python = os.environ.get("PYTHON", "python3")
+            failing = [python, "-c", "import sys; sys.exit(1)"]
+            # Like Codex, this process writes its own rollout during the pass, then fails.
+            recorded = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "error": {
+                "message": "private", "codex_error_info": {"response_stream_disconnected": {"http_status_code": None}}}}})
+            writes_then_fails = [python, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2]); "
+                                 "sys.exit(1)", str(home / "sessions/rollout.jsonl"), recorded]
+            # A rollout left by an earlier pass in the shared home.
+            (home / "sessions/earlier.jsonl").write_text(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "error": {"codex_error_info": "unauthorized"}}}))
+            with patch.object(e, "configure_codex"):
+                with patch.object(e, "codex_command", return_value=failing), \
+                        self.assertRaisesRegex(e.ReviewAbort, "^Codex action failed; inspect provider account"):
                     e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
-                (home / "sessions/rollout.jsonl").write_text(json.dumps({"type": "event_msg", "payload": {
-                    "type": "task_complete", "error": {"message": "private",
-                    "codex_error_info": {"response_stream_disconnected": {"http_status_code": None}}}}}))
-                with self.assertRaisesRegex(e.ReviewAbort,
-                                            r"^OpenAI response stream disconnected; request the review again "
-                                            r"\(codex_error_info=response_stream_disconnected\); no paid retry$"):
+                with patch.object(e, "codex_command", return_value=writes_then_fails), \
+                        self.assertRaisesRegex(e.ReviewAbort,
+                                               r"^OpenAI response stream disconnected; request the review again "
+                                               r"\(codex_error_info=response_stream_disconnected\); no paid retry$"):
                     e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
 
     def test_single_request_above_the_allowance_aborts(self):
