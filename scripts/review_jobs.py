@@ -301,18 +301,20 @@ def publish_review(repo, pr, ctx, policy, plan, result):
     findings = [public_finding(f) for f in result["findings"]]
     files = {f["path"]: f for f in plan["bundle"]["files"]}
     previous = {followups.canonical(f) for record in proof.values() for f in record["findings"]}
-    comments = []
-    for finding in findings:
+    placement, anchored = [], []
+    for index, finding in enumerate(findings):
         file = files.get(finding["path"])
         # Related-source or unchanged lines remain in the summary, never a fabricated anchor.
-        if (file and finding["line"] in anchor_lines(file["patch"])
-                and finding["end_line"] in anchor_lines(file["patch"])
-                and followups.canonical(finding) not in previous):
-            comment = {"path": finding["path"], "line": finding["end_line"], "side": "RIGHT",
-                       "body": f"**{finding['title']}**\n\n{finding['body']}"}
-            if finding["end_line"] != finding["line"]:
-                comment.update(start_line=finding["line"], start_side="RIGHT")
-            comments.append(comment)
+        if not (file and finding["line"] in anchor_lines(file["patch"])
+                and finding["end_line"] in anchor_lines(file["patch"])):
+            placement.append("summary")
+        elif followups.canonical(finding) in previous:
+            # Exact prior findings keep their existing thread instead of opening another.
+            placement.append("earlier")
+        else:
+            placement.append("inline")
+            anchored.append(index)
+    comments = [inline_comment([findings[i] for i in group]) for group in overlap_groups(findings, anchored)]
     key = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
     roots = []
     def fresh():
@@ -320,17 +322,7 @@ def publish_review(repo, pr, ctx, policy, plan, result):
     status = pr.create_issue_comment(notice + "\nReview publication pending; no completed review yet.")
     if comments:
         publish.InlinePublisher(pr, ctx["head"], fresh, roots)(commit=repo.get_commit(ctx["head"]), event="COMMENT", comments=comments)
-    text = ("No findings reported by the completed passes." if not findings else
-            "\n\n".join(f"**{f['title']}** ({f['path']}:{f['line']})\n\n{f['body']}" for f in findings))
-    text += (f"\n\nReviewed base `{ctx['base']}` and head `{ctx['head']}`."
-             f"\n\nReviewer source `{ctx['reviewer']}`; policy `{ctx['profile_sha']}`."
-             f"\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
-             "\n\nEarlier findings and threads remain for the maintainer's sweep."
-             f"\n\nDeclared exclusions: `{json.dumps(plan['bundle']['exclusions']).replace(chr(96), chr(92)+'u0060')}`.")
-    unopened = engine.unopened_regions(plan["bundle"], result["receipt"]["passes"])
-    if unopened:
-        text += ("\n\nSent as changed regions only and not opened by any pass: "
-                 f"`{json.dumps(unopened).replace(chr(96), chr(92)+'u0060')}`.")
+    text = summary_text(ctx, scope, plan["bundle"], result, findings, placement)
     # Check sizes before any success transition; a partial publication is never reusable.
     if len(text.encode()) > followups.MAX_DATA_BYTES:
         raise ReviewAbort("Summary exceeds the existing data budget")
@@ -361,6 +353,107 @@ def publish_review(repo, pr, ctx, policy, plan, result):
     if not followups.identity(actual.user, followups.BOT) or actual.body != body:
         raise ReviewAbort("Success publication could not be verified")
     followups.write_completion(os.environ["REVIEW_COMPLETION_PATH"], dict(evidence, digest=digest))
+    collapse_earlier(pr, status.id, summary.id)
+
+
+def overlap_groups(findings, indexes):
+    """Group anchored findings whose line ranges overlap in the same file.
+
+    Every finding stays in the summary and completion evidence; grouping only decides
+    how many inline threads carry them. Exact range overlap, no similarity heuristic.
+    """
+    groups = []
+    for index in indexes:
+        item = findings[index]
+        touching = [g for g in groups if any(
+            findings[i]["path"] == item["path"] and findings[i]["line"] <= item["end_line"]
+            and item["line"] <= findings[i]["end_line"] for i in g)]
+        merged = [i for g in touching for i in g] + [index]
+        groups = [g for g in groups if g not in touching] + [sorted(merged)]
+    return sorted(groups)
+
+
+def inline_comment(group):
+    first, last = min(f["line"] for f in group), max(f["end_line"] for f in group)
+    if len(group) == 1:
+        body = f"**{group[0]['title']}**\n\n{group[0]['body']}"
+    else:
+        body = (f"**{len(group)} findings on these lines**\n\n"
+                + "\n\n---\n\n".join(f"**{f['title']}**\n\n{f['body']}" for f in group))
+    comment = {"path": group[0]["path"], "line": last, "side": "RIGHT", "body": body}
+    if last != first:
+        comment.update(start_line=first, start_side="RIGHT")
+    return comment
+
+
+def code(text):
+    return "`" + text.replace("`", "'") + "`"
+
+
+def cell(text):
+    return " ".join(text.split()).replace("|", "\\|")
+
+
+WHERE = {"inline": "inline thread", "earlier": "earlier thread", "summary": "below"}
+
+
+def summary_text(ctx, scope, bundle, result, findings, placement):
+    """Short headline and table first; full text only for findings with no thread."""
+    if not findings:
+        text = "**AI review:** No findings reported by the completed passes."
+    else:
+        counts = {}
+        for item in result["findings"]:
+            counts[item["confidence"]] = counts.get(item["confidence"], 0) + 1
+        tally = ", ".join(f"{counts[c]} {c}" for c in ("high", "medium", "low") if c in counts)
+        noun = "finding" if len(findings) == 1 else "findings"
+        rows = [f"| {item['confidence']} | {cell(f['title'])} | {code(f['path'] + ':' + str(f['line']))} | {WHERE[where]} |"
+                for item, f, where in zip(result["findings"], findings, placement)]
+        text = (f"**AI review:** {len(findings)} {noun} ({tally}).\n\n"
+                "| Confidence | Finding | Location | Discussion |\n|---|---|---|---|\n" + "\n".join(rows))
+        loose = [f for f, where in zip(findings, placement) if where == "summary"]
+        if loose:
+            text += "\n\n**Not on a changed line**\n\n" + "\n\n".join(
+                f"**{f['title']}** ({code(f['path'] + ':' + str(f['line']))})\n\n{f['body']}" for f in loose)
+    details = (f"Reviewed base `{ctx['base']}` and head `{ctx['head']}`."
+               f"\n\nReviewer source `{ctx['reviewer']}`; policy `{ctx['profile_sha']}`."
+               f"\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
+               "\n\nEarlier findings and threads remain for the maintainer's sweep."
+               f"\n\nDeclared exclusions: `{json.dumps(bundle['exclusions']).replace(chr(96), chr(92)+'u0060')}`.")
+    unopened = engine.unopened_regions(bundle, result["receipt"]["passes"])
+    if unopened:
+        details += ("\n\nSent as changed regions only and not opened by any pass: "
+                    f"`{json.dumps(unopened).replace(chr(96), chr(92)+'u0060')}`.")
+    return text + "\n\n<details><summary>Review details</summary>\n\n" + details + "\n\n</details>"
+
+
+# Published comments carrying these markers are reviewer bookkeeping or older results.
+COLLAPSIBLE_PREFIXES = ("<!-- agent-review-status:v1", "<!-- agent-review-notice:v1")
+
+
+def collapse_earlier(pr, status_id, summary_id):
+    """Hide this run's status line and earlier reviewer comments as outdated.
+
+    GitHub's minimizeComment changes visibility only, never the body, so digest-bound
+    records stay verifiable. It is cosmetic: a refusal leaves comments visible and never
+    fails a review that already published. Comments created after this run's status
+    belong to a concurrent run and are left alone.
+    Source: https://docs.github.com/en/graphql/reference/mutations#minimizecomment
+    """
+    try:
+        for comment in pr.get_issue_comments():
+            body = comment.body if isinstance(comment.body, str) else ""
+            if (comment.id == summary_id or comment.id > status_id
+                    or not followups.identity(comment.user, followups.BOT)
+                    or not (body.startswith(COLLAPSIBLE_PREFIXES) or publish.RESULT_MARKER in body)):
+                continue
+            node = comment.raw_data.get("node_id")
+            if isinstance(node, str) and node:
+                pr.requester.graphql_named_mutation(
+                    "minimizeComment", {"subjectId": node, "classifier": "OUTDATED"},
+                    "minimizedComment { isMinimized }")
+    except Exception as error:
+        print(f"Earlier review comments were left visible ({type(error).__name__})")
 
 
 UNVERIFIED_LOCATION_NOTE = "_Location could not be confirmed at the reviewed head; listed in the summary only._"

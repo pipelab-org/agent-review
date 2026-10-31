@@ -288,6 +288,80 @@ class JobTests(unittest.TestCase):
             self.assertEqual(count, len(self.pr.writes))
             self.assertTrue(any("The resolved local value" in c.body for c in self.pr.roots))
 
+    def summary(self):
+        return next(c.body for c in self.pr.comments.values()
+                    if f.RESULT.search(c.body) and not c.body.startswith("<!-- agent-review-status:v1"))
+
+    def test_summary_is_a_table_and_inline_text_is_not_repeated(self):
+        self.build([finding(path="app.py", mechanism="Inline mechanism text"),
+                    finding(path="helper.py", title="Related helper", mechanism="Helper mechanism text",
+                            confidence="medium")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        summary = self.summary()
+        self.assertTrue(summary.startswith("**AI review:** 2 findings (1 high, 1 medium)."))
+        self.assertIn("| high | Missing state transfer | `app.py:1` | inline thread |", summary)
+        self.assertIn("| medium | Related helper | `helper.py:1` | below |", summary)
+        self.assertNotIn("Inline mechanism text", summary)
+        self.assertIn("Helper mechanism text", summary.split("<details>")[0])
+        self.assertIn("Reviewed base", summary.split("<details>")[1])
+
+    def test_table_cells_cannot_break_the_table(self):
+        self.build([finding(path="app.py", title="a | b\nc")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertIn("| a \\| b c |", self.summary())
+
+    def test_overlapping_findings_share_one_thread_and_keep_both_records(self):
+        self.build([finding(path="app.py", title="First", mechanism="One mechanism"),
+                    finding(path="app.py", title="Second", mechanism="Another mechanism", confidence="low")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len(self.pr.roots))
+        body = self.pr.roots[0].body
+        self.assertTrue(body.startswith("**2 findings on these lines**"))
+        self.assertIn("One mechanism", body)
+        self.assertIn("Another mechanism", body)
+        record = json.loads((self.root / "completion.json").read_text())
+        self.assertEqual(2, len(record["findings"]))
+        self.assertEqual(1, len(record["roots"]))
+
+    def test_overlap_groups_merge_transitively_and_keep_separate_ranges_apart(self):
+        items = [{"path": "a", "line": 1, "end_line": 3}, {"path": "a", "line": 10, "end_line": 12},
+                 {"path": "a", "line": 3, "end_line": 10}, {"path": "b", "line": 1, "end_line": 3},
+                 {"path": "a", "line": 20, "end_line": 20}]
+        self.assertEqual([[0, 1, 2], [3], [4]], j.overlap_groups(items, [0, 1, 2, 3, 4]))
+        self.assertEqual([[0], [1]], j.overlap_groups(items, [0, 1]))
+        merged = j.inline_comment([dict(items[0], title="x", body="y"), dict(items[2], title="z", body="w")])
+        self.assertEqual((1, 10), (merged["start_line"], merged["line"]))
+
+    def test_success_collapses_status_and_earlier_reviewer_comments_only(self):
+        calls = []
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: calls.append((name, data)))
+        old = Comment(50, "<!-- agent-review-notice:v1 run=1 -->\nReview incomplete", NS(**f.BOT), {"node_id": "OLD"})
+        human = Comment(51, "<!-- agent-review-notice:v1 run=1 --> copied", NS(**f.JOSH), {"node_id": "HUMAN"})
+        self.pr.comments.update({50: old, 51: human})
+        self.build([finding(path="app.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+        summary = next(c for c in self.pr.comments.values() if f.RESULT.search(c.body) and c is not status)
+        hidden = {data["subjectId"] for _, data in calls}
+        self.assertEqual({"OLD"}, hidden - {None})
+        self.assertEqual({"minimizeComment"}, {name for name, _ in calls})
+        self.assertTrue(all(data["classifier"] == "OUTDATED" for _, data in calls))
+        status.raw_data["node_id"], summary.raw_data["node_id"] = "STATUS", "SUMMARY"
+        later = Comment(status.id + 50, "<!-- agent-review-notice:v1 run=9 -->", NS(**f.BOT), {"node_id": "LATER"})
+        self.pr.comments[later.id] = later
+        calls.clear()
+        j.collapse_earlier(self.pr, status.id, summary.id)
+        self.assertEqual({"OLD", "STATUS"}, {data["subjectId"] for _, data in calls})
+
+    def test_collapse_refusal_never_fails_a_published_review(self):
+        def refuse(*_):
+            raise RuntimeError("forbidden")
+        self.pr.requester = NS(graphql_named_mutation=refuse)
+        self.pr.comments[50] = Comment(50, "<!-- agent-review-notice:v1 run=1 -->", NS(**f.BOT), {"node_id": "OLD"})
+        self.build([finding(path="app.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertTrue((self.root / "completion.json").is_file())
+
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
