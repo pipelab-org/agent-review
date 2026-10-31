@@ -305,6 +305,13 @@ class JobTests(unittest.TestCase):
         self.assertIn("Helper mechanism text", summary.split("<details>")[0])
         self.assertIn("Reviewed base", summary.split("<details>")[1])
 
+    def test_table_and_full_text_show_each_findings_line_range(self):
+        self.build([finding(path="helper.py", line=1, end_line=3, title="Spanning helper")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        summary = self.summary().split("<details>")[0]
+        self.assertIn("| `helper.py:1-3` | below |", summary)
+        self.assertIn("**Spanning helper** (`helper.py:1-3`)", summary)
+
     def test_table_cells_cannot_break_the_table(self):
         self.build([finding(path="app.py", title="a | b\nc")])
         j.publish_artifact(self.artifact, self.head_dir)

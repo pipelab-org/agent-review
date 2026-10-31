@@ -394,6 +394,12 @@ def code(text):
     return fence + (" " + text + " " if "`" in text else text) + fence
 
 
+def location(finding):
+    """Head location with the full line range when a finding spans more than one line."""
+    span = str(finding["line"]) if finding["end_line"] == finding["line"] else f"{finding['line']}-{finding['end_line']}"
+    return code(finding["path"] + ":" + span)
+
+
 def cell(text):
     return html.escape(" ".join(text.split()), quote=False).replace("\\", "\\\\").replace("|", "\\|")
 
@@ -411,14 +417,14 @@ def summary_text(ctx, scope, bundle, result, findings, placement):
             counts[item["confidence"]] = counts.get(item["confidence"], 0) + 1
         tally = ", ".join(f"{counts[c]} {c}" for c in ("high", "medium", "low") if c in counts)
         noun = "finding" if len(findings) == 1 else "findings"
-        rows = [f"| {item['confidence']} | {cell(f['title'])} | {code(f['path'] + ':' + str(f['line'])).replace('|', chr(92) + '|')} | {WHERE[where]} |"
+        rows = [f"| {item['confidence']} | {cell(f['title'])} | {location(f).replace('|', chr(92) + '|')} | {WHERE[where]} |"
                 for item, f, where in zip(result["findings"], findings, placement)]
         text = (f"**AI review:** {len(findings)} {noun} ({tally}).\n\n"
                 "| Confidence | Finding | Location | Discussion |\n|---|---|---|---|\n" + "\n".join(rows))
         loose = [f for f, where in zip(findings, placement) if where == "summary"]
         if loose:
             text += "\n\n**Findings without a new thread**\n\n" + "\n\n".join(
-                f"**{f['title']}** ({code(f['path'] + ':' + str(f['line']))})\n\n{f['body']}" for f in loose)
+                f"**{f['title']}** ({location(f)})\n\n{f['body']}" for f in loose)
     details = (f"Reviewed base `{ctx['base']}` and head `{ctx['head']}`."
                f"\n\nReviewer source `{ctx['reviewer']}`; policy `{ctx['profile_sha']}`."
                f"\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
