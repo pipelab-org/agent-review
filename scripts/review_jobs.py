@@ -301,7 +301,7 @@ def publish_review(repo, pr, ctx, policy, plan, result):
         raise ReviewAbort("Findings bundle is not bound to admitted commits")
     findings = [public_finding(f) for f in result["findings"]]
     files = {f["path"]: f for f in plan["bundle"]["files"]}
-    previous = {followups.canonical(f) for record in proof.values() for f in record["findings"]}
+    previous = prior_thread_findings(pr, proof)
     placement, anchored = [], []
     for index, finding in enumerate(findings):
         file = files.get(finding["path"])
@@ -385,6 +385,35 @@ def inline_comment(group):
     if last != first:
         comment.update(start_line=first, start_side="RIGHT")
     return comment
+
+
+def prior_thread_findings(pr, proof):
+    """Only omit finding text when its verified inline root still exists intact."""
+    if not any(record["roots"] for record in proof.values()):
+        return set()
+    try:
+        live = {comment.id: comment for comment in pr.get_review_comments()}
+    except Exception as error:
+        if reliability.throttled(error):
+            raise
+        return set()
+    previous = set()
+    for record in proof.values():
+        for entry in record["roots"]:
+            root = live.get(entry["id"])
+            if (root is None or not followups.identity(root.user, followups.BOT)
+                    or root.raw_data.get("in_reply_to_id") is not None
+                    or root.raw_data.get("pull_request_review_id") != entry["review_id"]
+                    or root.commit_id != entry["commit"] or root.path != entry["path"]
+                    or not isinstance(root.body, str) or followups.digest(root.body) != entry["digest"]):
+                continue
+            members = [f for f in record["findings"] if f["path"] == root.path
+                       and inline_comment([f])["body"] in root.body]
+            # Reconstruct the whole body, including grouped roots. Ambiguous membership
+            # never suppresses a finding, including delimiters embedded in model text.
+            if members and inline_comment(members)["body"] == root.body:
+                previous.update(followups.canonical(f) for f in members)
+    return previous
 
 
 def code(text):

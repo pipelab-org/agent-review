@@ -344,6 +344,53 @@ class JobTests(unittest.TestCase):
         merged = j.inline_comment([dict(items[0], title="x", body="y"), dict(items[2], title="z", body="w")])
         self.assertEqual((1, 10), (merged["start_line"], merged["line"]))
 
+    def advance_head(self, path):
+        (self.head_dir / path).write_text("next\n")
+        e.git(self.head_dir, "add", "--", path)
+        e.git(self.head_dir, "commit", "-qm", "next")
+        self.pr.head.sha = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        os.environ.update(REVIEW_HEAD=self.pr.head.sha, GITHUB_RUN_ID="124")
+        self.pr.writes.clear()
+
+    def test_prior_summary_finding_gets_a_real_thread_when_it_becomes_anchorable(self):
+        item = finding(path="helper.py")
+        self.build([item])
+        j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        self.assertEqual([], old["roots"])
+        self.advance_head("helper.py")
+        with patch.object(j, "records", return_value={123: old}):
+            self.build([item])
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len(self.pr.roots))
+        newest = max(self.pr.comments.values(), key=lambda c: c.id)
+        self.assertIn("| inline thread |", newest.body)
+        self.assertNotIn("| earlier thread |", newest.body)
+
+    def test_prior_thread_proof_requires_intact_live_roots_and_supports_grouping(self):
+        self.build([finding(path="app.py", title="First", mechanism="One mechanism"),
+                    finding(path="app.py", title="Second", mechanism="Another mechanism")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        record = json.loads((self.root / "completion.json").read_text())
+        proof = {123: record}
+        expected = {f.canonical(item) for item in record["findings"]}
+        self.assertEqual(expected, j.prior_thread_findings(self.pr, proof))
+        root = self.pr.roots[0]
+        body = root.body
+        root.edit(body + "edited")
+        self.assertEqual(set(), j.prior_thread_findings(self.pr, proof))
+        root.edit(body)
+        self.pr.roots.clear()
+        self.assertEqual(set(), j.prior_thread_findings(self.pr, proof))
+        self.pr.roots.append(root)
+        self.advance_head("app.py")
+        with patch.object(j, "records", return_value=proof):
+            self.build([finding(path="app.py", title="First", mechanism="One mechanism"),
+                        finding(path="app.py", title="Second", mechanism="Another mechanism")])
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len(self.pr.roots), "grouped findings were posted twice")
+        self.assertEqual(2, max(self.pr.comments.values(), key=lambda c: c.id).body.count("| earlier thread |"))
+
     def test_success_collapses_status_and_earlier_reviewer_comments_only(self):
         calls = []
         self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: calls.append((name, data)))
