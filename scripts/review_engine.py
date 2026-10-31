@@ -641,22 +641,36 @@ def codex_error_cause(error):
 
 
 def codex_failure_cause(home):
-    """The last classified error Codex recorded in its rollouts, or None."""
-    cause = None
-    for path in sorted(Path(home).glob("sessions/**/*.jsonl")):
-        for raw in path.read_text().splitlines():
+    """The first classified error Codex recorded, or None; never raises.
+
+    A best-effort diagnostic must not replace the fixed failure message, so
+    unreadable files and non-object records count as no evidence. The first
+    error matches codex_progress, which aborts on the first error event.
+    """
+    try:
+        paths = sorted(Path(home).glob("sessions/**/*.jsonl"))
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            lines = path.read_text().splitlines()
+        except (OSError, ValueError):  # ValueError includes UnicodeDecodeError
+            continue
+        for raw in lines:
             try:
                 event = json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             payload = event.get("payload") if isinstance(event, dict) else None
-            if event.get("type") != "event_msg" or not isinstance(payload, dict):
+            if not isinstance(payload, dict) or event.get("type") != "event_msg":
                 continue
             # protocol.rs: ErrorEvent carries codex_error_info directly; TaskComplete under "error".
             error = payload if payload.get("type") == "error" else (
                 payload.get("error") if payload.get("type") == "task_complete" else None)
-            cause = codex_error_cause(error) or cause
-    return cause
+            cause = codex_error_cause(error)
+            if cause:
+                return cause
+    return None
 
 
 def codex_progress(home, head, strict=False, model=None, request_limit=None):

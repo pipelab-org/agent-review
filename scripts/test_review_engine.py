@@ -457,12 +457,26 @@ class CodexTests(unittest.TestCase):
             (home / "sessions/2026/10/30/rollout.jsonl").write_text(
                 "\n".join(json.dumps(v) for v in events) + "\n{truncated")
             cause = e.codex_failure_cause(home)
-            self.assertTrue(cause.startswith("OpenAI rejected the API key"))
+            # First classified error, matching codex_progress, which aborts on the first error event.
+            self.assertTrue(cause.startswith("OpenAI server overloaded"))
             self.assertNotIn("stream disconnected", cause)
             # A turn that completed without an error object leaves no cause.
             (home / "sessions/2026/10/30/rollout.jsonl").write_text(json.dumps(
                 {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "done"}}))
             self.assertIsNone(e.codex_failure_cause(home))
+
+    def test_codex_failure_cause_never_raises_on_bad_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "sessions").mkdir()
+            classified = json.dumps({"type": "event_msg", "payload": {"type": "error", "codex_error_info": "unauthorized"}})
+            (home / "sessions/a.jsonl").write_text('null\n[]\n5\n"text"\n' + "[" * 100000 + "\n")
+            (home / "sessions/b.jsonl").write_bytes(b"\xff\xfe not utf-8\n")
+            self.assertIsNone(e.codex_failure_cause(home))
+            (home / "sessions/c.jsonl").write_text(classified)
+            self.assertTrue(e.codex_failure_cause(home).startswith("OpenAI rejected the API key"))
+            (home / "sessions/d.jsonl").mkdir()  # an unreadable entry matching the glob
+            self.assertTrue(e.codex_failure_cause(home).startswith("OpenAI rejected the API key"))
 
     def test_codex_progress_names_the_classified_error(self):
         with tempfile.TemporaryDirectory() as tmp:
