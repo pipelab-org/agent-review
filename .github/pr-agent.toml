@@ -6,13 +6,14 @@
 # steps, the heaviest Opus pass about 170k tokens and 19 steps. Caps are about
 # twice that, priced from https://platform.claude.com/docs/en/about-claude/pricing
 # (Sonnet 5.5 $2/$10, Opus 5.5 $4/$20 per million input/output tokens).
-# Codex uses gpt-6.1-terra (owner choice, 2026-10-29) at
-# https://developers.openai.com/api/docs/pricing rates (checked 2026-10-29):
-# $1/$5, half of Sonnet, so the same token allowance is USD 1 per pass.
-# codex-deep runs xhigh effort; Artificial Analysis reports Terra using about
-# twice the tokens at its higher efforts, so its pass gets USD 2.
+# Codex depths (owner choice, 2026-10-30): codex runs gpt-6.1-terra at high effort,
+# codex-deep runs gpt-6.1-sol at medium effort. Rates from
+# https://developers.openai.com/api/docs/pricing (checked 2026-10-29): Terra $1/$5,
+# Sol $2/$10 per million input/output tokens. In a partial evaluation run on
+# 2026-10-30 (one run per historical case before the provider usage limit stopped it),
+# Terra high reviews cost $0.32-$1.29 in 10-26 turns and Sol medium $0.26-$1.19 in
+# 7-20 turns, so both passes get USD 2. Provisional until a full 3-run scoring.
 # Effort values: https://developers.openai.com/api/docs/models/gpt-6.1-terra .
-# Pending their own measurement.
 # max_model_tokens is the largest allowance billed at standard rates by both
 # providers: OpenAI bills above 272K input tokens at long-context rates
 # (https://developers.openai.com/api/docs/pricing), and Claude 4.6+ models other
@@ -41,12 +42,12 @@ max_budget_usd = 4.0
 
 [review_depth.codex]
 model = "gpt-6.1-terra"
-reasoning_effort = "medium"
+reasoning_effort = "high"
 max_turns = 40
-max_budget_usd = 1.0
+max_budget_usd = 2.0
 
 [review_depth.codex-deep]
-model = "gpt-6.1-terra"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 max_turns = 40
 max_budget_usd = 2.0

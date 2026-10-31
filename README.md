@@ -6,8 +6,8 @@ A maintainer-gated agentic pull request reviewer for GitHub Actions. Comment an 
 | --- | --- |
 | `/review` | Two independent Sonnet passes: bundle first, then callers first |
 | `/review deep` | One Opus pass |
-| `/review codex` | One GPT-6.1 Terra pass at medium effort |
-| `/review codex deep` | One GPT-6.1 Terra pass at xhigh effort |
+| `/review codex` | One GPT-6.1 Terra pass at high effort |
+| `/review codex deep` | One GPT-6.1 Sol pass at medium effort |
 
 The engine builds a merge-base diff with full changed files, falling back to changed regions when the configured input budget requires it. The reviewer can read related source. Each pass reports concrete introduced defects with a head location, trigger, consequence, repair, and confidence. Findings are merged by location and mechanism. Each pass can return up to six candidates; there is no evidence-challenge veto.
 
