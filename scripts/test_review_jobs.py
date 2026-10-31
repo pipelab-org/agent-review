@@ -1302,6 +1302,22 @@ class JobTests(unittest.TestCase):
         self.assertFalse(self.pr.threads[root.id]["isResolved"])
         self.assertIn(j.COMMAND_NOT_ATTEMPTED_NOTE, self.pr.roots[-1].body)
 
+    def test_unrelated_or_deleted_roots_never_cancel_verification_of_owned_threads(self):
+        proof, root = self.prior_threads()
+        # Another bot's thread whose root fetch would fail must never be fetched.
+        self.pr.threads[987654] = {"id": "THREAD_other", "isResolved": False, "isOutdated": True}
+        fetch, fetched = self.pr.get_review_comment, []
+        def recorded(comment_id):
+            fetched.append(comment_id)
+            return fetch(comment_id)
+        self.pr.get_review_comment = recorded
+        self.assertEqual([root.id], [item["root"]["id"] for item in j.collect_threads(self.pr, {123: proof})])
+        self.assertNotIn(987654, fetched, "an unowned root was fetched")
+        # A deleted owned root leaves only its own thread out.
+        from github import GithubException
+        self.pr.get_review_comment = lambda comment_id: (_ for _ in ()).throw(GithubException(404, {"message": "Not Found"}))
+        self.assertEqual([], j.collect_threads(self.pr, {123: proof}))
+
     def test_pending_or_incomplete_verification_reply_is_not_a_decision(self):
         proof, root = self.prior_threads()
         marker = f.verification_marker(root.id, "a" * 40)

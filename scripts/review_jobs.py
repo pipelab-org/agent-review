@@ -537,11 +537,15 @@ def reconstruct_root(root, record):
 
 
 def collect_threads(pr, proof):
-    if not any(record["roots"] for record in proof.values()):
+    # Only roots named in verified completion records can be ours; other threads on
+    # the pull request (other bots, people) are never fetched.
+    owned = {entry["id"] for record in proof.values() for entry in record["roots"]}
+    if not owned:
         return []
     threads, judged = followups.review_threads(pr), judged_roots(pr)
     result = [item for root_id, thread in threads.items()
-              if (item := thread_item(pr, proof, root_id, thread, judged)) is not None]
+              if root_id in owned
+              and (item := thread_item(pr, proof, root_id, thread, judged)) is not None]
     return sorted(result, key=lambda item: item["thread"])
 
 
@@ -588,6 +592,13 @@ def thread_item(pr, proof, root_id, thread, judged):
         return None
     try:
         root = pr.get_review_comment(root_id)
+    except Exception as error:
+        # A deleted or unreadable root leaves only that thread open; throttling
+        # still stops the run, as everywhere else in the engine.
+        if reliability.throttled(error):
+            raise
+        return None
+    try:
         record, entry = followups.verify_root(pr, root, proof)
         findings = reconstruct_root(root, record)
     except (followups.FollowupAbort, ReviewAbort):
