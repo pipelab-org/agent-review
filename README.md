@@ -13,11 +13,15 @@ The engine builds a merge-base diff with full changed files, falling back to cha
 
 Inference jobs have read-only GitHub permissions. A separate publisher validates the result and transcript-derived receipts, rechecks the captured commits and original command, then publishes resolvable inline threads and a short summary table. Findings on overlapping lines share one thread. Earlier verified success status lines are hidden as outdated; earlier summaries stay visible. Related-source findings stay in the summary when no changed line can anchor them. Immutable completion records support duplicate detection, incremental coverage, and verified follow-up replies.
 
+When a review runs inference, it can also verify open threads backed by its completion records. One batched pass uses that review's provider, model, read-only tools, and per-pass limits. A thread is resolved only after head-code evidence confirms every finding it carries is fixed and a verified reply records that evidence. Present, unclear, unowned, edited, or unverifiable findings stay open. Silence in a later review never resolves anything. A verification failure leaves threads open without failing the review. Unchanged snapshots skip inference and thread verification.
+
+Eligible inline replies read the head checkout with restricted file tools. They can answer earlier-head threads and resolve them when the human reports a fix that the code confirms, or when the code disproves every carried finding. Disputed findings that remain valid stay open with an explanation. Membership, event binding, provenance, and publication checks still apply.
+
 ## Required operator policy
 
 The central [.github/pr-agent.toml](.github/pr-agent.toml) retains its filename for compatibility. Each of `review_depth.default`, `review_depth.deep`, `review_depth.codex`, and `review_depth.codex-deep` requires `max_turns` and `max_budget_usd`. The code has no defaults; the shipped policy sets 40 turns, USD 2 per default pass, USD 4 per deep pass, USD 2 per codex pass, and USD 2 per codex-deep pass, so reviews run and incur provider charges once the provider secrets are configured. Removing or invalidating either setting fails before inference with the exact config key to set.
 
-The USD allowance applies **per pass**. A review's configured allowance is its pass count multiplied by that limit. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. The shipped Claude limits come from measured evaluation runs. Codex limits are provisional values from a partial evaluation run, as described in `.github/pr-agent.toml`.
+The USD allowance applies **per pass**. A review's configured allowance is its review pass count multiplied by that limit, plus one pass when thread verification runs. Verification that cannot fit the existing limits is skipped with a fixed notice. These are client-side cost estimates and can overshoot on an in-flight request; provider account limits remain the billing backstop. The shipped Claude limits come from measured evaluation runs. Codex limits are provisional values from a partial evaluation run, as described in `.github/pr-agent.toml`.
 
 ## Adoption
 

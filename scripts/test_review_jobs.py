@@ -35,6 +35,21 @@ class Pull:
         self.head = NS(sha=head, repo=NS(full_name=repo, fork=False))
         self.base = NS(sha=base, repo=NS(full_name=repo))
         self.comments, self.roots, self.reviews, self.writes = {}, [], {}, []
+        self.node_id, self.threads = "PR_fixture", {}
+        self.requester = NS(graphql_query=self.graphql_query, graphql_named_mutation=self.graphql_named_mutation)
+
+    def graphql_query(self, query, variables):
+        nodes = [dict(thread, comments={"nodes": [{"databaseId": root}]}) for root, thread in self.threads.items()]
+        return {}, {"data": {"node": {"reviewThreads": {"nodes": nodes,
+            "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
+
+    def graphql_named_mutation(self, name, data, schema):
+        if name == "resolveReviewThread":
+            self.writes.append(("resolve", data["threadId"]))
+            thread = next(t for t in self.threads.values() if t["id"] == data["threadId"])
+            thread["isResolved"] = True
+            return {}, {"thread": {"id": thread["id"], "isResolved": True}}
+        return {}, {}
 
     def get_issue_comments(self): return list(self.comments.values())
     def get_issue_comment(self, id): return self.comments[id]
@@ -54,8 +69,12 @@ class Pull:
         review = NS(id=id, user=NS(**f.BOT), commit_id=kwargs["commit"].sha, state="COMMENTED")
         self.reviews[id] = review
         for request in kwargs["comments"]:
-            self.roots.append(Comment(len(self.roots) + 300, request["body"], NS(**f.BOT),
-                         {"pull_request_review_id": id}, path=request["path"], commit_id=kwargs["commit"].sha))
+            root = Comment(len(self.roots) + 300, request["body"], NS(**f.BOT),
+                {"pull_request_review_id": id, "original_commit_id": kwargs["commit"].sha,
+                 "commit_id": kwargs["commit"].sha, "line": request["line"]},
+                path=request["path"], commit_id=kwargs["commit"].sha)
+            self.roots.append(root)
+            self.threads[root.id] = {"id": "THREAD_" + str(root.id), "isResolved": False, "isOutdated": False}
         return review
 
     def create_review_comment_reply(self, root, body):
@@ -123,12 +142,16 @@ class JobTests(unittest.TestCase):
 
     def build(self, findings=None):
         j.prepare(self.head_dir, self.plan)
-        def run(policy, bundle, strategy, head):
+        def run(policy, bundle, strategy, head, **kwargs):
             r = receipt(strategy); r["files_opened"] = ["app.py"]
+            if strategy == "verify-threads":
+                plan = json.loads(self.plan.read_text())
+                return {"output": {"threads": [{"thread": t["thread"], "status": "present", "evidence": []}
+                    for t in plan["threads"]]}, "receipt": r}
             return {"findings": findings or [], "receipt": r}
         with patch.object(e, "run_claude", side_effect=run) as provider:
             j.infer(self.plan, self.artifact, self.head_dir)
-        self.assertEqual(["bundle", "callers"], [c.args[2] for c in provider.call_args_list])
+        self.assertEqual(["bundle", "callers"], [c.args[2] for c in provider.call_args_list if c.args[2] != "verify-threads"])
         self.assertEqual([], self.pr.writes, "read-only stages attempted a write")
 
     def test_summary_names_region_files_no_pass_opened(self):
@@ -282,7 +305,8 @@ class JobTests(unittest.TestCase):
             plan = json.loads(self.plan.read_text())
             r = receipt("reply"); r["files_opened"] = []
             j.publish_reply(self.repo, self.pr, ctx, policy, plan,
-                            {"answer": "The resolved local value is lost during the copy.", "receipt": r})
+                            {"output": {"answer": "The resolved local value is lost during the copy.",
+                                "resolve": False, "reason": "none", "evidence": []}, "receipt": r})
             count = len(self.pr.writes)
             j.publish_reply(self.repo, self.pr, ctx, policy, plan, None)
             self.assertEqual(count, len(self.pr.writes))
@@ -356,6 +380,17 @@ class JobTests(unittest.TestCase):
         e.git(self.head_dir, "add", "--", path)
         e.git(self.head_dir, "commit", "-qm", "next")
         self.pr.head.sha = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        # GitHub moves commit_id for live comments; rewriting their line instead
+        # freezes that commit and sets line=null. original_commit_id never moves.
+        for comment in self.pr.roots:
+            thread = self.pr.threads.get(comment.raw_data.get("in_reply_to_id", comment.id))
+            if thread and not thread["isOutdated"]:
+                if comment.path == path:
+                    thread["isOutdated"] = True
+                    comment.raw_data["line"] = None
+                else:
+                    comment.commit_id = self.pr.head.sha
+                    comment.raw_data["commit_id"] = self.pr.head.sha
         os.environ.update(REVIEW_HEAD=self.pr.head.sha, GITHUB_RUN_ID="124")
         self.pr.writes.clear()
 
@@ -476,7 +511,7 @@ class JobTests(unittest.TestCase):
         def refuse(*_):
             calls.append(True)
             raise GithubException(403, {"message": "private response detail"})
-        self.pr.requester = NS(graphql_named_mutation=refuse)
+        self.pr.requester = NS(graphql_named_mutation=refuse, graphql_query=self.pr.graphql_query)
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
         old = json.loads((self.root / "completion.json").read_text())
@@ -526,6 +561,398 @@ class JobTests(unittest.TestCase):
             exec(compile(script, "<trusted-notifier>", "exec"), {})
         self.assertIn("Treat this run as incomplete", status.body)
         self.assertNotIn(str(status.id), hidden)
+
+
+    def prior_threads(self, grouped=False):
+        items = [finding(path="app.py", title="First")]
+        if grouped:
+            items.append(finding(path="app.py", title="Second", mechanism="Another cause"))
+        self.build(items)
+        j.publish_artifact(self.artifact, self.head_dir)
+        proof = json.loads((self.root / "completion.json").read_text())
+        root = self.pr.roots[0]
+        original = root.commit_id
+        self.advance_head("helper.py")
+        self.assertNotEqual(original, root.commit_id)
+        self.assertEqual(original, root.raw_data["original_commit_id"])
+        return proof, root
+
+    def verified(self, plan, status="fixed"):
+        r = receipt("verify-threads"); r["files_opened"] = ["app.py"]
+        return {"output": {"threads": [{"thread": t["thread"], "status": status,
+            "evidence": [{"finding": i, "path": "app.py", "line": 1, "change": "The value is preserved."}
+                         for i in range(len(t["findings"]))] if status == "fixed" else []}
+            for t in plan["threads"]]}, "receipt": r}
+
+    def prepare_verification(self, proof):
+        with patch.object(j, "records", return_value={123: proof}):
+            self.build()
+        return json.loads(self.plan.read_text())
+
+    def publish_verified(self, proof, plan, verification):
+        artifact = json.loads(self.artifact.read_text())
+        artifact.update(plan=plan, verification=verification)
+        self.artifact.write_text(json.dumps(artifact))
+        with patch.object(j, "records", return_value={123: proof}):
+            j.publish_artifact(self.artifact, self.head_dir)
+
+    def test_fixed_grouped_root_gets_one_verified_reply_then_resolution(self):
+        proof, root = self.prior_threads(grouped=True)
+        plan = self.prepare_verification(proof)
+        self.assertEqual(2, len(plan["threads"][0]["findings"]))
+        verification = self.verified(plan)
+        self.publish_verified(proof, plan, verification)
+        self.assertEqual(["reply", "resolve"], [kind for kind, _ in self.pr.writes if kind in ("reply", "resolve")])
+        self.assertTrue(self.pr.threads[root.id]["isResolved"])
+        answer = next(c for c in self.pr.roots if c.raw_data.get("in_reply_to_id") == root.id)
+        self.assertIn("app.py:1", answer.body)
+        self.assertIn("The value is preserved", answer.body)
+
+    def test_present_unclear_and_model_silence_never_resolve(self):
+        proof, root = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        for status in ("present", "unclear", None):
+            self.pr.writes.clear()
+            self.publish_verified(proof, plan, self.verified(plan, status) if status else None)
+            self.assertFalse(self.pr.threads[root.id]["isResolved"])
+            self.assertFalse(any(k in ("reply", "resolve") for k, _ in self.pr.writes))
+
+    def test_fixed_rerun_reuses_verified_answer_without_duplicate_reply(self):
+        proof, root = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        with patch.object(j, "records", return_value={123: proof}), patch.object(f, "resolve_thread", side_effect=RuntimeError("private")):
+            j.publish_verification(self.repo, self.pr, ctx, policy, plan, self.verified(plan), self.head_dir)
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        with patch.object(j, "records", return_value={123: proof}):
+            j.publish_verification(self.repo, self.pr, ctx, policy, plan, self.verified(plan), self.head_dir)
+            j.publish_verification(self.repo, self.pr, ctx, policy, plan, self.verified(plan), self.head_dir)
+        self.assertEqual(1, sum(k == "reply" for k, _ in self.pr.writes))
+        self.assertEqual(1, sum(k == "resolve" for k, _ in self.pr.writes))
+
+    def test_unowned_or_changed_roots_are_never_collected_or_resolved(self):
+        proof, root = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        for mutate in (lambda p: p["roots"].clear(),
+                       lambda p: p["roots"][0].update(digest="0" * 64),
+                       lambda p: p["roots"][0].update(commit=self.pr.head.sha),
+                       lambda p: p["roots"][0].update(review_id=999),
+                       lambda p: p["roots"][0].update(path="helper.py")):
+            bad = copy.deepcopy(proof); mutate(bad)
+            self.pr.writes.clear()
+            with patch.object(j, "records", return_value={123: bad}):
+                j.publish_verification(self.repo, self.pr, ctx, policy, plan, self.verified(plan), self.head_dir)
+            self.assertFalse(any(k in ("reply", "resolve") for k, _ in self.pr.writes))
+        root.body += "edited"
+        self.assertEqual([], j.collect_threads(self.pr, {123: proof}))
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+
+    def test_reconstruction_requires_exact_unambiguous_group_members(self):
+        proof, root = self.prior_threads(grouped=True)
+        self.assertEqual(proof["findings"], j.reconstruct_root(root, proof))
+        for change in (lambda p: p["findings"].append(copy.deepcopy(p["findings"][0])),
+                       lambda p: p["findings"].pop(),
+                       lambda p: p["findings"][0].update(body="edited"),
+                       lambda p: p["findings"][1].update(line=9, end_line=9)):
+            bad = copy.deepcopy(proof); change(bad)
+            with self.assertRaises(e.ReviewAbort): j.reconstruct_root(root, bad)
+        bad = copy.deepcopy(proof)
+        bad["findings"].append(dict(bad["findings"][0], title="Summary only"))
+        self.assertEqual(proof["findings"], j.reconstruct_root(root, bad))
+        bad["findings"].append(dict(bad["findings"][0], title="2 findings on these lines",
+                                   body=root.body.split("\n\n", 1)[1]))
+        with self.assertRaises(e.ReviewAbort): j.reconstruct_root(root, bad)
+        root.body += "extra"
+        with self.assertRaises(e.ReviewAbort): j.reconstruct_root(root, proof)
+
+    def test_resolved_roots_are_skipped_and_outdated_roots_can_be_verified(self):
+        proof, root = self.prior_threads()
+        self.pr.threads[root.id]["isResolved"] = True
+        self.assertEqual([], j.collect_threads(self.pr, {123: proof}))
+        self.pr.threads[root.id].update(isResolved=False, isOutdated=True)
+        root.raw_data["line"] = None
+        self.assertEqual(1, len(j.collect_threads(self.pr, {123: proof})))
+
+    def test_verification_schema_receipt_completeness_and_head_evidence_guards(self):
+        with self.assertRaises(e.ReviewAbort): j.validate_evidence_schema({})
+        proof, _ = self.prior_threads(grouped=True)
+        plan = self.prepare_verification(proof)
+        policy, _ = j.settings()
+        good = self.verified(plan)
+        mutations = [
+            lambda v: v.update(extra=True),
+            lambda v: v["receipt"].update(strategy="bundle"),
+            lambda v: v["output"].update(extra=True),
+            lambda v: v["output"].update(threads={}),
+            lambda v: v["output"]["threads"].clear(),
+            lambda v: v["output"]["threads"].append(copy.deepcopy(v["output"]["threads"][0])),
+            lambda v: v["output"]["threads"][0].update(thread="other"),
+            lambda v: v["output"]["threads"][0].update(status="silent"),
+            lambda v: v["output"]["threads"][0].update(evidence={}),
+            lambda v: v["output"]["threads"][0]["evidence"].pop(),
+            lambda v: v["receipt"].update(files_opened=[]),
+        ]
+        for key, value in (("finding", True), ("finding", -1), ("path", "../escape"),
+                           ("line", True), ("line", 0), ("line", 999), ("change", ""),
+                           ("change", None), ("extra", "value")):
+            mutations.append(lambda v, k=key, val=value: v["output"]["threads"][0]["evidence"][0].update({k: val}))
+        for mutate in mutations:
+            bad = copy.deepcopy(good); mutate(bad)
+            with self.subTest(mutation=mutate), self.assertRaises(e.ReviewAbort):
+                j.validate_verification_result(bad, plan["threads"], policy, self.head_dir, self.pr.head.sha)
+        bad = copy.deepcopy(good)
+        for evidence in bad["output"]["threads"][0]["evidence"]: evidence["path"] = "gone.py"
+        bad["receipt"]["files_opened"] = ["gone.py"]
+        with self.assertRaises(e.ReviewAbort):
+            j.validate_verification_result(bad, plan["threads"], policy, self.head_dir, self.pr.head.sha)
+        folder = self.head_dir / "nested"; folder.mkdir()
+        (folder / "source.py").write_text("source\n")
+        e.git(self.head_dir, "add", "--", "nested")
+        e.git(self.head_dir, "commit", "-qm", "nested fixture")
+        tree_head = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        bad = copy.deepcopy(good)
+        for item in bad["output"]["threads"][0]["evidence"]: item["path"] = "nested"
+        bad["receipt"]["files_opened"] = ["nested"]
+        with self.assertRaises(e.ReviewAbort):
+            j.validate_verification_result(bad, plan["threads"], policy, self.head_dir, tree_head)
+        for validator, value in ((j.validate_verification, {"threads": []}),
+                                 (j.validate_reply, self.answer()["output"])):
+            with patch.object(f, "MAX_DATA_BYTES", len(f.canonical(value).encode()) - 1), self.assertRaises(e.ReviewAbort):
+                validator(value)
+
+    def test_oversized_verification_prompt_skips_without_a_provider_call(self):
+        import io
+        proof, _ = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        actual_run = e.run_claude
+        def run(policy, bundle, strategy, head, **kwargs):
+            if strategy == "verify-threads":
+                return actual_run(dict(policy, max_model_tokens=policy["max_output_tokens"]), bundle, strategy, head, **kwargs)
+            return {"findings": [], "receipt": receipt(strategy)}
+        with patch.object(e, "run_claude", side_effect=run), patch.object(e.subprocess, "run") as provider, \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            j.infer(self.plan, self.artifact, self.head_dir)
+        provider.assert_not_called()
+        self.assertEqual(j.FOLLOWUP_NOTE + "\n", output.getvalue())
+        self.assertIsNone(json.loads(self.artifact.read_text())["verification"])
+
+    def test_graphql_prepare_inference_and_publish_failures_leave_review_successful(self):
+        import io
+        proof, root = self.prior_threads()
+        with patch.object(j, "records", return_value={123: proof}), \
+                patch.object(self.pr.requester, "graphql_query", side_effect=RuntimeError("private")), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.build()
+        self.assertEqual(j.FOLLOWUP_NOTE + "\n", output.getvalue())
+        self.assertEqual([], json.loads(self.plan.read_text())["threads"])
+        plan = self.prepare_verification(proof)
+        original = self.pr.requester.graphql_named_mutation
+        for failure in ("graphql", "resolve", "reply", "reply_readback", "root_changed", "head_moved"):
+            self.pr.roots = [c for c in self.pr.roots if c.raw_data.get("in_reply_to_id") is None]
+            self.pr.writes.clear()
+            artifact = json.loads(self.artifact.read_text()); artifact["verification"] = self.verified(plan)
+            self.artifact.write_text(json.dumps(artifact))
+            def refuse(name, data, schema):
+                if name == "resolveReviewThread": raise RuntimeError("private provider body")
+                return original(name, data, schema)
+            target, attr, effect = {
+                "graphql": (self.pr.requester, "graphql_query", RuntimeError("private")),
+                "resolve": (self.pr.requester, "graphql_named_mutation", refuse),
+                "reply": (self.pr, "create_review_comment_reply", RuntimeError("private")),
+                "reply_readback": (j, "publish_answer", RuntimeError("private")),
+                "root_changed": (j, "collect_threads", lambda *a: []),
+                "head_moved": (j, "check_pr", RuntimeError("moved")),
+            }[failure]
+            policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+            # Check publication as an optional post-success action, never un-green it.
+            with patch.object(j, "records", return_value={123: proof}), \
+                    patch.object(target, attr, side_effect=effect), patch("sys.stdout", new_callable=io.StringIO) as output:
+                j.publish_verification(self.repo, self.pr, ctx, policy, plan, self.verified(plan), self.head_dir)
+            self.assertEqual(j.FOLLOWUP_NOTE + "\n", output.getvalue())
+            self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        # Full successful publication still writes completion when optional resolution fails.
+        with patch.object(f, "resolve_thread", side_effect=RuntimeError("private")):
+            self.publish_verified(proof, plan, self.verified(plan))
+        self.assertTrue((self.root / "completion.json").exists())
+        self.assertTrue(any("state=success" in c.body for c in self.pr.comments.values()))
+
+    def test_batched_verification_uses_host_provider_at_every_depth_and_skips_failures(self):
+        import io
+        proof, _ = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        for depth in e.DEPTHS:
+            os.environ["REVIEW_DEPTH"] = depth
+            self.pr.comments[9].body = {"default": "/review", "deep": "/review deep",
+                "codex": "/review codex", "codex-deep": "/review codex deep"}[depth]
+            policy, _ = j.settings(); ctx, _ = j.context(policy, depth)
+            plan["context"] = ctx
+            self.plan.write_text(json.dumps(plan))
+            def run(policy, bundle, strategy, head, *args, **kwargs):
+                r = receipt(strategy); r.update(provider=policy["provider"], model=policy["model"], files_opened=["app.py"])
+                return {"output": self.verified(plan)["output"], "receipt": r} if strategy == "verify-threads" else {"findings": [], "receipt": r}
+            active = "run_claude" if policy["provider"] == "claude" else "run_codex"
+            inactive = "run_codex" if active == "run_claude" else "run_claude"
+            with patch.object(e, active, side_effect=run) as provider, patch.object(e, inactive) as unused:
+                j.infer(self.plan, self.artifact, self.head_dir, "/action", "/home")
+            unused.assert_not_called()
+            self.assertEqual(1, sum(c.args[2] == "verify-threads" for c in provider.call_args_list))
+            self.assertEqual(policy, provider.call_args_list[-1].args[0])
+            self.assertIs(j.VERIFICATION_SCHEMA, provider.call_args_list[-1].kwargs["schema"])
+            self.assertIsNotNone(json.loads(self.artifact.read_text())["verification"])
+            def fail(policy, bundle, strategy, head, *args, **kwargs):
+                if strategy == "verify-threads": raise e.ReviewAbort("private model text")
+                return run(policy, bundle, strategy, head, *args, **kwargs)
+            with patch.object(e, active, side_effect=fail), patch("sys.stdout", new_callable=io.StringIO) as output:
+                j.infer(self.plan, self.artifact, self.head_dir, "/action", "/home")
+            self.assertEqual(j.FOLLOWUP_NOTE + "\n", output.getvalue())
+            self.assertIsNone(json.loads(self.artifact.read_text())["verification"])
+
+    def test_unchanged_scope_never_triggers_verification(self):
+        proof, _ = self.prior_threads()
+        plan = self.prepare_verification(proof)
+        plan["scope"]["kind"] = "unchanged"
+        self.plan.write_text(json.dumps(plan))
+        with patch.object(e, "run_claude") as claude, patch.object(e, "run_codex") as codex:
+            j.infer(self.plan, self.artifact, self.head_dir)
+        claude.assert_not_called(); codex.assert_not_called()
+        self.assertIsNone(json.loads(self.artifact.read_text())["verification"])
+
+    def test_no_proof_and_unchanged_prepare_do_not_collect_threads(self):
+        with patch.object(f, "review_threads") as query:
+            self.assertEqual([], j.collect_threads(self.pr, {}))
+        query.assert_not_called()
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        scope = {"kind": "unchanged", "from": ctx["head"], "to": ctx["head"], "parent": 123, "full_head": False}
+        with patch.object(f, "scope_for", return_value=scope), patch.object(j, "collect_threads") as collect:
+            j.prepare(self.head_dir, self.plan)
+        collect.assert_not_called()
+
+    def reply_plan(self, proof, root):
+        raw = {"id": 500, "body": "Fixed now, please check the code.", "in_reply_to_id": root.id,
+            "pull_request_review_id": root.raw_data["pull_request_review_id"],
+            "commit_id": root.commit_id, "original_commit_id": root.raw_data["original_commit_id"],
+            "path": root.path, "created_at": "2026-10-28T01:00:00Z", "updated_at": "2026-10-28T01:00:00Z",
+            "pull_request_url": "https://api.github.com/repos/example/project/pulls/1"}
+        self.pr.roots.append(Comment(500, raw["body"], NS(**f.JOSH), raw, path=root.path))
+        self.event_path.write_text(json.dumps({"action": "created", "repository": {"full_name": self.repo.full_name},
+            "pull_request": {"number": 1}, "comment": dict(raw, user=f.JOSH)}))
+        os.environ["GITHUB_EVENT_NAME"] = "pull_request_review_comment"
+        with patch.object(j, "records", return_value={123: proof}):
+            j.prepare(self.head_dir, self.plan, reply=True)
+        return json.loads(self.plan.read_text())
+
+    def answer(self, reason="none"):
+        r = receipt("reply"); r["files_opened"] = ["app.py"]
+        return {"receipt": r, "output": {"answer": "app.py:1 preserves the local value.",
+            "resolve": reason != "none", "reason": reason,
+            "evidence": [{"finding": 0, "path": "app.py", "line": 1, "change": "Preserves the value."}] if reason != "none" else []}}
+
+    def test_earlier_head_code_reading_reply_resolves_fixed_or_wrong_only(self):
+        proof, root = self.prior_threads()
+        for reason in ("none", "fixed", "finding_wrong"):
+            self.pr.threads[root.id]["isResolved"] = False
+            self.pr.roots = [root]
+            plan = self.reply_plan(proof, root)
+            self.assertIn("read-only file tools", plan["prompt"])
+            policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+            with patch.object(j, "records", return_value={123: proof}):
+                j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer(reason), self.head_dir)
+            self.assertEqual(reason != "none", self.pr.threads[root.id]["isResolved"])
+
+    def test_reply_resolution_requires_disposition_receipt_all_findings_and_head_reads(self):
+        for field, value in (("resolve", 1), ("reason", "other"), ("answer", ""), ("reason", "none")):
+            bad = self.answer("fixed")["output"]; bad[field] = value
+            with self.assertRaises(e.ReviewAbort): j.validate_reply(bad)
+        proof, root = self.prior_threads(grouped=True)
+        plan = self.reply_plan(proof, root)
+        policy, _ = j.settings()
+        for mutate in (lambda v: v["output"].update(resolve=1),
+                       lambda v: v["output"].update(reason="other"),
+                       lambda v: v["output"].update(answer=""),
+                       lambda v: v["output"].update(reason="none"),
+                       lambda v: v["receipt"].update(files_opened=[]),
+                       lambda v: v["output"].update(answer="x" * (f.MAX_DATA_BYTES + 1))):
+            bad = self.answer("fixed"); mutate(bad)
+            with self.assertRaises(e.ReviewAbort): j.validate_reply_result(bad, plan, policy, self.head_dir)
+        with self.assertRaises(e.ReviewAbort): j.validate_reply_result(self.answer("fixed"), plan, policy, self.head_dir)
+
+    def test_reply_provider_reads_files_and_attests_model_without_execution(self):
+        from scripts.test_review_engine import transcript
+        proof, root = self.prior_threads()
+        plan = self.reply_plan(proof, root)
+        policy, _ = j.settings()
+        events = transcript()
+        events[0]["message"]["content"][0]["input"]["file_path"] = "app.py"
+        events[-1]["structured_output"] = self.answer("fixed")["output"]
+        proc = NS(returncode=0, stdout="\n".join(map(json.dumps, events)))
+        actual_run = e.subprocess.run
+        def provider(*args, **kwargs):
+            return proc if args[0][0] == "claude" else actual_run(*args, **kwargs)
+        with patch.object(e.subprocess, "run", side_effect=provider) as run:
+            answer = j.infer_reply(policy, plan, self.head_dir)
+        self.assertEqual(["app.py"], answer["receipt"]["files_opened"])
+        self.assertIn("Read,Grep,Glob", run.call_args_list[0].args[0])
+        self.assertIn("dontAsk", run.call_args_list[0].args[0])
+        events[0]["message"]["content"][0]["name"] = "Bash"
+        proc.stdout = "\n".join(map(json.dumps, events))
+        with patch.object(e.subprocess, "run", return_value=proc), self.assertRaises(e.ReviewAbort):
+            j.infer_reply(policy, plan, self.head_dir)
+
+    def test_reply_resolution_failure_leaves_verified_answer_visible_and_thread_open(self):
+        import io
+        proof, root = self.prior_threads()
+        plan = self.reply_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        with patch.object(j, "records", return_value={123: proof}), \
+                patch.object(f, "resolve_thread", side_effect=RuntimeError("private model text")), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("fixed"), self.head_dir)
+        self.assertEqual(j.FOLLOWUP_NOTE + "\n", output.getvalue())
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertTrue(any(self.answer()["output"]["answer"] in c.body for c in self.pr.roots))
+
+    def test_edited_root_reply_and_ambiguous_answer_never_resolve(self):
+        proof, root = self.prior_threads()
+        plan = self.reply_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        root.body += "edited"
+        with patch.object(j, "records", return_value={123: proof}), self.assertRaises(f.FollowupAbort):
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("fixed"), self.head_dir)
+        root.body = root.body.removesuffix("edited")
+        marker = f.reply_marker(plan["trigger"], root.id)
+        pending = self.pr.create_review_comment_reply(root.id, marker + "\nReply pending; no completed answer yet.")
+        for body in (pending.body, marker + "\nedited"):
+            pending.edit(body)
+            with patch.object(j, "records", return_value={123: proof}), self.assertRaises(e.ReviewAbort):
+                j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("fixed"), self.head_dir)
+            self.assertFalse(self.pr.threads[root.id]["isResolved"])
+
+    def test_pending_reply_readback_edit_and_target_binding_fail_closed(self):
+        proof, root = self.prior_threads()
+        plan = self.reply_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        for field, value in (("trigger", 999), ("root", 999), ("root_digest", "0" * 64), ("findings", [])):
+            bad = dict(plan, **{field: value})
+            with patch.object(j, "records", return_value={123: proof}), self.assertRaises(e.ReviewAbort):
+                j.publish_reply(self.repo, self.pr, ctx, policy, bad, self.answer("fixed"), self.head_dir)
+        original = self.pr.create_review_comment_reply
+        for fault in ("identity", "parent", "body", "edit", "duplicate", "oversized"):
+            self.pr.roots = [root, next(c for c in self.pr.roots if c.id == 500)]
+            marker = f.reply_marker(500, root.id)
+            def create(root_id, body):
+                comment = original(root_id, body)
+                if fault == "identity": comment.user.id = 1
+                if fault == "parent": comment.raw_data["in_reply_to_id"] = 999
+                if fault == "body": comment.body = "other"
+                if fault == "edit": comment.edit = lambda body: None
+                return comment
+            if fault == "duplicate":
+                original(root.id, marker + "\nanswer"); original(root.id, marker + "\nanswer")
+            answer = "x" * f.MAX_DATA_BYTES if fault == "oversized" else "answer"
+            with patch.object(self.pr, "create_review_comment_reply", side_effect=create), self.assertRaises(e.ReviewAbort):
+                j.publish_answer(self.pr, root.id, marker, answer, lambda: None)
+            self.assertFalse(self.pr.threads[root.id]["isResolved"])
 
 
 class WorkflowTests(unittest.TestCase):
