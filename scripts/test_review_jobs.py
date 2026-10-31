@@ -352,8 +352,8 @@ class JobTests(unittest.TestCase):
         os.environ.update(REVIEW_HEAD=self.pr.head.sha, GITHUB_RUN_ID="124")
         self.pr.writes.clear()
 
-    def test_prior_summary_finding_gets_a_real_thread_when_it_becomes_anchorable(self):
-        item = finding(path="helper.py")
+    def test_prior_summary_finding_keeps_full_text_when_it_becomes_anchorable(self):
+        item = finding(path="helper.py", mechanism="Only copy of this mechanism")
         self.build([item])
         j.publish_artifact(self.artifact, self.head_dir)
         old = json.loads((self.root / "completion.json").read_text())
@@ -362,35 +362,36 @@ class JobTests(unittest.TestCase):
         with patch.object(j, "records", return_value={123: old}):
             self.build([item])
             j.publish_artifact(self.artifact, self.head_dir)
-        self.assertEqual(1, len(self.pr.roots))
-        newest = max(self.pr.comments.values(), key=lambda c: c.id)
-        self.assertIn("| inline thread |", newest.body)
-        self.assertNotIn("| earlier thread |", newest.body)
+        self.assertEqual([], self.pr.roots, "an identical prior finding opened another thread")
+        newest = self.summary_after(old["summary"])
+        self.assertIn("| below |", newest)
+        self.assertIn("Only copy of this mechanism", newest.split("<details>")[0])
 
-    def test_prior_thread_proof_requires_intact_live_roots_and_supports_grouping(self):
-        self.build([finding(path="app.py", title="First", mechanism="One mechanism"),
-                    finding(path="app.py", title="Second", mechanism="Another mechanism")])
+    def test_prior_thread_findings_repeat_full_text_when_github_moves_or_outdates_the_root(self):
+        # GitHub moves a live root's commit_id to the new head and outdates a root whose
+        # line is rewritten; neither state may leave a finding with no visible text.
+        items = [finding(path="app.py", title="First", mechanism="One mechanism"),
+                 finding(path="app.py", title="Second", mechanism="Another mechanism")]
+        self.build(items)
         j.publish_artifact(self.artifact, self.head_dir)
         record = json.loads((self.root / "completion.json").read_text())
-        proof = {123: record}
-        expected = {f.canonical(item) for item in record["findings"]}
-        self.assertEqual(expected, j.prior_thread_findings(self.pr, proof))
         root = self.pr.roots[0]
-        self.assertIs(root, f.owned_root(self.pr, NS(raw_data={"in_reply_to_id": root.id}, path=root.path), proof))
-        body = root.body
-        root.edit(body + "edited")
-        self.assertEqual(set(), j.prior_thread_findings(self.pr, proof))
-        root.edit(body)
-        self.pr.roots.clear()
-        self.assertEqual(set(), j.prior_thread_findings(self.pr, proof))
-        self.pr.roots.append(root)
+        self.assertIs(root, f.owned_root(self.pr, NS(raw_data={"in_reply_to_id": root.id}, path=root.path), {123: record}))
         self.advance_head("app.py")
-        with patch.object(j, "records", return_value=proof):
-            self.build([finding(path="app.py", title="First", mechanism="One mechanism"),
-                        finding(path="app.py", title="Second", mechanism="Another mechanism")])
+        root.commit_id = self.pr.head.sha
+        root.raw_data["line"] = None
+        with patch.object(j, "records", return_value={123: record}):
+            self.build(items)
             j.publish_artifact(self.artifact, self.head_dir)
         self.assertEqual(1, len(self.pr.roots), "grouped findings were posted twice")
-        self.assertEqual(2, max(self.pr.comments.values(), key=lambda c: c.id).body.count("| earlier thread |"))
+        newest = self.summary_after(record["summary"]).split("<details>")[0]
+        self.assertEqual(2, newest.count("| below |"))
+        self.assertIn("One mechanism", newest)
+        self.assertIn("Another mechanism", newest)
+
+    def summary_after(self, old_summary):
+        return max((c for c in self.pr.comments.values() if c.id != old_summary and f.RESULT.search(c.body)
+                    and not c.body.startswith("<!-- agent-review-status:v1")), key=lambda c: c.id).body
 
     def test_success_collapses_status_and_earlier_reviewer_comments_only(self):
         calls = []
@@ -406,30 +407,42 @@ class JobTests(unittest.TestCase):
         pending = Comment(52, "<!-- agent-review-notice:v1 run=9 -->\nPublication pending", NS(**f.BOT), {"node_id": "PENDING"})
         later = Comment(500, status.body, NS(**f.BOT), {"node_id": "LATER"})
         self.pr.comments.update({50: other, 51: human, 52: pending, 500: later})
-        j.collapse_earlier(self.pr, 600, 601, {}, j.prior_thread_findings(self.pr, {123: old}))
+        j.collapse_earlier(self.pr, 400, 401, {}, True)
         self.assertEqual([], calls, "a parseable record is not immutable workflow proof")
-        self.advance_head("app.py")
-        calls.clear()
-        with patch.object(j, "records", return_value={123: old}):
-            self.build([finding(path="app.py")])
-            j.publish_artifact(self.artifact, self.head_dir)
+        j.collapse_earlier(self.pr, 400, 401, {123: old}, True)
         self.assertEqual({"STATUS", "SUMMARY"}, {data["subjectId"] for _, data in calls})
         self.assertEqual({"minimizeComment"}, {name for name, _ in calls})
         self.assertTrue(all(data["classifier"] == "OUTDATED" for _, data in calls))
+        calls.clear()
+        j.collapse_earlier(self.pr, 400, 401, {123: old}, False)
+        self.assertEqual({"STATUS"}, {data["subjectId"] for _, data in calls})
         self.assertEqual(old, f.parse_record(status, self.pr.comments))
 
-    def test_cleanup_keeps_the_only_full_text_of_a_summary_finding_visible(self):
+    def test_incremental_review_keeps_every_earlier_summary_visible(self):
         hidden = set()
         self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
-        self.build([finding(path="helper.py")])
-        j.publish_artifact(self.artifact, self.head_dir)
-        old = json.loads((self.root / "completion.json").read_text())
-        self.pr.comments[old["summary"]].raw_data["node_id"] = "ONLY-FINDING-TEXT"
-        self.advance_head("app.py")
-        with patch.object(j, "records", return_value={123: old}):
-            self.build()
-            j.publish_artifact(self.artifact, self.head_dir)
-        self.assertNotIn("ONLY-FINDING-TEXT", hidden)
+        for findings in ([finding(path="helper.py")], [finding(path="app.py")], []):
+            with self.subTest(findings=len(findings)):
+                hidden.clear()
+                self.pr.comments = {k: v for k, v in self.pr.comments.items() if k == 9}
+                self.pr.roots.clear()
+                self.pr.writes.clear()
+                os.environ.update(REVIEW_HEAD=self.env["REVIEW_HEAD"], GITHUB_RUN_ID="123")
+                self.pr.head.sha = self.env["REVIEW_HEAD"]
+                e.git(self.head_dir, "checkout", "-q", self.env["REVIEW_HEAD"])
+                # A zero-finding summary can hold the only disclosure of a coverage gap.
+                with patch.object(e, "unopened_regions", return_value=["docs/big.md"]):
+                    self.build(findings)
+                    j.publish_artifact(self.artifact, self.head_dir)
+                old = json.loads((self.root / "completion.json").read_text())
+                status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+                status.raw_data["node_id"] = "OLD-STATUS"
+                self.pr.comments[old["summary"]].raw_data["node_id"] = "OLD-SUMMARY"
+                self.advance_head("app.py")
+                with patch.object(j, "records", return_value={123: old}):
+                    self.build()
+                    j.publish_artifact(self.artifact, self.head_dir)
+                self.assertEqual({"OLD-STATUS"}, hidden)
 
     def test_collapse_refusal_never_fails_a_published_review(self):
         import io

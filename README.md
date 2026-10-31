@@ -11,7 +11,7 @@ A maintainer-gated agentic pull request reviewer for GitHub Actions. Comment an 
 
 The engine builds a merge-base diff with full changed files, falling back to changed regions when the configured input budget requires it. The reviewer can read related source. Each pass reports concrete introduced defects with a head location, trigger, consequence, repair, and confidence. Findings are merged by location and mechanism. Each pass can return up to six candidates; there is no evidence-challenge veto.
 
-Inference jobs have read-only GitHub permissions. A separate publisher validates the result and transcript-derived receipts, rechecks the captured commits and original command, then publishes resolvable inline threads and a short summary table. Findings on overlapping lines share one thread. Verified earlier summaries are hidden as outdated when every finding has an intact thread. Related-source findings stay in the summary when no changed line can anchor them. Immutable completion records support duplicate detection, incremental coverage, and verified follow-up replies.
+Inference jobs have read-only GitHub permissions. A separate publisher validates the result and transcript-derived receipts, rechecks the captured commits and original command, then publishes resolvable inline threads and a short summary table. Findings on overlapping lines share one thread. After a full review, verified earlier summaries are hidden as outdated. Related-source findings stay in the summary when no changed line can anchor them. Immutable completion records support duplicate detection, incremental coverage, and verified follow-up replies.
 
 ## Required operator policy
 

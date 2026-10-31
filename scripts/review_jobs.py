@@ -301,17 +301,18 @@ def publish_review(repo, pr, ctx, policy, plan, result):
         raise ReviewAbort("Findings bundle is not bound to admitted commits")
     findings = [public_finding(f) for f in result["findings"]]
     files = {f["path"]: f for f in plan["bundle"]["files"]}
-    previous = prior_thread_findings(pr, proof)
+    previous = {followups.canonical(f) for record in proof.values() for f in record["findings"]}
     placement, anchored = [], []
     for index, finding in enumerate(findings):
         file = files.get(finding["path"])
         # Related-source or unchanged lines remain in the summary, never a fabricated anchor.
-        if not (file and finding["line"] in anchor_lines(file["patch"])
-                and finding["end_line"] in anchor_lines(file["patch"])):
+        # Exact prior findings keep their full text here instead of opening an identical
+        # thread: GitHub moves a live comment's commit_id to the new head and outdates it
+        # when its line is rewritten, so an old thread is no proof the text is still visible.
+        if (not (file and finding["line"] in anchor_lines(file["patch"])
+                 and finding["end_line"] in anchor_lines(file["patch"]))
+                or followups.canonical(finding) in previous):
             placement.append("summary")
-        elif followups.canonical(finding) in previous:
-            # Exact prior findings keep their existing thread instead of opening another.
-            placement.append("earlier")
         else:
             placement.append("inline")
             anchored.append(index)
@@ -354,7 +355,7 @@ def publish_review(repo, pr, ctx, policy, plan, result):
     if not followups.identity(actual.user, followups.BOT) or actual.body != body:
         raise ReviewAbort("Success publication could not be verified")
     followups.write_completion(os.environ["REVIEW_COMPLETION_PATH"], dict(evidence, digest=digest))
-    collapse_earlier(pr, status.id, summary.id, proof, previous)
+    collapse_earlier(pr, status.id, summary.id, proof, scope["kind"] == "full")
 
 
 def overlap_groups(findings, indexes):
@@ -387,35 +388,6 @@ def inline_comment(group):
     return comment
 
 
-def prior_thread_findings(pr, proof):
-    """Only omit finding text when its verified inline root still exists intact."""
-    if not any(record["roots"] for record in proof.values()):
-        return set()
-    try:
-        live = {comment.id: comment for comment in pr.get_review_comments()}
-    except Exception as error:
-        if reliability.throttled(error):
-            raise
-        return set()
-    previous = set()
-    for record in proof.values():
-        for entry in record["roots"]:
-            root = live.get(entry["id"])
-            if (root is None or not followups.identity(root.user, followups.BOT)
-                    or root.raw_data.get("in_reply_to_id") is not None
-                    or root.raw_data.get("pull_request_review_id") != entry["review_id"]
-                    or root.commit_id != entry["commit"] or root.path != entry["path"]
-                    or not isinstance(root.body, str) or followups.digest(root.body) != entry["digest"]):
-                continue
-            members = [f for f in record["findings"] if f["path"] == root.path
-                       and inline_comment([f])["body"] in root.body]
-            # Reconstruct the whole body, including grouped roots. Ambiguous membership
-            # never suppresses a finding, including delimiters embedded in model text.
-            if members and inline_comment(members)["body"] == root.body:
-                previous.update(followups.canonical(f) for f in members)
-    return previous
-
-
 def code(text):
     text = text.replace("\r", r"\r").replace("\n", r"\n")
     fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
@@ -426,7 +398,7 @@ def cell(text):
     return html.escape(" ".join(text.split()), quote=False).replace("\\", "\\\\").replace("|", "\\|")
 
 
-WHERE = {"inline": "inline thread", "earlier": "earlier thread", "summary": "below"}
+WHERE = {"inline": "inline thread", "summary": "below"}
 
 
 def summary_text(ctx, scope, bundle, result, findings, placement):
@@ -445,7 +417,7 @@ def summary_text(ctx, scope, bundle, result, findings, placement):
                 "| Confidence | Finding | Location | Discussion |\n|---|---|---|---|\n" + "\n".join(rows))
         loose = [f for f, where in zip(findings, placement) if where == "summary"]
         if loose:
-            text += "\n\n**Not on a changed line**\n\n" + "\n\n".join(
+            text += "\n\n**Findings without a new thread**\n\n" + "\n\n".join(
                 f"**{f['title']}** ({code(f['path'] + ':' + str(f['line']))})\n\n{f['body']}" for f in loose)
     details = (f"Reviewed base `{ctx['base']}` and head `{ctx['head']}`."
                f"\n\nReviewer source `{ctx['reviewer']}`; policy `{ctx['profile_sha']}`."
@@ -459,15 +431,19 @@ def summary_text(ctx, scope, bundle, result, findings, placement):
     return text + "\n\n<details><summary>Review details</summary>\n\n" + details + "\n\n</details>"
 
 
-def collapse_earlier(pr, status_id, summary_id, proof, threaded):
-    """Hide verified earlier successes, preserving findings with no intact thread.
+def collapse_earlier(pr, status_id, summary_id, proof, full):
+    """Hide superseded reviewer comments backed by verified completion records.
 
+    Earlier success statuses are bookkeeping and always qualify. Earlier summaries
+    qualify only after a full review, which restates every finding and coverage gap at
+    this head; an incremental review covers only the delta, so older summaries hold the
+    only text of their findings and gaps and stay visible.
     GitHub's minimizeComment changes visibility only, never the body, so digest-bound
     records stay verifiable. It is cosmetic: a refusal leaves remaining comments visible and never
     fails a review that already published. This run's status stays visible because
     a later upload failure makes the notifier edit it into an incomplete warning.
     Comments created after this run's status belong to a concurrent run and stay visible.
-    Source: https://docs.github.com/en/graphql/reference/issues#minimizecomment
+    Source: https://docs.github.com/en/graphql/reference/issues#mutation-minimizecomment
     """
     try:
         comments = {comment.id: comment for comment in pr.get_issue_comments()}
@@ -477,9 +453,7 @@ def collapse_earlier(pr, status_id, summary_id, proof, threaded):
             if record is None or proof.get(record["run_id"]) != record:
                 continue
             eligible.add(comment.id)
-            # Incremental results do not repeat older summary-only findings. Their
-            # full text must stay visible until there is an intact inline root.
-            if all(followups.canonical(f) in threaded for f in record["findings"]):
+            if full:
                 eligible.add(record["summary"])
         for comment in comments.values():
             if (comment.id == summary_id or comment.id >= status_id
