@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the read/infer/write boundary with real validation and a fake GitHub API."""
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,7 @@ class Comment:
 class Pull:
     def __init__(self, repo, head, base):
         self.number, self.state = 1, "open"
+        self.user = NS(login="pr-author")
         self.head = NS(sha=head, repo=NS(full_name=repo, fork=False))
         self.base = NS(sha=base, repo=NS(full_name=repo))
         self.comments, self.roots, self.reviews, self.writes = {}, [], {}, []
@@ -112,6 +114,9 @@ class JobTests(unittest.TestCase):
         self.pr = Pull("example/project", head, base)
         self.repo = NS(full_name="example/project", get_pull=lambda _: self.pr,
                        owner=NS(login="example", type="Organization"))
+        # Repository permission per login, as GitHub's legacy permission field reports it.
+        self.permissions = {f.JOSH["login"]: "write"}
+        self.repo.get_collaborator_permission = lambda login: self.permissions.get(login, "none")
         from github.Commit import Commit
         self.repo.get_commit = lambda sha: Commit(NS(per_page=30, is_not_lazy=False), {}, {"sha": sha}, completed=True)
         self.repo.get_workflow_run = lambda _: (_ for _ in ()).throw(ValueError("no old artifact"))
@@ -1072,13 +1077,15 @@ class JobTests(unittest.TestCase):
         verified = f.verification_marker(root.id, self.pr.head.sha)
         resolved = f.resolution_marker(root.id)
         header = f.reply_marker(500, root.id)
-        for text, expected in ((verified + "\nEvidence", {root.id}),
+        done = "\n" + j.VERIFIED_PREFIX + "a" * 40 + ":\n\n- evidence"
+        for text, expected in ((verified + done, {root.id}),
+                (verified + "\nEvidence", set()),
                 (header + "\nAnswer\n" + resolved, {root.id}),
                 ("Text\n" + verified, set()), (resolved + "\nText", set()),
                 (verified + "\n<!-- other -->", set()),
                 (header + "\n<!-- other -->\n" + resolved, set()),
                 (f.reply_marker(500, 999) + "\nAnswer\n" + resolved, set()),
-                (f.verification_marker(999, self.pr.head.sha) + "\nEvidence", set()),
+                (f.verification_marker(999, self.pr.head.sha) + done, set()),
                 (header + "\nAnswer\n" + f.resolution_marker(999), set()),
                 ("Text\n" + resolved, set())):
             comment = {"id": 600, "body": text, "user": f.BOT, "in_reply_to_id": root.id}
@@ -1231,6 +1238,66 @@ class JobTests(unittest.TestCase):
             j.publish_reply(self.repo, self.pr, ctx, policy, plan, None, self.head_dir)
         resolve.assert_not_called()
         self.assertNotIn("agent-review-resolved", self.pr.roots[-1].body)
+
+    def test_resolve_requires_pr_author_or_write_access_at_admission_and_mutation(self):
+        # A current organization member with only read access who did not open the PR.
+        proof, root = self.prior_threads()
+        self.permissions[f.JOSH["login"]] = "read"
+        plan = self.resolve_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        with patch.object(j, "records", return_value={123: proof}), patch.object(f, "resolve_thread") as resolve:
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, None, self.head_dir)
+        resolve.assert_not_called()
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertIn(j.NOT_AUTHORIZED_NOTE, self.pr.roots[-1].body)
+        self.assertNotIn("agent-review-resolved", self.pr.roots[-1].body)
+        # A code-confirmed fix reported by that member is answered and kept open too.
+        self.pr.roots = [root]
+        plan = self.reply_plan(proof, root)
+        with patch.object(j, "records", return_value={123: proof}), patch.object(f, "resolve_thread") as resolve:
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("fixed"), self.head_dir)
+        resolve.assert_not_called()
+        self.assertIn(j.NOT_AUTHORIZED_NOTE, self.pr.roots[-1].body)
+        # A failed permission lookup never authorizes.
+        self.pr.roots = [root]
+        self.repo.get_collaborator_permission = lambda login: (_ for _ in ()).throw(RuntimeError("lookup failed"))
+        plan = self.resolve_plan(proof, root)
+        with patch.object(j, "records", return_value={123: proof}), patch.object(f, "resolve_thread") as resolve:
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, None, self.head_dir)
+        resolve.assert_not_called()
+        # The PR author may resolve even with read access.
+        self.pr.roots = [root]
+        self.pr.user = NS(login=f.JOSH["login"])
+        plan = self.resolve_plan(proof, root)
+        with patch.object(j, "records", return_value={123: proof}):
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, None, self.head_dir)
+        self.assertTrue(self.pr.threads[root.id]["isResolved"])
+
+    def test_authority_revoked_before_the_mutation_never_resolves(self):
+        proof, root = self.prior_threads()
+        plan = self.resolve_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        answers = iter(["write"])
+        self.repo.get_collaborator_permission = lambda login: next(answers, "read")
+        with patch.object(j, "records", return_value={123: proof}), patch.object(f, "resolve_thread") as resolve, \
+                patch("sys.stdout", new_callable=io.StringIO):
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, None, self.head_dir)
+        resolve.assert_not_called()
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertIn(j.COMMAND_NOT_ATTEMPTED_NOTE, self.pr.roots[-1].body)
+        self.assertNotIn("awaiting GitHub confirmation", self.pr.roots[-1].body)
+
+    def test_pending_or_incomplete_verification_reply_is_not_a_decision(self):
+        proof, root = self.prior_threads()
+        marker = f.verification_marker(root.id, "a" * 40)
+        for body in (marker + "\nReply pending; no completed answer yet.",
+                     marker + "\nReply incomplete; inspect Actions and post a new reply to retry."):
+            self.pr.roots = [root]
+            self.pr.create_review_comment_reply(root.id, body)
+            self.assertEqual(1, len(j.collect_threads(self.pr, {123: proof})), body)
+        self.pr.roots = [root]
+        self.pr.create_review_comment_reply(root.id, marker + "\n" + j.VERIFIED_PREFIX + "a" * 40 + ":\n\n- evidence")
+        self.assertEqual([], j.collect_threads(self.pr, {123: proof}))
 
     def test_command_flag_and_existing_answer_never_authorize_an_extra_resolve(self):
         proof, root = self.prior_threads()

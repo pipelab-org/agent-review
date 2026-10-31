@@ -152,6 +152,26 @@ def prepare(head_dir, output, reply=False):
             stream.write(f"run_inference={'false' if scope['kind'] == 'unchanged' else 'true'}\n")
 
 
+# GitHub lets a person resolve a review conversation only if they opened the pull
+# request or have write access to the repository:
+# https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests/commenting-on-a-pull-request#resolving-conversations
+# The legacy permission field reports admin, write, read or none (maintain is
+# reported as write): https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+RESOLVING_PERMISSIONS = ("admin", "write")
+NOT_AUTHORIZED_NOTE = ("Only the pull request author or someone with write access can resolve this "
+                       "conversation; it stays open.")
+
+
+def may_resolve(repo, pr, login):
+    """The bot resolves for a person only when GitHub would let that person resolve it."""
+    try:
+        if pr.user.login == login:
+            return True
+        return repo.get_collaborator_permission(login) in RESOLVING_PERMISSIONS
+    except Exception:
+        return False
+
+
 def reply_check(repo, pr, ctx, policy, proof=None):
     event = engine.strict_json(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     def membership(org, login):
@@ -269,9 +289,14 @@ def publish_reply(repo, pr, ctx, policy, plan, result, head_dir=None):
     existing = marked_replies(pr, root.id, marker, comments=comments)
     if existing and result is None:
         return
+    authorized = may_resolve(repo, pr, live.user.login)
     def fresh():
         current = check_pr(repo, ctx)
         reply_check(repo, current, ctx, policy, proof)
+    def fresh_authorized():
+        fresh()
+        if not may_resolve(repo, pr, live.user.login):
+            raise ReviewAbort("Resolver authority changed")
     thread = None
     answer = None if command else validate_reply_result(result, plan, policy, head_dir)
     if command or (answer["resolve"] and answer["reason"] == "fixed"):
@@ -281,25 +306,29 @@ def publish_reply(repo, pr, ctx, policy, plan, result, head_dir=None):
             print(FOLLOWUP_NOTE)
     if command and (thread is None or thread["isResolved"]):
         return
-    resolvable = bool(thread and not thread["isResolved"]
+    resolvable = bool(authorized and thread and not thread["isResolved"]
                       and (command or (thread["isOutdated"] and root.id not in judged)))
-    text = "Resolution requested; awaiting GitHub confirmation." if command else answer["answer"]
+    if command and not authorized:
+        text = NOT_AUTHORIZED_NOTE
+    else:
+        text = "Resolution requested; awaiting GitHub confirmation." if command else answer["answer"]
     if not command and (answer["resolve"] or result["output"]["resolve"]) and not resolvable:
-        text += "\n\n" + KEPT_OPEN_NOTE
+        text += "\n\n" + (KEPT_OPEN_NOTE if authorized else NOT_AUTHORIZED_NOTE)
     posted, created = publish_answer(pr, root.id, marker, text, fresh, {"comments": comments})
     if not resolvable or not created:
         return
-    failed = False
+    failed, attempted = False, False
     try:
-        fresh()
+        fresh_authorized()
         state, target_comments = followups.thread_snapshot(pr, thread["id"], root.id)
         target_judged = judged_comments([c for c in target_comments if c["id"] != posted.id])
         if (not state["isResolved"] and (command or (state["isOutdated"]
                 and root.id not in judged | target_judged))):
-            fresh()
+            fresh_authorized()
             published_body = posted.body
             resolution_body(published_body, root.id, False)
             succeeded = False
+            attempted = True
             try:
                 followups.resolve_thread(pr, thread["id"])
                 succeeded = True
@@ -309,8 +338,19 @@ def publish_reply(repo, pr, ctx, policy, plan, result, head_dir=None):
                 finish_resolution(pr, posted, root.id, succeeded, published_body)
     except Exception:
         failed = True
+    if command and not attempted:
+        # Never leave the acknowledgment reading as if resolution were still pending.
+        try:
+            actual = pr.get_review_comment(posted.id)
+            if followups.identity(actual.user, followups.BOT) and actual.raw_data.get("in_reply_to_id") == root.id:
+                actual.edit(marker + "\n" + COMMAND_NOT_ATTEMPTED_NOTE)
+        except Exception:
+            failed = True
     if failed:
         print(FOLLOWUP_NOTE)
+
+
+COMMAND_NOT_ATTEMPTED_NOTE = "Resolution was not attempted; check the thread."
 
 
 def resolution_body(text, root, succeeded):
@@ -505,6 +545,9 @@ def collect_threads(pr, proof):
     return sorted(result, key=lambda item: item["thread"])
 
 
+VERIFIED_PREFIX = "Verified fixed at "
+
+
 def judged_roots(pr):
     return judged_comments(followups.listed_comments(pr))
 
@@ -523,7 +566,10 @@ def judged_comments(comments):
         parent = comment.get("in_reply_to_id")
         lines = comment["body"].split("\n")
         match = re.fullmatch(r"<!-- agent-review-verified:v1 root=([1-9][0-9]*) head=([0-9a-f]{40}) -->", lines[0])
-        if match and parent == int(match[1]) and "<!--" not in "\n".join(lines[1:]):
+        # Pending or incomplete verification replies are not decisions; only the
+        # completed answer, written by the publisher on line two, is.
+        if (match and parent == int(match[1]) and len(lines) > 1 and lines[1].startswith(VERIFIED_PREFIX)
+                and "<!--" not in "\n".join(lines[1:])):
             judged.add(parent)
         # A reply that resolved its thread decides it at every head.
         resolved = re.fullmatch(r"<!-- agent-review-resolved:v1 root=([1-9][0-9]*) -->", lines[-1])
@@ -684,7 +730,8 @@ def publish_answer(pr, root, marker, answer, fresh, thread_context=None):
         pending.edit(body)
         observed(body)
     except BaseException:
-        pending.edit(marker + "\nReply incomplete; inspect Actions and post a new reply to retry.")
+        pending.edit(marker + "\nReply incomplete; inspect Actions and post a new reply to retry, "
+                     "or reply /resolve if you may resolve this conversation.")
         raise
     return pending, True
 
@@ -725,7 +772,7 @@ def publish_verification(repo, pr, ctx, policy, plan, verification, head_dir):
                     raise ReviewAbort("Verification target changed or is no longer open")
             bound()
             marker = followups.verification_marker(target["root"]["id"], ctx["head"])
-            answer = "Verified fixed at " + ctx["head"] + ":\n\n" + "\n".join(
+            answer = VERIFIED_PREFIX + ctx["head"] + ":\n\n" + "\n".join(
                 f"- {code(e['path'] + ':' + str(e['line']))}: {e['change']}" for e in item["evidence"])
             _, created = publish_answer(pr, root_id, marker, answer, bound,
                 {"comments": comments, "on_create": active.add})
