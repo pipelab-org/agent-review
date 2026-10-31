@@ -563,7 +563,7 @@ class JobTests(unittest.TestCase):
         self.assertNotIn(str(status.id), hidden)
 
 
-    def prior_threads(self, grouped=False):
+    def prior_threads(self, grouped=False, outdated=True):
         items = [finding(path="app.py", title="First")]
         if grouped:
             items.append(finding(path="app.py", title="Second", mechanism="Another cause"))
@@ -572,8 +572,16 @@ class JobTests(unittest.TestCase):
         proof = json.loads((self.root / "completion.json").read_text())
         root = self.pr.roots[0]
         original = root.commit_id
-        self.advance_head("helper.py")
-        self.assertNotEqual(original, root.commit_id)
+        if outdated:
+            # Rewriting the finding's file outdates the thread and freezes its commit.
+            self.advance_head("app.py")
+            self.assertTrue(self.pr.threads[root.id]["isOutdated"])
+            self.assertIsNone(root.raw_data["line"])
+        else:
+            # A change elsewhere keeps the thread live and moves its commit_id.
+            self.advance_head("helper.py")
+            self.assertNotEqual(original, root.commit_id)
+            self.assertFalse(self.pr.threads[root.id]["isOutdated"])
         self.assertEqual(original, root.raw_data["original_commit_id"])
         return proof, root
 
@@ -650,7 +658,7 @@ class JobTests(unittest.TestCase):
         plan = self.reply_plan(proof, root)
         policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
         with patch.object(j, "records", return_value={123: proof}):
-            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("finding_wrong"), self.head_dir)
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("fixed"), self.head_dir)
         self.assertTrue(self.pr.threads[root.id]["isResolved"])
         self.pr.threads[root.id]["isResolved"] = False
         self.advance_head("later.py")
@@ -905,7 +913,7 @@ class JobTests(unittest.TestCase):
             "resolve": reason != "none", "reason": reason,
             "evidence": [{"finding": 0, "path": "app.py", "line": 1, "change": "Preserves the value."}] if reason != "none" else []}}
 
-    def test_earlier_head_code_reading_reply_resolves_fixed_or_wrong_only(self):
+    def test_earlier_head_code_reading_reply_resolves_only_confirmed_fixes(self):
         proof, root = self.prior_threads()
         for reason in ("none", "fixed", "finding_wrong"):
             self.pr.threads[root.id]["isResolved"] = False
@@ -915,7 +923,24 @@ class JobTests(unittest.TestCase):
             policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
             with patch.object(j, "records", return_value={123: proof}):
                 j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer(reason), self.head_dir)
-            self.assertEqual(reason != "none", self.pr.threads[root.id]["isResolved"])
+            self.assertEqual(reason == "fixed", self.pr.threads[root.id]["isResolved"])
+            posted = [c.body for c in self.pr.roots if c.raw_data.get("in_reply_to_id") == root.id][-1]
+            self.assertEqual(reason == "finding_wrong", j.KEPT_OPEN_NOTE in posted)
+            self.assertEqual(reason == "fixed", "agent-review-resolved:v1" in posted)
+
+    def test_live_threads_are_never_verified_or_resolved_by_a_reply(self):
+        # The code at a live thread's location did not change, so neither the
+        # verification stage nor a "fixed" reply may resolve it.
+        proof, root = self.prior_threads(outdated=False)
+        self.assertEqual([], j.collect_threads(self.pr, {123: proof}))
+        plan = self.reply_plan(proof, root)
+        policy, depth = j.settings(); ctx, _ = j.context(policy, depth)
+        with patch.object(j, "records", return_value={123: proof}):
+            j.publish_reply(self.repo, self.pr, ctx, policy, plan, self.answer("fixed"), self.head_dir)
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        posted = [c.body for c in self.pr.roots if c.raw_data.get("in_reply_to_id") == root.id][-1]
+        self.assertIn(j.KEPT_OPEN_NOTE, posted)
+        self.assertNotIn("agent-review-resolved:v1", posted)
 
     def test_reply_resolution_requires_disposition_receipt_all_findings_and_head_reads(self):
         for field, value in (("resolve", 1), ("reason", "other"), ("answer", ""), ("reason", "none")):
