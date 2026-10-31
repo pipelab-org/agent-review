@@ -376,6 +376,7 @@ class JobTests(unittest.TestCase):
         expected = {f.canonical(item) for item in record["findings"]}
         self.assertEqual(expected, j.prior_thread_findings(self.pr, proof))
         root = self.pr.roots[0]
+        self.assertIs(root, f.owned_root(self.pr, NS(raw_data={"in_reply_to_id": root.id}, path=root.path), proof))
         body = root.body
         root.edit(body + "edited")
         self.assertEqual(set(), j.prior_thread_findings(self.pr, proof))
@@ -394,32 +395,63 @@ class JobTests(unittest.TestCase):
     def test_success_collapses_status_and_earlier_reviewer_comments_only(self):
         calls = []
         self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: calls.append((name, data)))
-        old = Comment(50, "<!-- agent-review-notice:v1 run=1 -->\nReview incomplete", NS(**f.BOT), {"node_id": "OLD"})
-        human = Comment(51, "<!-- agent-review-notice:v1 run=1 --> copied", NS(**f.JOSH), {"node_id": "HUMAN"})
-        self.pr.comments.update({50: old, 51: human})
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
         status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
         summary = next(c for c in self.pr.comments.values() if f.RESULT.search(c.body) and c is not status)
-        hidden = {data["subjectId"] for _, data in calls}
-        self.assertEqual({"OLD"}, hidden - {None})
+        status.raw_data["node_id"], summary.raw_data["node_id"] = "STATUS", "SUMMARY"
+        other = Comment(50, "Other workflow quoted agent-review-result:v1", NS(**f.BOT), {"node_id": "OTHER"})
+        human = Comment(51, summary.body, NS(**f.JOSH), {"node_id": "HUMAN"})
+        pending = Comment(52, "<!-- agent-review-notice:v1 run=9 -->\nPublication pending", NS(**f.BOT), {"node_id": "PENDING"})
+        later = Comment(500, status.body, NS(**f.BOT), {"node_id": "LATER"})
+        self.pr.comments.update({50: other, 51: human, 52: pending, 500: later})
+        j.collapse_earlier(self.pr, 600, 601, {}, j.prior_thread_findings(self.pr, {123: old}))
+        self.assertEqual([], calls, "a parseable record is not immutable workflow proof")
+        self.advance_head("app.py")
+        calls.clear()
+        with patch.object(j, "records", return_value={123: old}):
+            self.build([finding(path="app.py")])
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual({"STATUS", "SUMMARY"}, {data["subjectId"] for _, data in calls})
         self.assertEqual({"minimizeComment"}, {name for name, _ in calls})
         self.assertTrue(all(data["classifier"] == "OUTDATED" for _, data in calls))
-        status.raw_data["node_id"], summary.raw_data["node_id"] = "STATUS", "SUMMARY"
-        later = Comment(status.id + 50, "<!-- agent-review-notice:v1 run=9 -->", NS(**f.BOT), {"node_id": "LATER"})
-        self.pr.comments[later.id] = later
-        calls.clear()
-        j.collapse_earlier(self.pr, status.id, summary.id)
-        self.assertEqual({"OLD"}, {data["subjectId"] for _, data in calls})
+        self.assertEqual(old, f.parse_record(status, self.pr.comments))
+
+    def test_cleanup_keeps_the_only_full_text_of_a_summary_finding_visible(self):
+        hidden = set()
+        self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
+        self.build([finding(path="helper.py")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        self.pr.comments[old["summary"]].raw_data["node_id"] = "ONLY-FINDING-TEXT"
+        self.advance_head("app.py")
+        with patch.object(j, "records", return_value={123: old}):
+            self.build()
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertNotIn("ONLY-FINDING-TEXT", hidden)
 
     def test_collapse_refusal_never_fails_a_published_review(self):
+        import io
+        from github import GithubException
+        calls = []
         def refuse(*_):
-            raise RuntimeError("forbidden")
+            calls.append(True)
+            raise GithubException(403, {"message": "private response detail"})
         self.pr.requester = NS(graphql_named_mutation=refuse)
-        self.pr.comments[50] = Comment(50, "<!-- agent-review-notice:v1 run=1 -->", NS(**f.BOT), {"node_id": "OLD"})
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
+        old = json.loads((self.root / "completion.json").read_text())
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+        status.raw_data["node_id"] = "OLD-STATUS"
+        self.advance_head("app.py")
+        output = io.StringIO()
+        with patch.object(j, "records", return_value={123: old}), patch("sys.stdout", output):
+            self.build([finding(path="app.py")])
+            j.publish_artifact(self.artifact, self.head_dir)
         self.assertTrue((self.root / "completion.json").is_file())
+        self.assertEqual([True], calls)
+        self.assertEqual("Earlier review comments were left visible (GithubException)\n", output.getvalue())
 
     def test_failed_completion_upload_keeps_the_notifier_warning_visible(self):
         import io

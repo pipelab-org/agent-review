@@ -354,7 +354,7 @@ def publish_review(repo, pr, ctx, policy, plan, result):
     if not followups.identity(actual.user, followups.BOT) or actual.body != body:
         raise ReviewAbort("Success publication could not be verified")
     followups.write_completion(os.environ["REVIEW_COMPLETION_PATH"], dict(evidence, digest=digest))
-    collapse_earlier(pr, status.id, summary.id)
+    collapse_earlier(pr, status.id, summary.id, proof, previous)
 
 
 def overlap_groups(findings, indexes):
@@ -459,26 +459,32 @@ def summary_text(ctx, scope, bundle, result, findings, placement):
     return text + "\n\n<details><summary>Review details</summary>\n\n" + details + "\n\n</details>"
 
 
-# Published comments carrying these markers are reviewer bookkeeping or older results.
-COLLAPSIBLE_PREFIXES = ("<!-- agent-review-status:v1", "<!-- agent-review-notice:v1")
-
-
-def collapse_earlier(pr, status_id, summary_id):
-    """Hide earlier reviewer comments as outdated.
+def collapse_earlier(pr, status_id, summary_id, proof, threaded):
+    """Hide verified earlier successes, preserving findings with no intact thread.
 
     GitHub's minimizeComment changes visibility only, never the body, so digest-bound
-    records stay verifiable. It is cosmetic: a refusal leaves comments visible and never
+    records stay verifiable. It is cosmetic: a refusal leaves remaining comments visible and never
     fails a review that already published. This run's status stays visible because
     a later upload failure makes the notifier edit it into an incomplete warning.
     Comments created after this run's status belong to a concurrent run and stay visible.
-    Source: https://docs.github.com/en/graphql/reference/mutations#minimizecomment
+    Source: https://docs.github.com/en/graphql/reference/issues#minimizecomment
     """
     try:
-        for comment in pr.get_issue_comments():
-            body = comment.body if isinstance(comment.body, str) else ""
+        comments = {comment.id: comment for comment in pr.get_issue_comments()}
+        eligible = set()
+        for comment in comments.values():
+            record = followups.parse_record(comment, comments)
+            if record is None or proof.get(record["run_id"]) != record:
+                continue
+            eligible.add(comment.id)
+            # Incremental results do not repeat older summary-only findings. Their
+            # full text must stay visible until there is an intact inline root.
+            if all(followups.canonical(f) in threaded for f in record["findings"]):
+                eligible.add(record["summary"])
+        for comment in comments.values():
             if (comment.id == summary_id or comment.id >= status_id
                     or not followups.identity(comment.user, followups.BOT)
-                    or not (body.startswith(COLLAPSIBLE_PREFIXES) or publish.RESULT_MARKER in body)):
+                    or comment.id not in eligible):
                 continue
             node = comment.raw_data.get("node_id")
             if isinstance(node, str) and node:
