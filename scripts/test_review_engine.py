@@ -277,6 +277,21 @@ class BundleTests(unittest.TestCase):
             self.assertFalse(e.safe_path(path), path)
         self.assertTrue(e.safe_path("src/app.py"))
 
+    def test_change_over_the_depth_allowance_is_refused_as_incomplete(self):
+        small = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)  # 24,000 available
+        # A diff larger than the allowance stops at the Git byte bound.
+        (self.root / "app.py").write_text("changed line of source\n" * 2_000)
+        head = self.commit()
+        with self.assertRaisesRegex(e.ReviewAbort, "^Source or diff exceeds the review depth's max_model_tokens"):
+            e.build_bundle(self.root, head, self.base, small)
+        # A diff under the byte bound whose regions plus patch still exceed it is refused too.
+        (self.root / "app.py").write_text("changed line of source\n" * 700)
+        head = self.commit()
+        with self.assertRaisesRegex(e.ReviewAbort, "^Diff and changed regions exceed the review depth's max_model_tokens"):
+            e.build_bundle(self.root, head, self.base, small)
+        # The same change fits the shipped Claude allowance.
+        self.assertEqual(["app.py"], [f["path"] for f in e.build_bundle(self.root, head, self.base, e.policy("default"))["files"]])
+
 
 class ResultTests(unittest.TestCase):
     def test_invalid_finding_schema_is_rejected(self):
@@ -940,6 +955,47 @@ class CodexTests(unittest.TestCase):
         with self.assertRaisesRegex(e.ReviewAbort, "short-context"):
             e.codex_command(dict(POLICY, model="gpt-6.1-sol", max_model_tokens=272_001), Path("/head"),
                             Path("/home"), Path("/schema"), Path("/out"), Path("/action"))
+
+
+class AllowanceGuardTests(unittest.TestCase):
+    """Each size guard refuses input over the depth's own allowance (here 24,000 after output)."""
+    DEPTH = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
+    LIMIT = 24_000
+
+    def test_claude_request_over_the_depth_allowance_aborts(self):
+        for total, refused in ((self.LIMIT, False), (self.LIMIT + 1, True)):
+            events = transcript()
+            events[0]["message"]["usage"] = {"input_tokens": 10, "cache_read_input_tokens": total - 10,
+                                             "output_tokens": 5}
+            with self.subTest(total=total), tempfile.TemporaryDirectory() as tmp:
+                if refused:
+                    with self.assertRaisesRegex(e.ReviewAbort, "Claude request exceeded the review depth's max_model_tokens"):
+                        e.claude_result(events, self.DEPTH, BUNDLE, "bundle", Path(tmp))
+                else:
+                    e.claude_result(events, self.DEPTH, BUNDLE, "bundle", Path(tmp))
+
+    def test_claude_prompt_over_the_depth_allowance_aborts_before_launch(self):
+        schema = len(json.dumps(e.OUTPUT_SCHEMA))
+        with patch.object(e.subprocess, "run", side_effect=AssertionError("provider launched")):
+            with self.assertRaisesRegex(e.ReviewAbort, "Complete prompt exceeds the review depth's max_model_tokens"):
+                e.run_claude(self.DEPTH, BUNDLE, "bundle", Path("/head"), prompt="x" * (self.LIMIT - schema + 1))
+            with self.assertRaisesRegex(AssertionError, "provider launched"):
+                e.run_claude(self.DEPTH, BUNDLE, "bundle", Path("/head"), prompt="x" * (self.LIMIT - schema))
+
+    def test_codex_prompt_over_the_depth_allowance_aborts_before_launch(self):
+        settings = dict(self.DEPTH, model="gpt-6.1-terra", provider="codex", passes=["callers"])
+        schema = len(json.dumps(e.OUTPUT_SCHEMA))
+        with tempfile.TemporaryDirectory() as tmp:
+            home, workspace = Path(tmp) / "home", Path(tmp) / "work"
+            home.mkdir()
+            workspace.mkdir()
+            with patch.object(e, "configure_codex"),                     patch.object(e, "codex_command", side_effect=AssertionError("provider launched")):
+                with self.assertRaisesRegex(e.ReviewAbort, "Codex prompt exceeds the review depth's max_model_tokens"):
+                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace,
+                                prompt="x" * (self.LIMIT - schema + 1))
+                with self.assertRaisesRegex(AssertionError, "provider launched"):
+                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace,
+                                prompt="x" * (self.LIMIT - schema))
 
 
 class VacuityTests(unittest.TestCase):
