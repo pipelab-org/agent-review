@@ -97,6 +97,36 @@ class PolicyTests(unittest.TestCase):
         for depth in ("codex", "codex-deep"):
             self.assertIn(shipped["review_depth"][depth]["model"], e.CODEX_PRICES)
 
+    def test_depth_allowance_overrides_shared_input_allowance(self):
+        # Shipped: Claude depths take the larger allowance, Codex depths keep the shared 272000.
+        shipped = {depth: e.policy(depth)["max_model_tokens"] for depth in e.DEPTHS}
+        self.assertEqual({"default": 516_000, "deep": 516_000, "codex": 272_000, "codex-deep": 272_000}, shipped)
+        data = self.data()
+        data["config"]["max_model_tokens"] = 272_000
+        data["review_depth"]["default"]["max_model_tokens"] = 516_000
+        self.assertEqual(516_000, e.policy("default", data)["max_model_tokens"])
+        self.assertEqual(272_000, e.policy("deep", data)["max_model_tokens"])
+        for bad in (0, -1, True, "516000", 1.5, None):
+            data["review_depth"]["default"]["max_model_tokens"] = bad
+            with self.subTest(value=bad), self.assertRaisesRegex(
+                    e.ReviewAbort, "review_depth.default.max_model_tokens"):
+                e.policy("default", data)
+        data["review_depth"]["default"]["max_model_tokens"] = e.CLAUDE_CONTEXT_TOKENS
+        self.assertEqual(e.CLAUDE_CONTEXT_TOKENS, e.policy("default", data)["max_model_tokens"])
+        data["review_depth"]["default"]["max_model_tokens"] = e.CLAUDE_CONTEXT_TOKENS + 1
+        with self.assertRaisesRegex(e.ReviewAbort, "Claude context window"):
+            e.policy("default", data)
+        data["review_depth"]["default"]["max_model_tokens"] = data["config"]["max_output_tokens"]
+        with self.assertRaisesRegex(e.ReviewAbort, "max_output_tokens below"):
+            e.policy("default", data)
+        # A raised Codex depth still fails before inference instead of billing long-context rates.
+        data = self.data()
+        data["review_depth"]["codex"]["max_model_tokens"] = 516_000
+        data["review_depth"]["codex"]["model"] = "gpt-6.1-terra"
+        settings = e.policy("codex", data)
+        with self.assertRaisesRegex(e.ReviewAbort, "short-context"):
+            e.codex_command(settings, Path("/head"), Path("/home"), Path("/schema"), Path("/out"), Path("/action"))
+
     def test_documented_allowances_match_shipped_policy(self):
         expected = {depth: e.policy(depth)["max_budget_usd"] for depth in e.DEPTHS}
         for path in ("README.md", "docs/agent-review.md"):
