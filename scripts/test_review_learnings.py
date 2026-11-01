@@ -7,6 +7,7 @@ import io
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -172,11 +173,12 @@ class FetchTests(unittest.TestCase):
         self.paths, self.requests = [], []
         self.payload = ENTRY.encode()
         self.error = None
+        self.token = "private-fixture-token"
         def request(req, timeout):
             self.requests.append(req)
             self.paths.append(req.full_url)
             self.assertEqual(engine_tests.POLICY["ai_timeout"], timeout)
-            self.assertEqual("Bearer private-fixture-token", req.get_header("Authorization"))
+            self.assertEqual("Bearer " + self.token, req.get_header("Authorization"))
             if "/contents/repos/" in req.full_url:
                 if self.error:
                     raise self.error
@@ -191,6 +193,34 @@ class FetchTests(unittest.TestCase):
     def fetch(self, token="private-fixture-token", credentials=True):
         l.fetch(self.root, "example/project", token, credentials, engine_tests.POLICY, opener=self.opener)
         return l.load(self.root, engine_tests.POLICY)
+
+    def test_fetch_and_main_never_persist_installation_token(self):
+        self.token = "SENTINEL_learnings_installation_token_do_not_persist"
+        for mode in ("fetch", "main"):
+            with self.subTest(mode=mode):
+                output = self.root / mode
+                output.mkdir()
+                github_output, github_env = self.root / (mode + "-output"), self.root / (mode + "-env")
+                github_output.touch(); github_env.touch()
+                env = {"LEARNINGS_TOKEN": self.token, "LEARNINGS_CREDENTIALS": "true",
+                       "GITHUB_REPOSITORY": "example/project", "RUNNER_TEMP": str(output),
+                       "GITHUB_OUTPUT": str(github_output), "GITHUB_ENV": str(github_env)}
+                with patch.dict(os.environ, env), patch.object(
+                        l.urllib.request, "build_opener", return_value=self.opener), patch.object(
+                        e, "policy", return_value=engine_tests.POLICY), patch(
+                        "sys.argv", ["review_learnings.py", "--fetch"]), patch("sys.stdout", new_callable=io.StringIO) as log:
+                    if mode == "fetch":
+                        l.fetch(output, "example/project", self.token, True, engine_tests.POLICY)
+                        directory = output
+                    else:
+                        self.assertEqual(0, l.main())
+                        directory = Path(github_output.read_text().removeprefix("directory=").strip())
+                self.assertEqual(1, len(l.load(directory, engine_tests.POLICY)["entries"]))
+                self.assertNotIn(self.token, log.getvalue())
+                paths = [p for p in output.rglob("*") if p.is_file()] + [github_output, github_env]
+                self.assertTrue(paths)
+                for path in paths:
+                    self.assertNotIn(self.token.encode(), path.read_bytes(), str(path))
 
     def test_fetch_pins_both_exact_files_to_one_default_branch_commit(self):
         loaded = self.fetch()
@@ -593,6 +623,59 @@ class WorkflowTests(unittest.TestCase):
     def workflow(self):
         return yaml.load((ROOT / ".github/workflows/agent-review-reusable.yaml").read_text(), Loader=yaml.BaseLoader)
 
+    def test_every_learnings_fetch_uses_its_prepare_depth(self):
+        jobs = self.workflow()["jobs"]
+        fetched = []
+        for name, job in jobs.items():
+            steps = job.get("steps", [])
+            for fetch in (s for s in steps if s.get("id") == "learnings-fetch"):
+                fetched.append(name)
+                prepare = next(s for s in steps if s.get("id") == "plan")
+                self.assertEqual(prepare["env"]["REVIEW_DEPTH"], fetch["env"]["REVIEW_DEPTH"], name)
+        self.assertEqual({"review", "reply"}, set(fetched))
+
+    def test_token_revocation_runs_immediately_after_fetch_before_head_and_inference(self):
+        for name in ("review", "reply"):
+            steps = self.workflow()["jobs"][name]["steps"]
+            token = next(s for s in steps if s.get("id") == "learnings-token")
+            fetch = next(s for s in steps if s.get("id") == "learnings-fetch")
+            revoke = next(s for s in steps if s.get("id") == "learnings-revoke")
+            self.assertEqual("true", token["with"]["skip-token-revoke"])
+            self.assertEqual("true", revoke["continue-on-error"])
+            self.assertIn("always()", revoke["if"])
+            self.assertIn("steps.learnings-token.outcome == 'success'", revoke["if"])
+            self.assertEqual(steps.index(fetch) + 1, steps.index(revoke))
+            consumers = [s for s in steps if s.get("with", {}).get("path") == "pr-head"
+                         or "review_jobs.py infer " in s.get("run", "")]
+            self.assertEqual(2, len(consumers), name)
+            for consumer in consumers:
+                self.assertLess(steps.index(revoke), steps.index(consumer), name)
+
+    def test_revoke_script_deletes_token_and_logs_failure_without_failing_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gh = root / "gh"
+            gh.write_text('#!/bin/bash\nprintf "%s" "$*" > "$REVOKE_CALL"\nexit "$REVOKE_EXIT"\n')
+            gh.chmod(0o700)
+            for name in ("review", "reply"):
+                revoke = next(s for s in self.workflow()["jobs"][name]["steps"]
+                              if s.get("id") == "learnings-revoke")
+                for code in (0, 1):
+                    with self.subTest(job=name, exit=code):
+                        call = root / "call"
+                        if call.exists():
+                            call.unlink()
+                        env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                               "GH_TOKEN": "SENTINEL_revoke_token", "REVOKE_CALL": str(call),
+                               "REVOKE_EXIT": str(code)}
+                        result = subprocess.run(["bash", "-euo", "pipefail", "-c", revoke["run"]],
+                                                env=env, capture_output=True, text=True, timeout=5)
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        self.assertTrue(call.is_file(), "revocation never called gh")
+                        self.assertEqual("api --method DELETE /installation/token", call.read_text())
+                        self.assertIn("::warning::" if code else "Learnings token revoked.", result.stdout)
+                        self.assertNotIn("SENTINEL_revoke_token", result.stdout + result.stderr)
+
     def test_token_is_scoped_optional_and_not_in_any_inference_step_environment(self):
         workflow = self.workflow()
         for name in ("AGENT_REVIEW_LEARNINGS_APP_ID", "AGENT_REVIEW_LEARNINGS_APP_KEY"):
@@ -602,6 +685,7 @@ class WorkflowTests(unittest.TestCase):
             steps = job["steps"]
             token = next(s for s in steps if s.get("id") == "learnings-token")
             fetch = next(s for s in steps if s.get("id") == "learnings-fetch")
+            revoke = next(s for s in steps if s.get("id") == "learnings-revoke")
             prepare = next(s for s in steps if s.get("id") == "plan")
             inference = next(s for s in steps if "review_jobs.py infer " in s.get("run", ""))
             self.assertEqual("true", token["continue-on-error"])
@@ -616,8 +700,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertLess(steps.index(fetch), steps.index(prepare))
             self.assertLess(steps.index(prepare), steps.index(inference))
             self.assertEqual("${{ steps.learnings-token.outputs.token }}", fetch["env"]["LEARNINGS_TOKEN"])
+            self.assertEqual({"GH_TOKEN": "${{ steps.learnings-token.outputs.token }}"}, revoke["env"])
             for step in steps:
-                if step is fetch:
+                if step.get("id", "").startswith("learnings-"):
+                    self.assertNotRegex(step.get("run", ""), r"\bGITHUB_(?:ENV|PATH)\b")
+            for step in steps:
+                if step is fetch or step is revoke:
                     continue
                 self.assertNotIn("learnings-token.outputs.token", json.dumps(step))
             self.assertNotIn("LEARNINGS_TOKEN", json.dumps(job.get("env", {})))
