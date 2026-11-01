@@ -70,7 +70,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 65
     permissions:
       actions: read
       contents: read
@@ -326,7 +326,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     permissions:
       actions: read
       contents: read

@@ -194,6 +194,22 @@ def trusted_run(run, record):
                 and ref.get("sha") == ctx["reviewer"] for ref in refs))
 
 
+# Seconds of socket inactivity allowed per artifact request. GitHub ends any REST
+# request after 10 seconds of processing (docs.github.com/en/rest/using-the-rest-api/
+# troubleshooting-the-rest-api); twice that leaves transfer headroom for the bounded
+# completion archive and keeps a stalled download from consuming the inference budget.
+ARTIFACT_TIMEOUT = 20
+
+
+def _get_once_more(get, *args, **kwargs):
+    """One retry of a timed-out or dropped request (requests' Timeout and ConnectionError
+    are OSError). A transient stall then costs at most two short waits, not a lost record."""
+    try:
+        return get(*args, **kwargs)
+    except OSError:
+        return get(*args, **kwargs)
+
+
 def download_record(artifact, token, timeout):
     """Follow GitHub's signed archive redirect without forwarding the token.
 
@@ -205,7 +221,7 @@ def download_record(artifact, token, timeout):
     if not (urlparse(endpoint).scheme == "https" and urlparse(endpoint).netloc == "api.github.com"
             and re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/artifacts/[1-9][0-9]*/zip", urlparse(endpoint).path)):
         raise FollowupAbort("Invalid artifact archive URL")
-    response = requests.get(endpoint, headers={"Authorization": "Bearer " + token,
+    response = _get_once_more(requests.get, endpoint, headers={"Authorization": "Bearer " + token,
                             "Accept": "application/vnd.github+json"}, timeout=timeout, allow_redirects=False)
     message = None
     if response.status_code in reliability.THROTTLE_STATUSES:
@@ -225,7 +241,7 @@ def download_record(artifact, token, timeout):
     target = urlparse(location)
     if target.scheme != "https" or not target.hostname or target.username or target.password:
         raise FollowupAbort("Invalid artifact redirect")
-    archive = requests.get(location, timeout=timeout, allow_redirects=False)
+    archive = _get_once_more(requests.get, location, timeout=timeout, allow_redirects=False)
     archive.raise_for_status()
     # v4 artifacts cannot be changed after upload. Verify the publisher's digest
     # as well as the run binding; expired or old (digestless) artifacts fail closed.

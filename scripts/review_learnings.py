@@ -228,6 +228,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# Seconds of socket inactivity per learnings request: GitHub ends any REST request after
+# 10 seconds of processing (docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api).
+# The provider's ai_timeout is unrelated; the workflow step also stops after one minute.
+REQUEST_TIMEOUT = 20
+
+
 def fetch(directory, repository, token, credentials, settings, *, opener=None):
     """Credential-bearing process. Fetch just two files at one default-branch commit."""
     root = Path(directory)
@@ -246,7 +252,7 @@ def fetch(directory, repository, token, credentials, settings, *, opener=None):
                 request = urllib.request.Request(api + path, headers={
                     "Authorization": "Bearer " + token,
                     "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json"})
-                with opener.open(request, timeout=settings["ai_timeout"]) as response:
+                with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
                     body = response.read(budget + 1)
                 if len(body) > budget:
                     raise OverflowError
