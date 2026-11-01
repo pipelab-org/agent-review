@@ -21,6 +21,14 @@
 # than Haiku 5.5 bill their full 1M window at standard rates
 # (https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing).
 # At 90000, Pipelock changes touching its largest files could not be reviewed.
+# Claude depths override it with 516000 (500,000 input plus the 16,000 output reserve):
+# their whole 1M window bills at standard rates, and large pull requests were refused
+# at 272000. Codex depths keep 272000 because crossing it reprices the whole request
+# (https://developers.openai.com/api/docs/models/gpt-6.1-terra , checked 2026-10-31).
+# Claude budgets (owner approved 2026-10-31): a 20-turn pass resending a full 500,000-token
+# input at a 90% cache-hit rate is estimated at about $4.41 on Sonnet and $8.80 on Opus at the
+# rates above, so the default pass gets USD 5 and the deep pass USD 9. Estimate, not measured;
+# replace with twice the heaviest measured large-change pass once one is observed.
 [config]
 max_model_tokens = 272000
 max_output_tokens = 16000
@@ -33,13 +41,15 @@ ai_timeout = 300
 model = "anthropic/claude-sonnet-5-5"
 reasoning_effort = "high"
 max_turns = 40
-max_budget_usd = 2.0
+max_budget_usd = 5.0
+max_model_tokens = 516000
 
 [review_depth.deep]
 model = "anthropic/claude-opus-5-5"
 reasoning_effort = "high"
 max_turns = 40
-max_budget_usd = 4.0
+max_budget_usd = 9.0
+max_model_tokens = 516000
 
 [review_depth.codex]
 model = "gpt-6.1-terra"

@@ -28,6 +28,10 @@ CODEX_PRICES = {"gpt-6-luna": (0.10, 0.01, 0.125, 0.50), "gpt-6.1-terra": (1.00,
                 "gpt-6.1-sol": (2.00, 0.10, 2.50, 10.00), "gpt-6-astra": (10.00, 1.00, 12.50, 50.00)}
 # Same page: requests above 272K input tokens bill at long-context rates.
 CODEX_SHORT_CONTEXT_TOKENS = 272_000
+# Sonnet 5.5 and Opus 5.5 have a 1M-token window billed at standard rates throughout.
+# Sources: https://platform.claude.com/docs/en/build-with-claude/context-windows and
+# https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing , checked 2026-10-31.
+CLAUDE_CONTEXT_TOKENS = 1_000_000
 # Measured on historical changes with known bugs and on clean changes (three runs each,
 # 2026-10-29): counterexample-first text with distinct per-pass focuses at high effort found
 # five of six known bugs with no findings on the clean changes; the previous text found two.
@@ -121,10 +125,18 @@ def policy(depth, data=None):
     for name in ("max_model_tokens", "max_output_tokens", "ai_timeout"):
         if not positive_int(data.get("config", {}).get(name)):
             raise ReviewAbort(f"Set config.{name} to a positive integer")
-    if data["config"]["max_output_tokens"] >= data["config"]["max_model_tokens"]:
-        raise ReviewAbort("Set config.max_output_tokens below config.max_model_tokens")
-    return {**entry, **{k: data["config"][k] for k in ("max_model_tokens", "max_output_tokens", "ai_timeout")},
-            "provider": DEPTHS[depth][0], "passes": list(DEPTHS[depth][1])}
+    settings = {**entry, **{k: data["config"][k] for k in ("max_model_tokens", "max_output_tokens", "ai_timeout")},
+                "provider": DEPTHS[depth][0], "passes": list(DEPTHS[depth][1])}
+    # A depth may raise or lower the shared allowance; providers price long prompts differently.
+    if "max_model_tokens" in entry:
+        if not positive_int(entry["max_model_tokens"]):
+            raise ReviewAbort(f"Set review_depth.{depth}.max_model_tokens to a positive integer")
+        settings["max_model_tokens"] = entry["max_model_tokens"]
+    if settings["max_output_tokens"] >= settings["max_model_tokens"]:
+        raise ReviewAbort("Set config.max_output_tokens below the depth's max_model_tokens")
+    if settings["provider"] == "claude" and settings["max_model_tokens"] > CLAUDE_CONTEXT_TOKENS:
+        raise ReviewAbort(f"Claude context window is {CLAUDE_CONTEXT_TOKENS} tokens; lower max_model_tokens")
+    return settings
 
 
 def git(repo, *args, binary=False, limit=None):
@@ -134,14 +146,14 @@ def git(repo, *args, binary=False, limit=None):
         result = subprocess.run(command, capture_output=True, check=False)
         raw, code = result.stdout, result.returncode
     else:
-        # The byte bound derives only from config.max_model_tokens minus output reserve.
+        # The byte bound derives only from the depth's max_model_tokens minus output reserve.
         # Avoid materializing a hostile oversized diff/blob merely to reject it.
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
             raw = process.stdout.read(limit + 1)
             if len(raw) > limit:
                 process.kill()
                 process.wait()
-                raise ReviewAbort("Source or diff exceeds config.max_model_tokens; review coverage is incomplete")
+                raise ReviewAbort("Source or diff exceeds the review depth's max_model_tokens; review coverage is incomplete")
             code = process.wait()
     if code:
         raise ReviewAbort("Immutable Git source unavailable; check admitted refs and fetch depth")
@@ -234,7 +246,7 @@ def build_bundle(repo, head, base, settings, exclusions=(), start=None, instruct
             if size() <= available:
                 break
     if size() > available:
-        raise ReviewAbort("Diff and changed regions exceed config.max_model_tokens; review coverage is incomplete")
+        raise ReviewAbort("Diff and changed regions exceed the review depth's max_model_tokens; review coverage is incomplete")
     return bundle
 
 
@@ -375,7 +387,7 @@ def claude_result(events, settings, bundle, strategy, head, *, validate_output=v
                 raise ReviewAbort("Invalid per-request Claude token receipt")
             input_tokens = sum(usage.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
             if input_tokens > settings["max_model_tokens"] - settings["max_output_tokens"]:
-                raise ReviewAbort("Claude request exceeded config.max_model_tokens; review incomplete")
+                raise ReviewAbort("Claude request exceeded the review depth's max_model_tokens; review incomplete")
             if usage.get("output_tokens", 0) > settings["max_output_tokens"]:
                 raise ReviewAbort("Claude request exceeded config.max_output_tokens; review incomplete")
         content = event_message(event).get("content", [])
@@ -474,7 +486,7 @@ def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHE
                validate_output=validate_schema, output_key="findings"):
     text = prompt or claude_prompt(bundle, strategy)
     if token_bound(text + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
-        raise ReviewAbort("Complete prompt exceeds config.max_model_tokens")
+        raise ReviewAbort("Complete prompt exceeds the review depth's max_model_tokens")
     try:
         result = subprocess.run(claude_args(settings, schema), input=text,
                                 cwd=head, env=clean_env(settings), capture_output=True, text=True,
@@ -719,7 +731,7 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None, ign
                 # (protocol.rs TokenUsageInfo.last_token_usage).
                 if (request_limit is not None and type(last.get("input_tokens")) is int
                         and last["input_tokens"] > request_limit):
-                    raise ReviewAbort("Codex request exceeded config.max_model_tokens; review incomplete")
+                    raise ReviewAbort("Codex request exceeded the review depth's max_model_tokens; review incomplete")
                 total = (payload.get("info") or {}).get("total_token_usage", {})
                 tokens = total.get("total_tokens")
                 if request_limit is not None and pending_response:
@@ -809,7 +821,7 @@ def codex_command(settings, head, home, schema, output, action):
         raise ReviewAbort("Codex cost estimator has no sourced price for the configured model; use one of "
                           + ", ".join(sorted(CODEX_PRICES)))
     if settings["max_model_tokens"] > CODEX_SHORT_CONTEXT_TOKENS:
-        raise ReviewAbort("Codex cost estimator covers short-context pricing only; keep config.max_model_tokens <= 272000")
+        raise ReviewAbort("Codex cost estimator covers short-context pricing only; keep this depth's max_model_tokens <= 272000")
     # Execute the pinned action's own privilege-reducing runner after its setup step.
     # No shell interpolation. The action supplies the read-only profile and schema.
     return ["node", str(Path(action).resolve() / "dist/main.js"), "run-codex-exec",
@@ -855,7 +867,7 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace, *, prom
     save(schema_path, schema)
     prompt = codex_prompt(bundle) if prompt is None else prompt
     if token_bound(prompt + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
-        raise ReviewAbort("Codex prompt exceeds config.max_model_tokens")
+        raise ReviewAbort("Codex prompt exceeds the review depth's max_model_tokens")
     output.with_suffix(".prompt").write_text(prompt)
     command = codex_command(settings, head, home, schema_path, output, action)
     earlier = frozenset(Path(home).glob("sessions/**/*.jsonl"))

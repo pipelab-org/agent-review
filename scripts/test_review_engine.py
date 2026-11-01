@@ -80,7 +80,7 @@ class PolicyTests(unittest.TestCase):
     def test_shipped_configuration_sets_approved_limits_and_code_has_no_defaults(self):
         import tomllib
         shipped = tomllib.loads(e.CONFIG.read_text())
-        approved = {"default": (40, 2.0), "deep": (40, 4.0), "codex": (40, 2.0), "codex-deep": (40, 2.0)}
+        approved = {"default": (40, 5.0), "deep": (40, 9.0), "codex": (40, 2.0), "codex-deep": (40, 2.0)}
         for depth in e.DEPTHS:
             table = shipped["review_depth"][depth]
             self.assertEqual(approved[depth], (table["max_turns"], table["max_budget_usd"]))
@@ -96,6 +96,36 @@ class PolicyTests(unittest.TestCase):
         # Every shipped Codex model has a sourced price, so no shipped depth fails closed on cost.
         for depth in ("codex", "codex-deep"):
             self.assertIn(shipped["review_depth"][depth]["model"], e.CODEX_PRICES)
+
+    def test_depth_allowance_overrides_shared_input_allowance(self):
+        # Shipped: Claude depths take the larger allowance, Codex depths keep the shared 272000.
+        shipped = {depth: e.policy(depth)["max_model_tokens"] for depth in e.DEPTHS}
+        self.assertEqual({"default": 516_000, "deep": 516_000, "codex": 272_000, "codex-deep": 272_000}, shipped)
+        data = self.data()
+        data["config"]["max_model_tokens"] = 272_000
+        data["review_depth"]["default"]["max_model_tokens"] = 516_000
+        self.assertEqual(516_000, e.policy("default", data)["max_model_tokens"])
+        self.assertEqual(272_000, e.policy("deep", data)["max_model_tokens"])
+        for bad in (0, -1, True, "516000", 1.5, None):
+            data["review_depth"]["default"]["max_model_tokens"] = bad
+            with self.subTest(value=bad), self.assertRaisesRegex(
+                    e.ReviewAbort, "review_depth.default.max_model_tokens"):
+                e.policy("default", data)
+        data["review_depth"]["default"]["max_model_tokens"] = e.CLAUDE_CONTEXT_TOKENS
+        self.assertEqual(e.CLAUDE_CONTEXT_TOKENS, e.policy("default", data)["max_model_tokens"])
+        data["review_depth"]["default"]["max_model_tokens"] = e.CLAUDE_CONTEXT_TOKENS + 1
+        with self.assertRaisesRegex(e.ReviewAbort, "Claude context window"):
+            e.policy("default", data)
+        data["review_depth"]["default"]["max_model_tokens"] = data["config"]["max_output_tokens"]
+        with self.assertRaisesRegex(e.ReviewAbort, "max_output_tokens below"):
+            e.policy("default", data)
+        # A raised Codex depth still fails before inference instead of billing long-context rates.
+        data = self.data()
+        data["review_depth"]["codex"]["max_model_tokens"] = 516_000
+        data["review_depth"]["codex"]["model"] = "gpt-6.1-terra"
+        settings = e.policy("codex", data)
+        with self.assertRaisesRegex(e.ReviewAbort, "short-context"):
+            e.codex_command(settings, Path("/head"), Path("/home"), Path("/schema"), Path("/out"), Path("/action"))
 
     def test_documented_allowances_match_shipped_policy(self):
         expected = {depth: e.policy(depth)["max_budget_usd"] for depth in e.DEPTHS}
@@ -246,6 +276,21 @@ class BundleTests(unittest.TestCase):
         for path in ("../key", "/etc/passwd", "a/../../b", ".git/config", "a\\b", "-option", "a//b"):
             self.assertFalse(e.safe_path(path), path)
         self.assertTrue(e.safe_path("src/app.py"))
+
+    def test_change_over_the_depth_allowance_is_refused_as_incomplete(self):
+        small = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)  # 24,000 available
+        # A diff larger than the allowance stops at the Git byte bound.
+        (self.root / "app.py").write_text("changed line of source\n" * 2_000)
+        head = self.commit()
+        with self.assertRaisesRegex(e.ReviewAbort, "^Source or diff exceeds the review depth's max_model_tokens"):
+            e.build_bundle(self.root, head, self.base, small)
+        # A diff under the byte bound whose regions plus patch still exceed it is refused too.
+        (self.root / "app.py").write_text("changed line of source\n" * 700)
+        head = self.commit()
+        with self.assertRaisesRegex(e.ReviewAbort, "^Diff and changed regions exceed the review depth's max_model_tokens"):
+            e.build_bundle(self.root, head, self.base, small)
+        # The same change fits the shipped Claude allowance.
+        self.assertEqual(["app.py"], [f["path"] for f in e.build_bundle(self.root, head, self.base, e.policy("default"))["files"]])
 
 
 class ResultTests(unittest.TestCase):
@@ -537,7 +582,7 @@ class CodexTests(unittest.TestCase):
                 "total_token_usage": {"input_tokens": 300_000, "output_tokens": 10, "total_tokens": 300_010},
                 "last_token_usage": {"input_tokens": 300_000, "output_tokens": 10, "total_tokens": 300_010}}}}
             (home / "sessions/rollout.jsonl").write_text(json.dumps(event))
-            with self.assertRaisesRegex(e.ReviewAbort, "exceeded config.max_model_tokens"):
+            with self.assertRaisesRegex(e.ReviewAbort, "exceeded the review depth's max_model_tokens"):
                 e.codex_progress(home, Path("/head"), model="gpt-6.1-terra", request_limit=256_000)
             # At the allowance it is accepted; without a limit (old callers) it is unchanged.
             self.assertEqual(1, e.codex_progress(home, Path("/head"), model="gpt-6.1-terra",
@@ -910,6 +955,47 @@ class CodexTests(unittest.TestCase):
         with self.assertRaisesRegex(e.ReviewAbort, "short-context"):
             e.codex_command(dict(POLICY, model="gpt-6.1-sol", max_model_tokens=272_001), Path("/head"),
                             Path("/home"), Path("/schema"), Path("/out"), Path("/action"))
+
+
+class AllowanceGuardTests(unittest.TestCase):
+    """Each size guard refuses input over the depth's own allowance (here 24,000 after output)."""
+    DEPTH = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
+    LIMIT = 24_000
+
+    def test_claude_request_over_the_depth_allowance_aborts(self):
+        for total, refused in ((self.LIMIT, False), (self.LIMIT + 1, True)):
+            events = transcript()
+            events[0]["message"]["usage"] = {"input_tokens": 10, "cache_read_input_tokens": total - 10,
+                                             "output_tokens": 5}
+            with self.subTest(total=total), tempfile.TemporaryDirectory() as tmp:
+                if refused:
+                    with self.assertRaisesRegex(e.ReviewAbort, "Claude request exceeded the review depth's max_model_tokens"):
+                        e.claude_result(events, self.DEPTH, BUNDLE, "bundle", Path(tmp))
+                else:
+                    e.claude_result(events, self.DEPTH, BUNDLE, "bundle", Path(tmp))
+
+    def test_claude_prompt_over_the_depth_allowance_aborts_before_launch(self):
+        schema = len(json.dumps(e.OUTPUT_SCHEMA))
+        with patch.object(e.subprocess, "run", side_effect=AssertionError("provider launched")):
+            with self.assertRaisesRegex(e.ReviewAbort, "Complete prompt exceeds the review depth's max_model_tokens"):
+                e.run_claude(self.DEPTH, BUNDLE, "bundle", Path("/head"), prompt="x" * (self.LIMIT - schema + 1))
+            with self.assertRaisesRegex(AssertionError, "provider launched"):
+                e.run_claude(self.DEPTH, BUNDLE, "bundle", Path("/head"), prompt="x" * (self.LIMIT - schema))
+
+    def test_codex_prompt_over_the_depth_allowance_aborts_before_launch(self):
+        settings = dict(self.DEPTH, model="gpt-6.1-terra", provider="codex", passes=["callers"])
+        schema = len(json.dumps(e.OUTPUT_SCHEMA))
+        with tempfile.TemporaryDirectory() as tmp:
+            home, workspace = Path(tmp) / "home", Path(tmp) / "work"
+            home.mkdir()
+            workspace.mkdir()
+            with patch.object(e, "configure_codex"),                     patch.object(e, "codex_command", side_effect=AssertionError("provider launched")):
+                with self.assertRaisesRegex(e.ReviewAbort, "Codex prompt exceeds the review depth's max_model_tokens"):
+                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace,
+                                prompt="x" * (self.LIMIT - schema + 1))
+                with self.assertRaisesRegex(AssertionError, "provider launched"):
+                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace,
+                                prompt="x" * (self.LIMIT - schema))
 
 
 class VacuityTests(unittest.TestCase):
