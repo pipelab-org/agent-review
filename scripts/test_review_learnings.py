@@ -947,6 +947,16 @@ class WorkflowTests(unittest.TestCase):
     def workflow(self):
         return yaml.load((ROOT / ".github/workflows/agent-review-reusable.yaml").read_text(), Loader=yaml.BaseLoader)
 
+    def test_every_learnings_fetch_is_time_bounded_and_optional(self):
+        fetches = [(name, step) for name, job in self.workflow()["jobs"].items()
+                   for step in job.get("steps", []) if step.get("id") == "learnings-fetch"]
+        self.assertGreaterEqual(len(fetches), 2)
+        for name, step in fetches:
+            with self.subTest(job=name):
+                # A stalled fetch must end the step, not the job (fail open to no learnings).
+                self.assertEqual("1", str(step.get("timeout-minutes")))
+                self.assertEqual("true", str(step.get("continue-on-error")).lower())
+
     def test_every_learnings_fetch_uses_its_prepare_depth(self):
         jobs = self.workflow()["jobs"]
         fetched = []

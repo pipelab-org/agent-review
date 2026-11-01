@@ -141,6 +141,10 @@ jobs:
     - name: Fetch optional learnings at one immutable revision
       id: learnings-fetch
       continue-on-error: true
+      # Four REST reads; GitHub ends any request after 10 s of processing
+      # (docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api).
+      # One minute bounds slow transfers so optional learnings never cost the job.
+      timeout-minutes: 1
       env:
         LEARNINGS_TOKEN: ${{ steps.learnings-token.outputs.token }}
         LEARNINGS_CREDENTIALS: ${{ steps.learnings-credentials.outputs.available }}
@@ -440,6 +444,10 @@ jobs:
     - name: Fetch optional learnings at one immutable revision
       id: learnings-fetch
       continue-on-error: true
+      # Four REST reads; GitHub ends any request after 10 s of processing
+      # (docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api).
+      # One minute bounds slow transfers so optional learnings never cost the job.
+      timeout-minutes: 1
       env:
         LEARNINGS_TOKEN: ${{ steps.learnings-token.outputs.token }}
         LEARNINGS_CREDENTIALS: ${{ steps.learnings-credentials.outputs.available }}
