@@ -472,6 +472,16 @@ class ClaudeTests(unittest.TestCase):
         for events in ([], None, "text", [1, "x", None], [{"type": "assistant", "error": "made_up"}],
                        [{"type": "result", "terminal_reason": "made_up", "subtype": "made_up"}]):
             self.assertIsNone(e.claude_failure_cause(events), events)
+        # Container-shaped categories classify nothing instead of raising (review round 1).
+        for bad in ([], {}, ["rate_limit"], {"rate_limit": 1}):
+            for events in ([{"type": "assistant", "error": bad}], [{"type": "result", "terminal_reason": bad}],
+                           [{"type": "result", "subtype": bad}]):
+                self.assertIsNone(e.claude_failure_cause(events), events)
+        from types import SimpleNamespace as NS
+        stdout = json.dumps({"type": "assistant", "error": []}) + "\n" + json.dumps({"type": "result", "subtype": {}})
+        with patch.object(e.subprocess, "run", return_value=NS(returncode=1, stdout=stdout, stderr="")):
+            with self.assertRaisesRegex(e.ReviewAbort, "^Claude API/turn/budget/output failure"):
+                e.run_claude(POLICY, BUNDLE, "bundle", Path("/head"))
         self.assertEqual([{"a": 1}], e.lenient_events('{"a": 1}\n{broken\n\n'))
         self.assertEqual([], e.lenient_events(None))
 

@@ -808,10 +808,14 @@ class JobTests(unittest.TestCase):
                 return actual_run(dict(policy, max_model_tokens=policy["max_output_tokens"]), bundle, strategy, head, **kwargs)
             return {"findings": [], "receipt": receipt(strategy)}
         with patch.object(e, "run_claude", side_effect=run), patch.object(e.subprocess, "run") as provider, \
-                patch("sys.stdout", new_callable=io.StringIO) as output:
+                patch("sys.stdout", new_callable=io.StringIO) as output, \
+                patch("sys.stderr", new_callable=io.StringIO) as errors:
             j.infer(self.plan, self.artifact, self.head_dir)
         provider.assert_not_called()
         self.assertEqual(j.FOLLOWUP_NOTE + "\n", output.getvalue())
+        # The fixed engine cause reaches the Actions log; stdout keeps the note alone.
+        self.assertEqual("Thread verification stopped: Complete prompt exceeds the review depth's max_model_tokens\n",
+                         errors.getvalue())
         self.assertIsNone(json.loads(self.artifact.read_text())["verification"])
 
     def test_graphql_prepare_inference_and_publish_failures_leave_review_successful(self):

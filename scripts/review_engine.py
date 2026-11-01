@@ -435,17 +435,21 @@ CLAUDE_SUBTYPE_CAUSES = {
 
 def claude_failure_cause(events):
     """A fixed operator message from the pass's recorded classification, or None; never raises."""
+    def known(value, causes):
+        # Only a string can name a category; any other shape classifies nothing.
+        return value if isinstance(value, str) and value in causes else None
+
     error = terminal = subtype = status = None
     for event in events if isinstance(events, list) else []:
         if not isinstance(event, dict):
             continue
-        if event.get("type") == "assistant" and event.get("error") in CLAUDE_ERROR_CAUSES:
+        if event.get("type") == "assistant" and known(event.get("error"), CLAUDE_ERROR_CAUSES):
             error = event["error"]
         if event.get("type") == "result":
             code = event.get("api_error_status")
             status = code if type(code) is int and 100 <= code <= 599 else None
-            terminal = event.get("terminal_reason") if event.get("terminal_reason") in CLAUDE_TERMINAL_CAUSES else None
-            subtype = event.get("subtype") if event.get("subtype") in CLAUDE_SUBTYPE_CAUSES else None
+            terminal = known(event.get("terminal_reason"), CLAUDE_TERMINAL_CAUSES)
+            subtype = known(event.get("subtype"), CLAUDE_SUBTYPE_CAUSES)
     if error:
         text, label = CLAUDE_ERROR_CAUSES[error], f"error={error}"
     elif terminal:
