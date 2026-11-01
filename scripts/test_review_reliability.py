@@ -154,7 +154,7 @@ class BudgetTests(unittest.TestCase):
         config = reliability.tomllib.loads((ROOT / ".github/pr-agent.toml").read_text())
         workflow = yaml.safe_load((ROOT / ".github/workflows/agent-review-reusable.yaml").read_text())
         wait, timeout, calls = reliability.budget_seconds(), config["config"]["ai_timeout"], \
-            len(review.DEPTHS["default"][1])
+            len(review.DEPTHS["default"][1]) + 1  # review passes plus thread verification
         self.assertEqual(timeout, wait)
         for job in ("review", "reply"):
             # Worst case: every completion call times out and every wait is spent.

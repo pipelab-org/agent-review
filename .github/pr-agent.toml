@@ -29,10 +29,15 @@
 # input at a 90% cache-hit rate is estimated at about $4.41 on Sonnet and $8.80 on Opus at the
 # rates above, so the default pass gets USD 5 and the deep pass USD 9. Estimate, not measured;
 # replace with twice the heaviest measured large-change pass once one is observed.
+# ai_timeout (owner approved 2026-11-01): a /review on a 1,720-line change ran past the
+# previous 300 s on its second pass (job run 41268398363, 2026-11-01). 900 s per pass lets
+# the USD and turn caps bound large reviews. The GitHub wait budget equals one ai_timeout, so
+# the worst case (two passes, verification and a full wait, 3,600 s) fits the 65-minute
+# review and reply job limits with setup and publication.
 [config]
 max_model_tokens = 272000
 max_output_tokens = 16000
-ai_timeout = 300
+ai_timeout = 900
 
 # High effort: at medium, Sonnet answered from the bundle in 2-7 turns and opened 0-2 files;
 # at high it traced producers and consumers (10-37 turns) and recall rose from 2/6 to 5/6 on
