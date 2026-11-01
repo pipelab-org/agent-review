@@ -52,12 +52,20 @@ def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def empty(reason="credentials unavailable", sha="none"):
-    return {"sha": sha, "reason": reason, "entries": []}
+def file_digests(maintainers=None, repository=None):
+    # Content identity covers just the two files this caller fetches. A 404 has
+    # a fixed absent marker; unrelated commits are provenance, not policy changes.
+    return {name: "absent" if body is None else hashlib.sha256(body).hexdigest()
+            for name, body in (("maintainers", maintainers), ("repository", repository))}
+
+
+def empty(reason="credentials unavailable", sha="none", files=None):
+    return {"sha": sha, "reason": reason, "entries": [], "files": files or file_digests()}
 
 
 def identity(data):
-    return {"sha": data["sha"], "digest": hashlib.sha256(canonical(data["entries"]).encode()).hexdigest()}
+    content = {"files": data["files"], "entries": data["entries"]}
+    return {"sha": data["sha"], "digest": hashlib.sha256(canonical(content).encode()).hexdigest()}
 
 
 def valid_identity(value):
@@ -133,16 +141,24 @@ def load(directory, settings):
         state = json.loads(read_bounded(root / "state.json", limit))
         sha = state["sha"]
         today = dt.date.fromisoformat(state["evaluation_date"])
+        files = state["files"]
+        if (not isinstance(files, dict) or set(files) != {"maintainers", "repository"}
+                or any(not isinstance(value, str) or (value != "absent" and not DIGEST.fullmatch(value))
+                       for value in files.values())):
+            raise ValueError
         if sha != "none" and (not isinstance(sha, str) or not SHA.fullmatch(sha)):
             raise ValueError
         if state["reason"] in REASONS:
-            return empty(state["reason"], sha)
+            return empty(state["reason"], sha, files)
         if state["reason"] != "" or sha == "none":
             raise ValueError
         maintainers = read_bounded(root / "maintainers.toml", limit)
         repository = read_bounded(root / "repository.toml", limit - len(maintainers))
+        if files != file_digests(maintainers, repository):
+            raise ValueError
         entries = parse(maintainers.decode("utf-8"), repository.decode("utf-8"), today)
-        return {"sha": sha, "reason": "no applicable entries" if not entries else "", "entries": entries}
+        return {"sha": sha, "reason": "no applicable entries" if not entries else "",
+                "entries": entries, "files": files}
     except OverflowError:
         return empty("input too large", sha)
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
@@ -205,6 +221,7 @@ def fetch(directory, repository, token, credentials, settings, *, opener=None):
     """Credential-bearing process. Fetch just two files at one default-branch commit."""
     root = Path(directory)
     today = dt.datetime.now(dt.timezone.utc).date()
+    files = file_digests()
     state = empty("credentials unavailable" if not credentials else "token unavailable")
     limit = allowance(settings)
     try:
@@ -230,9 +247,11 @@ def fetch(directory, repository, token, credentials, settings, *, opener=None):
                 raise ValueError
             state = empty("", sha)
             maintainers = read("/contents/maintainers.toml?ref=" + sha, raw=True)
+            files = file_digests(maintainers)
             try:
                 content = read("/contents/repos/" + repository + ".toml?ref=" + sha,
                                raw=True, budget=limit - len(maintainers))
+                files = file_digests(maintainers, content)
             except urllib.error.HTTPError as error:
                 if error.code == 404:
                     state = empty("repository file unavailable", sha)
@@ -253,7 +272,7 @@ def fetch(directory, repository, token, credentials, settings, *, opener=None):
         state = empty("fetch failed", state["sha"])
     path = root / "state.json"
     path.write_text(canonical({"sha": state["sha"], "reason": state["reason"],
-                               "evaluation_date": today.isoformat()}), encoding="utf-8")
+                               "evaluation_date": today.isoformat(), "files": files}), encoding="utf-8")
     path.chmod(0o600)
 
 

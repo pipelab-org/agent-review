@@ -39,13 +39,15 @@ review_by = 2099-01-01
 
 
 def data(text=ENTRY, owners=OWNERS, sha=SHA):
-    return {"sha": sha, "reason": "", "entries": l.parse(owners, text, TODAY)}
+    return {"sha": sha, "reason": "", "entries": l.parse(owners, text, TODAY),
+            "files": l.file_digests(owners.encode(), text.encode())}
 
 
 def snapshot(root, text=ENTRY, owners=OWNERS, sha=SHA, reason=""):
     root.mkdir(exist_ok=True)
     (root / "state.json").write_text(json.dumps({"sha": sha, "reason": reason,
-                                                   "evaluation_date": TODAY.isoformat()}))
+                                                   "evaluation_date": TODAY.isoformat(),
+                                                   "files": l.file_digests(owners.encode(), text.encode())}))
     (root / "maintainers.toml").write_text(owners)
     (root / "repository.toml").write_text(text)
     return root
@@ -147,6 +149,20 @@ class SelectionTests(unittest.TestCase):
         (self.root / "state.json").write_text(json.dumps(state))
         self.assertEqual("invalid data", l.load(self.root, self.policy)["reason"])
 
+    def test_snapshot_file_identity_rejects_malformed_or_mismatched_digests(self):
+        for files in (None, {}, {"maintainers": 1, "repository": "absent"},
+                      {"maintainers": "bad", "repository": "absent"},
+                      {"maintainers": "0" * 64, "repository": "0" * 64}):
+            for reason in ("", "repository file unavailable"):
+                if reason and files == {"maintainers": "0" * 64, "repository": "0" * 64}:
+                    continue  # Valid identities on unavailable files have no local bytes to compare.
+                with self.subTest(files=files, reason=reason):
+                    snapshot(self.root, reason=reason)
+                    state = json.loads((self.root / "state.json").read_text())
+                    state["files"] = files
+                    (self.root / "state.json").write_text(json.dumps(state))
+                    self.assertEqual("invalid data", l.load(self.root, self.policy)["reason"])
+
     def test_model_process_environment_has_no_learning_or_github_credentials(self):
         with patch.dict(os.environ, {"LEARNINGS_TOKEN": "fixture", "AGENT_REVIEW_LEARNINGS_APP_KEY": "fixture",
                                      "AGENT_REVIEW_LEARNINGS_APP_ID": "fixture", "GITHUB_TOKEN": "fixture"}):
@@ -174,6 +190,7 @@ class FetchTests(unittest.TestCase):
         self.payload = ENTRY.encode()
         self.error = None
         self.token = "private-fixture-token"
+        self.sha, self.owners = SHA, OWNERS
         def request(req, timeout):
             self.requests.append(req)
             self.paths.append(req.full_url)
@@ -184,9 +201,9 @@ class FetchTests(unittest.TestCase):
                     raise self.error
                 return io.BytesIO(self.payload)
             if "/contents/" in req.full_url:
-                return io.BytesIO(OWNERS.encode())
+                return io.BytesIO(self.owners.encode())
             if "/commits/" in req.full_url:
-                return io.BytesIO(json.dumps({"sha": SHA}).encode())
+                return io.BytesIO(json.dumps({"sha": self.sha}).encode())
             return io.BytesIO(b'{"default_branch":"main"}')
         self.opener = NS(open=request)
 
@@ -232,6 +249,19 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(1, len(loaded["entries"]))
         for name in ("maintainers.toml", "repository.toml", "state.json"):
             self.assertEqual(0o600, (self.root / name).stat().st_mode & 0o777)
+
+    def test_missing_repository_has_fixed_absent_content_identity(self):
+        self.error = urllib.error.HTTPError("private", 404, "private", {}, None)
+        first = self.fetch()
+        self.assertEqual("repository file unavailable", first["reason"])
+        self.assertEqual({"maintainers": hashlib.sha256(OWNERS.encode()).hexdigest(),
+                          "repository": "absent"}, first["files"])
+        self.sha = "b" * 40
+        second = self.fetch()
+        self.assertNotEqual(l.identity(first)["sha"], l.identity(second)["sha"])
+        self.assertEqual(l.identity(first)["digest"], l.identity(second)["digest"])
+        self.owners += "# Changed maintainers file.\n"
+        self.assertNotEqual(l.identity(first)["digest"], l.identity(self.fetch())["digest"])
 
     def test_missing_secrets_and_failed_mint_never_fetch_or_block(self):
         for token, credentials, reason in (("", False, "credentials unavailable"),
@@ -417,7 +447,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("Learnings: 1 loaded from agent-review-learnings@aaaaaaa", summary)
         self.assertNotIn(data()["entries"][0]["text"], summary)
 
-    def test_context_policy_identity_changes_on_revision_and_expiry(self):
+    def test_context_policy_identity_tracks_content_and_expiry_not_unrelated_commits(self):
         fx = self.fx
         policy, depth = j.settings()
         baseline, _ = j.context(policy, depth)
@@ -426,7 +456,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(f.same_policy(baseline, first))
         snapshot(self.directory, sha="b" * 40)
         second, _ = j.context(policy, depth)
-        self.assertFalse(f.same_policy(first, second))
+        self.assertNotEqual(first["learnings"]["sha"], second["learnings"]["sha"])
+        self.assertTrue(f.same_policy(first, second))
         snapshot(self.directory, ENTRY.replace("2099-01-01", "2026-01-02"))
         expired, _ = j.context(policy, depth)
         self.assertFalse(f.same_policy(first, expired))
@@ -452,7 +483,7 @@ class IntegrationTests(unittest.TestCase):
     def test_learnings_change_preserves_verification_ownership(self):
         fx = self.fx
         proof, root = self.published_record(advance=True)
-        snapshot(self.directory, sha="b" * 40)
+        snapshot(self.directory, ENTRY + "# Changed learning content.\n", sha="b" * 40)
         policy, depth = j.settings()
         ctx, _ = j.context(policy, depth)
         self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
@@ -465,7 +496,7 @@ class IntegrationTests(unittest.TestCase):
     def test_learnings_change_preserves_reply_and_resolve_ownership(self):
         fx = self.fx
         proof, root = self.published_record(advance=True)
-        snapshot(self.directory, sha="b" * 40)
+        snapshot(self.directory, ENTRY + "# Changed learning content.\n", sha="b" * 40)
         for command in (False, True):
             with self.subTest(command=command):
                 fx.pr.roots = [root]
@@ -491,15 +522,50 @@ class IntegrationTests(unittest.TestCase):
         proof, _ = self.published_record()
         j.prepare(fx.head_dir, fx.plan)
         self.assertEqual("unchanged", json.loads(fx.plan.read_text())["scope"]["kind"])
-        for change in ("revision", "digest"):
+        for change, expected in (("unrelated", "unchanged"), ("repository", "full"),
+                                 ("maintainers", "full"), ("expiry", "full")):
             with self.subTest(change=change):
-                snapshot(self.directory, sha="b" * 40) if change == "revision" else snapshot(
-                    self.directory, ENTRY.replace("This pattern is fine", "This pattern is documented"))
+                snapshot(self.directory, sha="b" * 40)
+                if change == "repository":
+                    snapshot(self.directory, ENTRY + "# Same entries, new file contents.\n")
+                elif change == "maintainers":
+                    snapshot(self.directory, owners=OWNERS + "# Same approvers, new file contents.\n")
+                elif change == "expiry":
+                    state = json.loads((self.directory / "state.json").read_text())
+                    state["evaluation_date"] = "2100-01-01"
+                    (self.directory / "state.json").write_text(json.dumps(state))
                 policy, depth = j.settings()
                 ctx, _ = j.context(policy, depth)
                 self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
                 j.prepare(fx.head_dir, fx.plan)
-                self.assertEqual("full", json.loads(fx.plan.read_text())["scope"]["kind"])
+                plan = json.loads(fx.plan.read_text())
+                self.assertEqual(expected, plan["scope"]["kind"])
+                self.assertEqual(ctx["learnings"], plan["context"]["learnings"])
+
+    def test_unrelated_commit_reuses_coverage_and_retains_provenance(self):
+        fx = self.fx
+        self.published_record()
+        snapshot(self.directory, sha="b" * 40)
+        j.prepare(fx.head_dir, fx.plan)
+        self.assertEqual("unchanged", json.loads(fx.plan.read_text())["scope"]["kind"])
+        with patch.object(e, "run_claude") as provider:
+            j.infer(fx.plan, fx.artifact, fx.head_dir)
+        provider.assert_not_called()
+        plan = json.loads(fx.plan.read_text())
+        self.assertEqual("b" * 40, plan["context"]["learnings"]["sha"])
+        self.assertIn("@bbbbbbb", l.summary(plan["bundle"]["learnings"]))
+        j.publish_artifact(fx.artifact, fx.head_dir)
+        # An unchanged review posts only a reuse notice. A subsequent content
+        # change runs inference and publishes the new commit as provenance.
+        self.assertTrue(any("already has verified coverage" in c.body for c in fx.pr.comments.values()))
+        snapshot(self.directory, ENTRY + "# Content changed.\n", sha="b" * 40)
+        fx.pr.writes.clear()
+        fx.build()
+        j.publish_artifact(fx.artifact, fx.head_dir)
+        record = json.loads((fx.root / "completion.json").read_text())
+        self.assertEqual("b" * 40, record["context"]["learnings"]["sha"])
+        self.assertIn("Learnings: 1 loaded from agent-review-learnings@bbbbbbb",
+                      fx.pr.comments[record["summary"]].body)
 
     def test_ownership_still_rejects_other_identity_changes_and_malformed_records(self):
         fx = self.fx
@@ -565,6 +631,7 @@ class IntegrationTests(unittest.TestCase):
         with patch.object(j, "reply_learnings", return_value=(meta, "x" * l.allowance(policy))):
             plan = fx.reply_plan(proof, root)
         self.assertEqual("prompt allowance exceeded", plan["learnings"]["reason"])
+        self.assertNotIn(l.PUBLIC_OUTPUT, plan["prompt"])
         snapshot(self.directory)
         changed = copy.deepcopy(plan)
         changed["learnings"] = dict(meta, digest="0" * 64)

@@ -248,10 +248,11 @@ def prepare_reply(repo, pr, ctx, policy, output, head_dir=None):
                  "thread": [{"id": c["id"], "author": c["user"]["login"], "body": c["body"]}
                             for c in sorted(thread, key=lambda c: c["id"])], "question": live.body}))
     meta, text = reply_learnings(ctx, policy, head_dir)
-    if text:
-        prompt = engine.learnings.PUBLIC_OUTPUT + prompt
-    if engine.token_bound(prompt + text + json.dumps(REPLY_SCHEMA)) > engine.learnings.allowance(policy):
+    public_prompt = engine.learnings.PUBLIC_OUTPUT + prompt if text else prompt
+    if engine.token_bound(public_prompt + text + json.dumps(REPLY_SCHEMA)) > engine.learnings.allowance(policy):
         meta = engine.learnings.without_context(meta, "prompt allowance exceeded")
+    else:
+        prompt = public_prompt
     write_learning_identity(ctx)
     engine.save(output, {"learnings": meta, "kind": "reply", "context": ctx, "root": root.id, "trigger": live.id,
                          "root_digest": followups.digest(root.body), "findings": findings,

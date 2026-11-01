@@ -86,8 +86,14 @@ def context(settings, repository, number, head, base, source, profile_sha, profi
 
 
 def same_policy(old, current, *, ownership=False):
-    # Thread provenance survives optional context updates; coverage reuse does not.
-    ignored = {"head", "learnings"} if ownership else {"head"}
+    # Thread ownership ignores optional context. Coverage compares file content
+    # and eligible entries; the learnings commit remains provenance only.
+    ignored = {"head", "learnings"}
+    if (not ownership and ("learnings" in old or "learnings" in current)
+            and (not learnings.valid_identity(old.get("learnings"))
+                 or not learnings.valid_identity(current.get("learnings"))
+                 or old["learnings"]["digest"] != current["learnings"]["digest"])):
+        return False
     return (set(old) == set(current)
             and all(old[key] == current[key] for key in current if key not in ignored))
 

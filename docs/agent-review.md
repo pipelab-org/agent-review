@@ -26,7 +26,7 @@ Missing secrets, mint failures, a missing repository file, fetch failures, malfo
 
 The public summary's Review details says `Learnings: N loaded from agent-review-learnings@<sha7>` or `Learnings: none loaded (<fixed reason>)`. Reasons come from a fixed allowlist; private files and exception text aren't echoed. The local inference plan can contain private context, but the published artifact removes that raw context and retains only the count, fixed reason, revision, digest and exact byte allowance. The publisher uses those bytes to reproduce the same bundle sizing without a private credential or another network lookup. These metadata fields are strictly validated and bound to the job's learning revision.
 
-Review context includes the full learnings commit and a digest of all eligible entries. A new commit or an expiry changes policy identity, so earlier coverage can't silently replace a review under changed background. The inference job passes only that safe identity to publication.
+Review context retains the full learnings commit for provenance and public reporting. Coverage reuse compares a digest of the two fetched files' SHA-256 content digests and eligible entries; a missing file has a fixed `absent` marker. Commits touching other callers' files leave that identity unchanged. Changes to either fetched file or entry expiry invalidate earlier coverage. The inference job passes only that safe identity to publication. Thread ownership continues to ignore learnings fields.
 
 ## Per-depth operator limits
 
