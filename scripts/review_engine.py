@@ -9,8 +9,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import tomllib
 from urllib.parse import unquote
 
@@ -888,6 +890,20 @@ def configure_codex(home, settings):
 
 def run_codex(settings, bundle, strategy, head, action, home, workspace, *, prompt=None,
               schema=OUTPUT_SCHEMA, validate_output=validate_schema, output_key="findings"):
+    # The workflow prepares a trusted home before inference. Copy it into a
+    # disposable pass directory so prompts, sessions, logs and databases cannot
+    # become read-only tool input for a later pass. Retain only the parsed result.
+    Path(workspace).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="codex-pass-", dir=workspace) as directory:
+        home_copy = Path(directory) / "home"
+        shutil.copytree(home, home_copy)
+        return _run_codex(settings, bundle, strategy, head, action, home_copy,
+                          Path(directory) / "output", prompt=prompt, schema=schema,
+                          validate_output=validate_output, output_key=output_key)
+
+
+def _run_codex(settings, bundle, strategy, head, action, home, workspace, *, prompt,
+               schema, validate_output, output_key):
     limit = settings["max_model_tokens"] - settings["max_output_tokens"]
     import selectors
     import time

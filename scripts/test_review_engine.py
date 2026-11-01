@@ -559,8 +559,9 @@ class CodexTests(unittest.TestCase):
             # Like Codex, this process writes its own rollout during the pass, then fails.
             recorded = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "error": {
                 "message": "private", "codex_error_info": {"response_stream_disconnected": {"http_status_code": None}}}}})
-            writes_then_fails = [python, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2]); "
-                                 "sys.exit(1)", str(home / "sessions/rollout.jsonl"), recorded]
+            def writes_then_fails(settings, head, pass_home, schema, output, action):
+                return [python, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2]); "
+                        "sys.exit(1)", str(pass_home / "sessions/rollout.jsonl"), recorded]
             # A rollout left by an earlier pass in the shared home.
             (home / "sessions/earlier.jsonl").write_text(json.dumps({"type": "event_msg", "payload": {
                 "type": "task_complete", "error": {"codex_error_info": "unauthorized"}}}))
@@ -568,11 +569,12 @@ class CodexTests(unittest.TestCase):
                 with patch.object(e, "codex_command", return_value=failing), \
                         self.assertRaisesRegex(e.ReviewAbort, "^Codex action failed; inspect provider account"):
                     e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
-                with patch.object(e, "codex_command", return_value=writes_then_fails), \
+                with patch.object(e, "codex_command", side_effect=writes_then_fails), \
                         self.assertRaisesRegex(e.ReviewAbort,
                                                r"^OpenAI response stream disconnected; request the review again "
                                                r"\(codex_error_info=response_stream_disconnected\); no paid retry$"):
                     e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
+            self.assertEqual([], list(workspace.iterdir()), "failed pass retained runtime files")
 
     def test_single_request_above_the_allowance_aborts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -928,8 +930,9 @@ class CodexTests(unittest.TestCase):
             seen.update(kwargs["env"])
             raise RuntimeError("stop before inference")
         with tempfile.TemporaryDirectory() as tmp,                 patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fixture-not-forwarded"}),                 patch.object(e, "configure_codex"), patch.object(e.subprocess, "Popen", side_effect=capture),                 self.assertRaises(RuntimeError):
+            home = Path(tmp) / "home"; home.mkdir()
             e.run_codex(dict(POLICY, model="gpt-6-luna", provider="codex"), {"files": []}, "callers",
-                        Path(tmp), Path(tmp), Path(tmp), Path(tmp))
+                        Path(tmp), Path(tmp), home, Path(tmp) / "work")
         self.assertIn("CODEX_HOME", seen)
         self.assertNotIn("ANTHROPIC_API_KEY", seen)
 

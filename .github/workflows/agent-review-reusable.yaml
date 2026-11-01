@@ -158,7 +158,7 @@ jobs:
         if gh api --method DELETE /installation/token >/dev/null 2>&1; then
           echo 'Learnings token revoked.'
         else
-          echo '::warning::Learnings token revocation failed; review continues.'
+          echo '::warning::Early learnings-token revoke failed before inference; review continues.'
         fi
     - name: Check out immutable head as read-only data
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -457,7 +457,7 @@ jobs:
         if gh api --method DELETE /installation/token >/dev/null 2>&1; then
           echo 'Learnings token revoked.'
         else
-          echo '::warning::Learnings token revocation failed; review continues.'
+          echo '::warning::Early learnings-token revoke failed before inference; review continues.'
         fi
     - name: Check out immutable head as read-only data
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

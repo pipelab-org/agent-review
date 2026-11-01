@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -453,7 +454,7 @@ class IntegrationTests(unittest.TestCase):
         plan = json.loads(fx.plan.read_text())
         self.assertEqual(identity, plan["context"]["learnings"])
         self.assertEqual(1, plan["bundle"]["learnings"]["count"])
-        self.assertEqual("2026-10-31", plan["learnings_date"])
+        self.assertNotIn("learnings_date", plan)
         self.assert_model_boundary(sentinels)
         self.assertTrue(plan["threads"], "verification must actually run")
         def model(policy, bundle, strategy, head, **kwargs):
@@ -470,12 +471,95 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNotNone(json.loads(fx.artifact.read_text())["verification"])
         self.assert_model_boundary(sentinels)
 
+    def test_selected_text_is_erased_before_verification_and_after_inference(self):
+        fx = self.fx
+        proof, _ = fx.prior_threads()
+        self.enable()
+        sentinel = "PRIVATE_SENTINEL_selected"
+        work = fx.root / "agent-review"
+        fx.plan, fx.artifact = work / "plan.json", work / "findings.json"
+        home = fx.root / "agent-review-codex-home"
+        home.mkdir()
+        config = ('model_provider="codex-action-responses-proxy"\n'
+                  '[model_providers.codex-action-responses-proxy]\n'
+                  'base_url="http://127.0.0.1:12345/v1"\nwire_api="responses"\n')
+        (home / "config.toml").write_text(config)
+        original = j.settings()[0]
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                snapshot(self.directory, ENTRY.replace(data()["entries"][0]["text"], sentinel))
+                policy = dict(original, provider=provider,
+                              model="gpt-6-luna" if provider == "codex" else original["model"],
+                              passes=["callers"] if provider == "codex" else original["passes"])
+                calls = []
+                def clean():
+                    self.assertFalse(self.directory.exists())
+                    files = [p for p in fx.root.rglob("*") if p.is_file()]
+                    self.assertTrue(files)
+                    for path in files:
+                        self.assertNotIn(sentinel.encode(), path.read_bytes(), str(path))
+                def check_prompt(prompt, verification):
+                    self.assertNotIn("learnings_text", json.loads(fx.plan.read_text())["bundle"])
+                    if verification:
+                        clean()
+                        self.assertNotIn(sentinel, prompt)
+                        assert_public_learning_prompt(self, prompt)
+                    else:
+                        self.assertIn(sentinel, prompt)
+                    calls.append("verification" if verification else "review")
+                def claude(policy, bundle, strategy, head, **kwargs):
+                    verification = strategy == "verify-threads"
+                    check_prompt(kwargs["prompt"] if verification else e.claude_prompt(bundle, strategy), verification)
+                    return fx.verified(plan, status="present") if verification else {
+                        "findings": [], "receipt": engine_tests.receipt(strategy)}
+                def command(policy, head, pass_home, schema, output, action):
+                    verification = json.loads(schema.read_text()) == j.VERIFICATION_SCHEMA
+                    prompt = output.with_suffix(".prompt").read_text()
+                    if verification:
+                        # The current pass has no selected text, and every file
+                        # from the review pass must already have been removed.
+                        check_prompt(prompt, True)
+                    else:
+                        check_prompt(prompt, False)
+                    value = fx.verified(plan, status="present")["output"] if verification else {"findings": []}
+                    events = [
+                        {"type": "turn_context", "payload": {"model": policy["model"]}},
+                        {"type": "response_item", "payload": {"type": "message", "text": prompt}},
+                        {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                            "last_token_usage": {"input_tokens": 100, "output_tokens": 20},
+                            "total_token_usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}}}]
+                    # Also persist a non-session runtime file: cleanup must not
+                    # depend on a list of known transcript filename extensions.
+                    return [sys.executable, "-c", "import pathlib,sys; "
+                            "pathlib.Path(sys.argv[1]).write_text(sys.argv[2]); "
+                            "p=pathlib.Path(sys.argv[3]); p.parent.mkdir(parents=True); p.write_text(sys.argv[4]); "
+                            "pathlib.Path(sys.argv[5]).write_text(sys.argv[6]); print('done')",
+                            str(output), json.dumps(value), str(pass_home / "sessions/pass.jsonl"),
+                            "\n".join(map(json.dumps, events)), str(pass_home / "state.db"), prompt]
+                with patch.dict(os.environ, {"RUNNER_TEMP": str(fx.root)}), \
+                        patch.object(j, "settings", return_value=(policy, "default")), \
+                        patch.object(j, "records", return_value={123: proof}):
+                    j.prepare(fx.head_dir, fx.plan)
+                    plan = json.loads(fx.plan.read_text())
+                    self.assertEqual(1, plan["bundle"]["learnings"]["count"])
+                    self.assertTrue(plan["threads"])
+                    with patch.object(e, "run_claude", side_effect=claude), \
+                            patch.object(e, "codex_command", side_effect=command):
+                        j.infer(fx.plan, fx.artifact, fx.head_dir, "/fixture-action", home)
+                artifact = json.loads(fx.artifact.read_text())
+                self.assertIsNotNone(artifact["verification"])
+                self.assertEqual("verification", calls[-1])
+                self.assertNotIn("learnings_text", artifact["plan"]["bundle"])
+                self.assertNotIn("learnings_date", artifact["plan"])
+                self.assertEqual(config, (home / "config.toml").read_text())
+                clean()
+
     def test_reply_inference_uses_only_selected_prepared_text(self):
         fx = self.fx
         proof, root = fx.prior_threads()
         self.enable()
         sentinels = self.private_snapshot()
-        fx.reply_plan(proof, root)
+        plan = fx.reply_plan(proof, root)
         self.assert_model_boundary(sentinels)
         def model(*args, **kwargs):
             self.assert_model_boundary(sentinels)
@@ -486,15 +570,17 @@ class IntegrationTests(unittest.TestCase):
                 patch.object(e, "run_claude", side_effect=model) as provider:
             j.infer(fx.plan, fx.artifact, fx.head_dir)
         provider.assert_called_once()
-        self.assertNotIn(l.FRAMING, fx.artifact.read_text())
+        self.assertNotIn("learnings_text", json.loads(fx.artifact.read_text())["plan"])
+        self.assertNotIn(data()["entries"][0]["text"], fx.artifact.read_text())
         self.assert_model_boundary(sentinels)
-        plan = json.loads(fx.plan.read_text())
-        for change in ("bytes", "revision"):
+        for change in ("bytes", "revision", "same_length"):
             changed = copy.deepcopy(plan)
             if change == "bytes":
                 changed["learnings_text"] += "x"
-            else:
+            elif change == "revision":
                 changed["learnings"]["sha"] = "b" * 40
+            else:
+                changed["learnings_text"] = changed["learnings_text"].replace("This", "That")
             with self.subTest(change=change), patch.object(e, "run_claude", return_value=fx.answer("none")) as provider:
                 with self.assertRaisesRegex(e.ReviewAbort, "prepared context"):
                     j.infer_reply(j.settings()[0], changed, fx.head_dir)
@@ -503,9 +589,14 @@ class IntegrationTests(unittest.TestCase):
     def test_prepare_cleanup_failure_stops_inference_and_failed_admission_still_cleans(self):
         fx = self.fx
         self.enable()
-        with patch.object(l.shutil, "rmtree", side_effect=OSError("fixture deletion failure")):
-            with self.assertRaisesRegex(OSError, "deletion failure"):
+        # A real unlink failure must propagate even if rmtree is changed to
+        # ignore_errors=True. Mocking rmtree itself cannot prove that contract.
+        self.directory.chmod(0o500)
+        try:
+            with self.assertRaises(PermissionError):
                 j.prepare(fx.head_dir, fx.plan)
+        finally:
+            self.directory.chmod(0o700)
         self.assertFalse(fx.plan.exists())
         self.assertTrue(self.directory.exists())
         with patch.object(j, "check_pr", side_effect=e.ReviewAbort("fixture admission failure")):
@@ -567,7 +658,7 @@ class IntegrationTests(unittest.TestCase):
                         self.assertEqual(1, len(artifact["result"]["findings"]))
                     clock.now.assert_called_once_with(dt.timezone.utc)
                     self.assertFalse(self.directory.exists())
-                    self.assertEqual("2026-10-31", json.loads(fx.plan.read_text())["learnings_date"])
+                    self.assertNotIn("learnings_date", json.loads(fx.plan.read_text()))
 
     def test_never_filter_findings_and_no_private_text_in_public_artifact_or_summary(self):
         fx = self.fx
@@ -578,6 +669,7 @@ class IntegrationTests(unittest.TestCase):
         fx.build(findings)
         artifact = json.loads(fx.artifact.read_text())
         self.assertEqual(original, artifact["result"]["findings"])
+        self.assertNotIn("learnings_text", artifact["plan"]["bundle"])
         self.assertNotIn(data()["entries"][0]["text"], fx.artifact.read_text())
         # Publication rebuilds at the exact reserved size with no private checkout,
         # no installation token and no model credential.
@@ -614,6 +706,10 @@ class IntegrationTests(unittest.TestCase):
             j.publish_artifact(fx.artifact, fx.head_dir)
             proof = json.loads((fx.root / "completion.json").read_text())
             root = fx.pr.roots[0]
+        # prior_threads/build consumes the snapshot. Subsequent preparations
+        # must exercise actual learnings, not an absent snapshot.
+        self.assertEqual(SHA, proof["context"]["learnings"]["sha"])
+        snapshot(self.directory)
         artifact = NS(name="agent-review-completion", expired=False)
         run = NS(raw_data=run_data(proof), get_artifacts=lambda: [artifact])
         patch.object(fx.repo, "get_workflow_run", return_value=run).start()
@@ -651,8 +747,9 @@ class IntegrationTests(unittest.TestCase):
                 # publication below use the real ownership/artifact path.
                 j.prepare(fx.head_dir, fx.plan, reply=True)
                 plan = json.loads(fx.plan.read_text())
+                self.assertEqual(1, plan["learnings"]["count"])
                 policy, depth = j.settings()
-                ctx, _ = j.context(policy, depth, learning_data=l.from_env(policy))
+                ctx, _ = j.context(policy, depth)
                 j.publish_reply(fx.repo, fx.pr, ctx, policy, plan,
                                 None if command else fx.answer(), fx.head_dir)
                 self.assertTrue(any(c.raw_data.get("in_reply_to_id") == root.id
@@ -759,7 +856,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(self.directory.exists())
         with patch.object(e, "run_claude", return_value=fx.answer("none")):
             j.infer(fx.plan, fx.artifact, fx.head_dir)
-        self.assertNotIn(l.FRAMING, fx.artifact.read_text())
+        self.assertNotIn("learnings_text", json.loads(fx.artifact.read_text())["plan"])
+        self.assertNotIn(data()["entries"][0]["text"], fx.artifact.read_text())
 
     def test_reply_omits_context_when_optional_path_discovery_cannot_fit(self):
         self.enable()
@@ -772,14 +870,25 @@ class IntegrationTests(unittest.TestCase):
 
     def test_reply_omits_oversized_context_and_detects_changed_prepared_context(self):
         fx = self.fx
-        self.enable()
         proof, root = fx.prior_threads()
+        self.enable()
         policy, _ = j.settings()
-        meta, _ = l.select(data(), ["app.py"])
-        with patch.object(j, "reply_learnings", return_value=(meta, "x" * l.allowance(policy))):
-            plan = fx.reply_plan(proof, root)
+        # Fit the raw snapshot but exceed the complete reply prompt allowance.
+        text = "x" * (l.allowance(policy) - len(ENTRY.encode()) - len(OWNERS.encode()) - 1)
+        snapshot(self.directory, ENTRY.replace(data()["entries"][0]["text"], text))
+        loaded = l.load(self.directory, policy)
+        self.assertEqual(1, len(loaded["entries"]))
+        self.assertEqual(SHA, loaded["sha"])
+        plan = fx.reply_plan(proof, root)
+        self.assertEqual(SHA, plan["context"]["learnings"]["sha"])
         self.assertEqual("prompt allowance exceeded", plan["learnings"]["reason"])
+        self.assertEqual("", plan["learnings_text"])
         self.assertNotIn(l.PUBLIC_OUTPUT, plan["prompt"])
+        with patch.object(e, "run_claude", return_value=fx.answer("none")) as provider:
+            j.infer(fx.plan, fx.artifact, fx.head_dir)
+        provider.assert_called_once()
+        self.assertNotIn(text, provider.call_args.kwargs["prompt"])
+        self.assertEqual(0, json.loads(fx.artifact.read_text())["plan"]["learnings"]["count"])
         changed = copy.deepcopy(plan)
         changed["context"]["learnings"]["digest"] = "0" * 64
         fx.plan.write_text(json.dumps(changed))
@@ -914,7 +1023,9 @@ class WorkflowTests(unittest.TestCase):
                         self.assertEqual(0, result.returncode, result.stderr)
                         self.assertTrue(call.is_file(), "revocation never called gh")
                         self.assertEqual("api --method DELETE /installation/token", call.read_text())
-                        self.assertIn("::warning::" if code else "Learnings token revoked.", result.stdout)
+                        self.assertIn("::warning::Early learnings-token revoke failed before inference; review continues."
+                                      if code else "Learnings token revoked.", result.stdout)
+                        self.assertNotIn("Token revocation failed", result.stdout)
                         self.assertNotIn("SENTINEL_revoke_token", result.stdout + result.stderr)
 
     def test_token_is_scoped_optional_and_not_in_any_inference_step_environment(self):
