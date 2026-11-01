@@ -130,6 +130,9 @@ def scenario(cli, mode):
                     assert final["subtype"] == ("error_max_turns" if mode == "turn" else "error_max_budget_usd"), final["subtype"]
                 elif mode in ("api", "schema"):
                     assert len(requests) == 1, "failed request or invalid schema was retried"
+                if mode == "api":
+                    cause = e.claude_failure_cause(e.lenient_events(proc.stdout))
+                    assert cause and "HTTP 503" in cause and "fixture error" not in cause, cause
             print(f"PASS native Claude {mode}: restricted tools, schema, scoped reads and receipt controls")
         finally:
             api.shutdown(); api.server_close(); thread.join()
