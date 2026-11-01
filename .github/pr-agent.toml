@@ -32,8 +32,8 @@
 # ai_timeout (owner approved 2026-11-01): a /review on a 1,720-line change ran past the
 # previous 300 s on its second pass (job run 41268398363, 2026-11-01). 900 s per pass lets
 # the USD and turn caps bound large reviews. The GitHub wait budget equals one ai_timeout, so
-# the worst case (two passes, verification and a full wait, 3,600 s) fits the 65-minute
-# review and reply job limits with setup and publication.
+# the review job (two passes, verification and a full wait, 3,600 s) gets 65 minutes and the
+# reply job (one call and a wait, 1,800 s) 35 minutes; publish jobs make no provider calls.
 [config]
 max_model_tokens = 272000
 max_output_tokens = 16000

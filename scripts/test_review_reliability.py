@@ -153,12 +153,13 @@ class BudgetTests(unittest.TestCase):
     def test_budget_is_one_provider_timeout_and_fits_the_review_job_limit(self):
         config = reliability.tomllib.loads((ROOT / ".github/pr-agent.toml").read_text())
         workflow = yaml.safe_load((ROOT / ".github/workflows/agent-review-reusable.yaml").read_text())
-        wait, timeout, calls = reliability.budget_seconds(), config["config"]["ai_timeout"], \
-            len(review.DEPTHS["default"][1]) + 1  # review passes plus thread verification
+        wait, timeout = reliability.budget_seconds(), config["config"]["ai_timeout"]
         self.assertEqual(timeout, wait)
-        for job in ("review", "reply"):
+        # Provider calls per job: review runs its passes plus thread verification; reply runs one.
+        calls = {"review": len(review.DEPTHS["default"][1]) + 1, "reply": 1}
+        for job, count in calls.items():
             # Worst case: every completion call times out and every wait is spent.
-            self.assertLess(wait + calls * timeout, workflow["jobs"][job]["timeout-minutes"] * 60, job)
+            self.assertLess(wait + count * timeout, workflow["jobs"][job]["timeout-minutes"] * 60, job)
 
 
 
