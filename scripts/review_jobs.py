@@ -60,7 +60,15 @@ def context(policy, depth):
             or not re.fullmatch(r"[1-9][0-9]*", number)
             or any(not followups.full_sha(value) for value in fields.values())):
         raise ReviewAbort("Invalid admitted repository or immutable source identity")
-    return {**fields, "repository": repo, "number": int(number), "profile_hash": fingerprint,
+    identity = engine.learnings.identity(engine.learnings.from_env(policy))
+    if os.environ.get("REVIEW_LEARNINGS_IDENTITY"):
+        try:
+            identity = json.loads(os.environ["REVIEW_LEARNINGS_IDENTITY"])
+            if not engine.learnings.valid_identity(identity):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ReviewAbort("Invalid learnings identity") from None
+    return {**fields, "learnings": identity, "repository": repo, "number": int(number), "profile_hash": fingerprint,
             "common_config": hashlib.sha256(engine.CONFIG.read_bytes()).hexdigest(),
             "depth": depth, "models": [policy["model"]]}, profile
 
@@ -129,7 +137,7 @@ def prepare(head_dir, output, reply=False):
     repo = github().get_repo(ctx["repository"])
     pr = check_pr(repo, ctx)
     if reply:
-        prepare_reply(repo, pr, ctx, policy, output)
+        prepare_reply(repo, pr, ctx, policy, output, head_dir)
         return
     check_command(repo, pr, depth)
     proof = records(repo, pr, ctx, policy)
@@ -137,7 +145,8 @@ def prepare(head_dir, output, reply=False):
     bundle = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy,
                                  profile["ignore"]["glob"],
                                  start=scope["from"] if scope["kind"] == "incremental" else None,
-                                 instructions=profile["review"]["instructions"])
+                                 instructions=profile["review"]["instructions"],
+                                 learning_data=engine.learnings.from_env(policy))
     threads = []
     if scope["kind"] != "unchanged":
         try:
@@ -146,6 +155,7 @@ def prepare(head_dir, output, reply=False):
             print(FOLLOWUP_NOTE)
     plan = {"context": ctx, "scope": scope, "bundle": bundle, "kind": "review", "threads": threads}
     engine.save(output, plan)
+    write_learning_identity(ctx)
     # Fixed output values only, never model/PR text in Actions commands.
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
@@ -193,7 +203,28 @@ def reply_check(repo, pr, ctx, policy, proof=None):
     return live, root, reconstruct_root(root, followups.verify_root(pr, root, proof)[0])
 
 
-def prepare_reply(repo, pr, ctx, policy, output):
+def write_learning_identity(ctx):
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+            stream.write("learnings_identity=" + followups.canonical(ctx["learnings"]) + "\n")
+
+
+def reply_learnings(ctx, policy, head_dir):
+    data = engine.learnings.from_env(policy)
+    if not data["entries"]:
+        return engine.learnings.select(data, [])
+    available = engine.learnings.allowance(policy)
+    try:
+        start = engine.git(head_dir, "merge-base", ctx["base"], ctx["head"]).strip()
+        paths = engine.git(head_dir, "diff", "--no-renames", "--name-only", "-z", start,
+                           ctx["head"], limit=available).split("\x00")[:-1]
+    except engine.ReviewAbort:
+        # The reply's ordinary code-evidence path doesn't need a whole-diff path list.
+        return engine.learnings.select(engine.learnings.empty("input too large", data["sha"]), [])
+    return engine.learnings.select(data, paths)
+
+
+def prepare_reply(repo, pr, ctx, policy, output, head_dir=None):
     live, root, findings = reply_check(repo, pr, ctx, policy)
     marker = followups.reply_marker(live.id, root.id)
     thread = [c for c in followups.listed_comments(pr)
@@ -215,7 +246,11 @@ def prepare_reply(repo, pr, ctx, policy, output):
                  "root": {"body": root.body, "path": root.path, "diff_hunk": root.raw_data.get("diff_hunk", "")},
                  "thread": [{"id": c["id"], "author": c["user"]["login"], "body": c["body"]}
                             for c in sorted(thread, key=lambda c: c["id"])], "question": live.body}))
-    engine.save(output, {"kind": "reply", "context": ctx, "root": root.id, "trigger": live.id,
+    meta, text = reply_learnings(ctx, policy, head_dir)
+    if engine.token_bound(prompt + text + json.dumps(REPLY_SCHEMA)) > engine.learnings.allowance(policy):
+        meta = engine.learnings.without_context(meta, "prompt allowance exceeded")
+    write_learning_identity(ctx)
+    engine.save(output, {"learnings": meta, "kind": "reply", "context": ctx, "root": root.id, "trigger": live.id,
                          "root_digest": followups.digest(root.body), "findings": findings,
                          "prompt": prompt, "reused": reused, "resolve_command": command})
 
@@ -259,12 +294,21 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
         except Exception:
             verification = None
             print(FOLLOWUP_NOTE)
+    # The public artifact must not contain private learning text. Exact byte
+    # metadata lets publication reproduce bundle sizing without fetching it again.
+    if plan["kind"] == "review":
+        plan["bundle"].pop("learnings_text", None)
     engine.save(output, {"plan": plan, "result": result, "verification": verification})
 
 
 def infer_reply(policy, plan, head_dir):
+    meta, text = reply_learnings(plan["context"], policy, head_dir)
+    if plan.get("learnings", {}).get("reason") == "prompt allowance exceeded":
+        meta, text = engine.learnings.without_context(meta, "prompt allowance exceeded"), ""
+    if meta != plan["learnings"]:
+        raise ReviewAbort("Reply learnings changed since preparation")
     result = engine.run_claude(policy, {"files": []}, "reply", head_dir,
-        prompt=plan["prompt"], schema=REPLY_SCHEMA, validate_output=validate_reply, output_key="output")
+        prompt=plan["prompt"] + text, schema=REPLY_SCHEMA, validate_output=validate_reply, output_key="output")
     result["output"] = validate_reply_result(result, plan, policy, head_dir)
     return result
 
@@ -837,7 +881,8 @@ def summary_text(ctx, scope, bundle, result, findings, placement):
     details = (f"Reviewed base `{ctx['base']}` and head `{ctx['head']}`."
                f"\n\nReviewer source `{ctx['reviewer']}`; policy `{ctx['profile_sha']}`."
                f"\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
-               "\n\nEarlier findings and threads remain for the maintainer's sweep."
+               + "\n\n" + engine.learnings.summary(bundle["learnings"]) + "."
+               + "\n\nEarlier findings and threads remain for the maintainer's sweep."
                f"\n\nDeclared exclusions: `{json.dumps(bundle['exclusions']).replace(chr(96), chr(92)+'u0060')}`.")
     unopened = engine.unopened_regions(bundle, result["receipt"]["passes"])
     if unopened:
@@ -918,6 +963,10 @@ def publish_artifact(path, head_dir):
     plan, result = artifact["plan"], artifact["result"]
     if plan["context"] != ctx:
         raise ReviewAbort("Artifact differs from trusted source/profile/snapshot policy")
+    meta = plan["learnings"] if plan["kind"] == "reply" else plan["bundle"]["learnings"]
+    engine.learnings.validate_metadata(meta, policy)
+    if meta["sha"] != ctx["learnings"]["sha"]:
+        raise ReviewAbort("Artifact learnings differ from trusted context")
     repo = github().get_repo(ctx["repository"])
     pr = check_pr(repo, ctx)
     if plan["kind"] == "reply":
@@ -925,7 +974,8 @@ def publish_artifact(path, head_dir):
     elif plan["kind"] == "review":
         expected = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy, profile["ignore"]["glob"],
                                       start=plan["scope"]["from"] if plan["scope"]["kind"] == "incremental" else None,
-                                      instructions=profile["review"]["instructions"])
+                                      instructions=profile["review"]["instructions"],
+                                      learning_metadata=plan["bundle"]["learnings"])
         if expected != plan["bundle"]:
             raise ReviewAbort("Artifact bundle differs from immutable source")
         if result is not None:

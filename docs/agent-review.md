@@ -10,6 +10,24 @@ The exact caller template, named secret mappings, permission ceiling, and immuta
 
 Caller profiles permit only `[review] instructions` and `[ignore] glob`. The existing 65,536-byte bounded reader rejects symlinks in every path component, non-regular files, malformed TOML, and unsupported fields. Profiles cannot supply Python, tools, callbacks, model policy, spending limits, credentials, or a publication destination.
 
+## Repository learnings
+
+The optional `AGENT_REVIEW_LEARNINGS_APP_ID` and `AGENT_REVIEW_LEARNINGS_APP_KEY` workflow-call secrets identify the existing GitHub App installed on `pipelab-org/agent-review-learnings`. `GITHUB_TOKEN` can't read that private repository. The pinned official [create-github-app-token v3.3.0 action](https://github.com/actions/create-github-app-token/releases/tag/v3.3.0), commit `64ab729a6294000f5aa4a4bc0b73d1f32bc45510`, mints an installation token for that owner and that repository only, with Contents:read and Metadata:read. The action revokes the short-lived token at job completion.
+
+Each inference job mints and fetches before preparing its prompt. Only the fetch step receives the installation token; neither the model step nor any PR-code environment receives it or the App key. Python 3.12 and the hash-pinned engine dependencies remain installed before steps that import third-party modules. The stdlib fetcher resolves the learnings default branch once, then fetches exactly `maintainers.toml` and `repos/<github.repository>.toml` at that full commit. It writes private files under `RUNNER_TEMP` with owner-only permissions, follows no repository rename aliases and refuses redirects.
+
+The schema follows the learnings repository's README and validator: each entry has a unique ID, a supported status and kind, nonempty text, an HTTPS source, a valid teacher login, and TOML `added` and `review_by` dates in order. Only `active` entries approved by an account in the same snapshot's `maintainers.toml` load. Approval logins compare without case. A `review_by` equal to today's UTC date is still valid; an earlier date expires the entry. Proposed and retired entries never load. A malformed file or any validation failure loads no entries from that file.
+
+An entry without `paths` applies repository-wide. Otherwise at least one glob must match a changed Git path. Matching uses Python's case-sensitive `fnmatchcase`, the repository's existing exclusion-glob convention: `*` and `**` span directories. Review bundles use the files in their admitted diff; inline answers use the merge-base diff at the captured head.
+
+Both Claude and Codex receive each selected ID, kind, text and source inside a labeled untrusted-data section. Learnings never filter, match against, hide, drop or downgrade findings. They can't authorize thread resolution. A model that disagrees with a learning saying a pattern is fine must explain why the evidence still supports its finding. Follow-up thread verification retains its existing code-evidence prompt.
+
+Missing secrets, mint failures, a missing repository file, fetch failures, malformed TOML and validation failures all proceed with no learnings. The combined raw TOML byte bound derives from the depth's existing `max_model_tokens - max_output_tokens` input allowance. The same bound applies to network reads, and exact rendered learning bytes count in `build_bundle`'s existing full-prompt measurement, including the schema. If the context still doesn't fit after the normal full-file-to-region fallback, the engine removes the optional context and sizes the ordinary review again. Inline answers omit learning context if it exceeds their existing prompt allowance.
+
+The public summary's Review details says `Learnings: N loaded from agent-review-learnings@<sha7>` or `Learnings: none loaded (<fixed reason>)`. Reasons come from a fixed allowlist; private files and exception text aren't echoed. The local inference plan can contain private context, but the published artifact removes that raw context and retains only the count, fixed reason, revision, digest and exact byte allowance. The publisher uses those bytes to reproduce the same bundle sizing without a private credential or another network lookup. These metadata fields are strictly validated and bound to the job's learning revision.
+
+Review context includes the full learnings commit and a digest of all eligible entries. A new commit or an expiry changes policy identity, so earlier coverage can't silently replace a review under changed background. The inference job passes only that safe identity to publication.
+
 ## Per-depth operator limits
 
 The trusted central `.github/pr-agent.toml` contains `review_depth.default`, `review_depth.deep`, `review_depth.codex`, and `review_depth.codex-deep`. Each table must contain these settings:
