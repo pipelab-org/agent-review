@@ -155,8 +155,8 @@ class BudgetTests(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / ".github/workflows/agent-review-reusable.yaml").read_text())
         wait, timeout = reliability.budget_seconds(), config["config"]["ai_timeout"]
         self.assertEqual(timeout, wait)
-        # Provider calls per job: review runs its passes plus thread verification; reply runs one.
-        calls = {"review": len(review.DEPTHS["default"][1]) + 1, "reply": 1}
+        # Provider calls per job: review runs its passes plus verification, reply one, publishers none.
+        calls = {"review": len(review.DEPTHS["default"][1]) + 1, "reply": 1, "publish": 0, "publish-reply": 0}
         for job, count in calls.items():
             # Worst case: every completion call times out and every wait is spent.
             self.assertLess(wait + count * timeout, workflow["jobs"][job]["timeout-minutes"] * 60, job)
@@ -172,6 +172,29 @@ class ArtifactTimeoutTests(unittest.TestCase):
         self.assertNotIn('download_record(a, os.environ["GITHUB_TOKEN"], policy["ai_timeout"])', source)
         config = reliability.tomllib.loads((ROOT / ".github/pr-agent.toml").read_text())
         self.assertLess(followups.ARTIFACT_TIMEOUT, config["config"]["ai_timeout"])
+
+
+class ArtifactRetryTests(unittest.TestCase):
+    def test_a_single_stalled_artifact_request_is_retried_once(self):
+        calls = []
+
+        def stalls_once(*args, **kwargs):
+            calls.append(kwargs.get("timeout"))
+            if len(calls) == 1:
+                raise TimeoutError("stalled")
+            return "ok"
+
+        self.assertEqual("ok", followups._get_once_more(stalls_once, "url", timeout=followups.ARTIFACT_TIMEOUT))
+        self.assertEqual([followups.ARTIFACT_TIMEOUT] * 2, calls)
+
+        def always_stalls(*args, **kwargs):
+            calls.append(1)
+            raise TimeoutError("stalled")
+
+        calls.clear()
+        with self.assertRaises(TimeoutError):
+            followups._get_once_more(always_stalls, "url")
+        self.assertEqual(2, len(calls))
 
 
 class EndpointKindTests(unittest.TestCase):
