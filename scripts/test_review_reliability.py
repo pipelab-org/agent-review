@@ -163,6 +163,17 @@ class BudgetTests(unittest.TestCase):
 
 
 
+class ArtifactTimeoutTests(unittest.TestCase):
+    def test_artifact_downloads_use_their_own_bounded_timeout(self):
+        # Two sequential requests per record must stay small next to the review job limit,
+        # and never inherit the much larger provider timeout.
+        source = (ROOT / "scripts/review_jobs.py").read_text()
+        self.assertIn("followups.ARTIFACT_TIMEOUT", source)
+        self.assertNotIn('download_record(a, os.environ["GITHUB_TOKEN"], policy["ai_timeout"])', source)
+        config = reliability.tomllib.loads((ROOT / ".github/pr-agent.toml").read_text())
+        self.assertLess(followups.ARTIFACT_TIMEOUT, config["config"]["ai_timeout"])
+
+
 class EndpointKindTests(unittest.TestCase):
     def test_labels_come_from_structure_never_from_names_or_paths(self):
         for url, kind in (("/repos/o/r/pulls/1/files?per_page=30&page=2", "repos/pulls/files"),

@@ -194,6 +194,13 @@ def trusted_run(run, record):
                 and ref.get("sha") == ctx["reviewer"] for ref in refs))
 
 
+# Seconds of socket inactivity allowed per artifact request. GitHub ends any REST
+# request after 10 seconds of processing (docs.github.com/en/rest/using-the-rest-api/
+# troubleshooting-the-rest-api); twice that leaves transfer headroom for the bounded
+# completion archive and keeps a stalled download from consuming the inference budget.
+ARTIFACT_TIMEOUT = 20
+
+
 def download_record(artifact, token, timeout):
     """Follow GitHub's signed archive redirect without forwarding the token.
 
