@@ -138,7 +138,6 @@ jobs:
         repositories: agent-review-learnings
         permission-contents: read
         permission-metadata: read
-        skip-token-revoke: true
     - name: Fetch optional learnings at one immutable revision
       id: learnings-fetch
       continue-on-error: true
@@ -261,7 +260,7 @@ jobs:
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Review the admitted diff
       env:
-        REVIEW_LEARNINGS_DIR: ${{ steps.learnings-fetch.outputs.directory }}
+        REVIEW_LEARNINGS_IDENTITY: ${{ steps.plan.outputs.learnings_identity }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.issue.number }}
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
@@ -438,7 +437,6 @@ jobs:
         repositories: agent-review-learnings
         permission-contents: read
         permission-metadata: read
-        skip-token-revoke: true
     - name: Fetch optional learnings at one immutable revision
       id: learnings-fetch
       continue-on-error: true
@@ -561,7 +559,7 @@ jobs:
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Review the admitted diff
       env:
-        REVIEW_LEARNINGS_DIR: ${{ steps.learnings-fetch.outputs.directory }}
+        REVIEW_LEARNINGS_IDENTITY: ${{ steps.plan.outputs.learnings_identity }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REVIEW_SOURCE_SHA: ${{ steps.reply-source.outputs.reviewer_sha }}

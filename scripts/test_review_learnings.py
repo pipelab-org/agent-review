@@ -239,6 +239,27 @@ class FetchTests(unittest.TestCase):
                 for path in paths:
                     self.assertNotIn(self.token.encode(), path.read_bytes(), str(path))
 
+    def test_failed_partial_fetch_retains_directory_for_prepare_cleanup(self):
+        output = self.root / "output"
+        env = {"RUNNER_TEMP": str(self.root), "GITHUB_OUTPUT": str(output),
+               "GITHUB_REPOSITORY": "example/project"}
+        def partial(directory, *args):
+            (Path(directory) / "repository.toml").write_text("PRIVATE_SENTINEL_partial")
+            raise OSError("fixture fetch failure")
+        with patch.dict(os.environ, env), patch.object(l, "fetch", side_effect=partial), \
+                patch.object(e, "policy", return_value=engine_tests.POLICY), \
+                patch("sys.argv", ["review_learnings.py", "--fetch"]), \
+                patch("sys.stdout", new_callable=io.StringIO) as log:
+            self.assertEqual(0, l.main())
+        self.assertTrue(output.is_file(), "raw directory was not recorded before fetch")
+        directory = Path(output.read_text().removeprefix("directory=").strip())
+        self.assertEqual(self.root, directory.parent)
+        self.assertTrue((directory / "repository.toml").is_file())
+        self.assertNotIn("PRIVATE_SENTINEL", output.read_text() + log.getvalue())
+        with patch.dict(os.environ, {"REVIEW_LEARNINGS_DIR": str(directory)}):
+            self.assertEqual([], l.consume_from_env(engine_tests.POLICY)["entries"])
+        self.assertFalse(directory.exists())
+
     def test_fetch_pins_both_exact_files_to_one_default_branch_commit(self):
         loaded = self.fetch()
         prefix = "https://api.github.com/repos/pipelab-org/agent-review-learnings"
@@ -384,7 +405,125 @@ class IntegrationTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
 
     def enable(self):
-        patch.dict(os.environ, {"REVIEW_LEARNINGS_DIR": str(self.directory)}).start()
+        patch.dict(os.environ, {"REVIEW_LEARNINGS_DIR": str(self.directory),
+                                "REVIEW_LEARNINGS_IDENTITY": ""}).start()
+        # Model the trusted Actions step-output handoff, never derive it in infer.
+        original = j.write_learning_identity
+        def record(ctx):
+            original(ctx)
+            os.environ["REVIEW_LEARNINGS_IDENTITY"] = json.dumps(ctx["learnings"])
+        patch.object(j, "write_learning_identity", side_effect=record).start()
+
+    def private_snapshot(self):
+        sentinels = ["PRIVATE_SENTINEL_" + name for name in
+                     ("proposed", "retired", "expired", "path_unselected", "maintainers")]
+        text = ENTRY
+        for index, kind in enumerate(("proposed", "retired", "expired", "path_unselected")):
+            entry = ENTRY.replace("example-0001", f"example-{index + 2:04d}").replace(
+                "This pattern is fine; evidence is checked in the parser.", sentinels[index])
+            if kind in ("proposed", "retired"):
+                entry = entry.replace('status = "active"', f'status = "{kind}"')
+            if kind == "retired":
+                entry += 'retired_reason = "Superseded."\n'
+            if kind == "expired":
+                entry = entry.replace("2099-01-01", "2026-01-02")
+            if kind == "path_unselected":
+                entry += 'paths = ["never-selected/**"]\n'
+            text += entry
+        snapshot(self.directory, text, OWNERS + "# " + sentinels[-1] + "\n")
+        return sentinels
+
+    def assert_model_boundary(self, sentinels):
+        self.assertFalse(self.directory.exists(), "raw snapshot survives into inference")
+        for path in self.fx.root.rglob("*"):
+            if path.is_file():
+                for sentinel in sentinels:
+                    self.assertNotIn(sentinel.encode(), path.read_bytes(), str(path))
+
+    def test_prepare_erases_unselected_data_before_review_and_verification(self):
+        fx = self.fx
+        proof, _ = fx.prior_threads()
+        self.enable()
+        sentinels = self.private_snapshot()
+        policy, _ = j.settings()
+        identity = l.identity(l.load(self.directory, policy))
+        patch.dict(os.environ, {"RUNNER_TEMP": str(fx.root)}).start()
+        with patch.object(j, "records", return_value={123: proof}):
+            j.prepare(fx.head_dir, fx.plan)
+        plan = json.loads(fx.plan.read_text())
+        self.assertEqual(identity, plan["context"]["learnings"])
+        self.assertEqual(1, plan["bundle"]["learnings"]["count"])
+        self.assertEqual("2026-10-31", plan["learnings_date"])
+        self.assert_model_boundary(sentinels)
+        self.assertTrue(plan["threads"], "verification must actually run")
+        def model(policy, bundle, strategy, head, **kwargs):
+            self.assert_model_boundary(sentinels)
+            if strategy == "verify-threads":
+                return fx.verified(plan)
+            self.assertIn(l.FRAMING, bundle["learnings_text"])
+            return {"findings": [], "receipt": engine_tests.receipt(strategy)}
+        with patch.object(l, "from_env", side_effect=AssertionError("inference reopened raw data")), \
+                patch.object(e, "run_claude", side_effect=model) as provider:
+            j.infer(fx.plan, fx.artifact, fx.head_dir)
+        self.assertEqual(["bundle", "callers", "verify-threads"],
+                         [call.args[2] for call in provider.call_args_list])
+        self.assertIsNotNone(json.loads(fx.artifact.read_text())["verification"])
+        self.assert_model_boundary(sentinels)
+
+    def test_reply_inference_uses_only_selected_prepared_text(self):
+        fx = self.fx
+        proof, root = fx.prior_threads()
+        self.enable()
+        sentinels = self.private_snapshot()
+        fx.reply_plan(proof, root)
+        self.assert_model_boundary(sentinels)
+        def model(*args, **kwargs):
+            self.assert_model_boundary(sentinels)
+            self.assertIn(l.FRAMING, kwargs["prompt"])
+            return fx.answer("none")
+        with patch.object(l, "from_env", side_effect=AssertionError("reply reopened raw data")), \
+                patch.object(j, "reply_learnings", side_effect=AssertionError("reply selected again")), \
+                patch.object(e, "run_claude", side_effect=model) as provider:
+            j.infer(fx.plan, fx.artifact, fx.head_dir)
+        provider.assert_called_once()
+        self.assertNotIn(l.FRAMING, fx.artifact.read_text())
+        self.assert_model_boundary(sentinels)
+        plan = json.loads(fx.plan.read_text())
+        for change in ("bytes", "revision"):
+            changed = copy.deepcopy(plan)
+            if change == "bytes":
+                changed["learnings_text"] += "x"
+            else:
+                changed["learnings"]["sha"] = "b" * 40
+            with self.subTest(change=change), patch.object(e, "run_claude", return_value=fx.answer("none")) as provider:
+                with self.assertRaisesRegex(e.ReviewAbort, "prepared context"):
+                    j.infer_reply(j.settings()[0], changed, fx.head_dir)
+            provider.assert_not_called()
+
+    def test_prepare_cleanup_failure_stops_inference_and_failed_admission_still_cleans(self):
+        fx = self.fx
+        self.enable()
+        with patch.object(l.shutil, "rmtree", side_effect=OSError("fixture deletion failure")):
+            with self.assertRaisesRegex(OSError, "deletion failure"):
+                j.prepare(fx.head_dir, fx.plan)
+        self.assertFalse(fx.plan.exists())
+        self.assertTrue(self.directory.exists())
+        with patch.object(j, "check_pr", side_effect=e.ReviewAbort("fixture admission failure")):
+            with self.assertRaisesRegex(e.ReviewAbort, "admission failure"):
+                j.prepare(fx.head_dir, fx.plan)
+        self.assertFalse(self.directory.exists())
+
+    def test_inference_requires_trusted_preparation_identity(self):
+        fx = self.fx
+        self.enable()
+        j.prepare(fx.head_dir, fx.plan)
+        with patch.dict(os.environ, {"REVIEW_LEARNINGS_IDENTITY": json.dumps(
+                dict(json.loads(fx.plan.read_text())["context"]["learnings"], digest="0" * 64))}), \
+                patch.object(e, "run_claude", side_effect=lambda policy, bundle, strategy, head:
+                             {"findings": [], "receipt": engine_tests.receipt(strategy)}) as provider:
+            with self.assertRaisesRegex(e.ReviewAbort, "trusted workflow context"):
+                j.infer(fx.plan, fx.artifact, fx.head_dir)
+        provider.assert_not_called()
 
     def test_fetch_date_survives_midnight_for_review_and_reply(self):
         before = dt.datetime(2026, 10, 31, 23, 59, 59, tzinfo=dt.timezone.utc)
@@ -405,6 +544,7 @@ class IntegrationTests(unittest.TestCase):
                 with self.subTest(reply=reply):
                     clock.reset_mock()
                     clock.now.return_value = before
+                    self.directory.mkdir(exist_ok=True)
                     l.fetch(self.directory, "example/project", "fixture", True,
                             engine_tests.POLICY, opener=NS(open=read))
                     self.assertEqual("2026-10-31",
@@ -426,7 +566,8 @@ class IntegrationTests(unittest.TestCase):
                         self.assertEqual(1, artifact["plan"]["bundle"]["learnings"]["count"])
                         self.assertEqual(1, len(artifact["result"]["findings"]))
                     clock.now.assert_called_once_with(dt.timezone.utc)
-                    self.assertEqual(1, len(l.from_env(engine_tests.POLICY)["entries"]))
+                    self.assertFalse(self.directory.exists())
+                    self.assertEqual("2026-10-31", json.loads(fx.plan.read_text())["learnings_date"])
 
     def test_never_filter_findings_and_no_private_text_in_public_artifact_or_summary(self):
         fx = self.fx
@@ -450,16 +591,16 @@ class IntegrationTests(unittest.TestCase):
     def test_context_policy_identity_tracks_content_and_expiry_not_unrelated_commits(self):
         fx = self.fx
         policy, depth = j.settings()
-        baseline, _ = j.context(policy, depth)
+        baseline, _ = j.context(policy, depth, learning_data=l.from_env(policy))
         self.enable()
-        first, _ = j.context(policy, depth)
+        first, _ = j.context(policy, depth, learning_data=l.from_env(policy))
         self.assertFalse(f.same_policy(baseline, first))
         snapshot(self.directory, sha="b" * 40)
-        second, _ = j.context(policy, depth)
+        second, _ = j.context(policy, depth, learning_data=l.from_env(policy))
         self.assertNotEqual(first["learnings"]["sha"], second["learnings"]["sha"])
         self.assertTrue(f.same_policy(first, second))
         snapshot(self.directory, ENTRY.replace("2099-01-01", "2026-01-02"))
-        expired, _ = j.context(policy, depth)
+        expired, _ = j.context(policy, depth, learning_data=l.from_env(policy))
         self.assertFalse(f.same_policy(first, expired))
         self.assertTrue(f.same_policy(first, dict(first, head="e" * 40)))
 
@@ -485,7 +626,7 @@ class IntegrationTests(unittest.TestCase):
         proof, root = self.published_record(advance=True)
         snapshot(self.directory, ENTRY + "# Changed learning content.\n", sha="b" * 40)
         policy, depth = j.settings()
-        ctx, _ = j.context(policy, depth)
+        ctx, _ = j.context(policy, depth, learning_data=l.from_env(policy))
         self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
         j.prepare(fx.head_dir, fx.plan)
         plan = json.loads(fx.plan.read_text())
@@ -505,12 +646,13 @@ class IntegrationTests(unittest.TestCase):
                     fx.resolve_plan(proof, root)
                 else:
                     fx.reply_plan(proof, root)
+                snapshot(self.directory, ENTRY + "# Changed learning content.\n", sha="b" * 40)
                 # Fixture event creation above mocks records; admission and
                 # publication below use the real ownership/artifact path.
                 j.prepare(fx.head_dir, fx.plan, reply=True)
                 plan = json.loads(fx.plan.read_text())
                 policy, depth = j.settings()
-                ctx, _ = j.context(policy, depth)
+                ctx, _ = j.context(policy, depth, learning_data=l.from_env(policy))
                 j.publish_reply(fx.repo, fx.pr, ctx, policy, plan,
                                 None if command else fx.answer(), fx.head_dir)
                 self.assertTrue(any(c.raw_data.get("in_reply_to_id") == root.id
@@ -520,6 +662,7 @@ class IntegrationTests(unittest.TestCase):
     def test_identical_review_skip_requires_same_learnings(self):
         fx = self.fx
         proof, _ = self.published_record()
+        snapshot(self.directory)
         j.prepare(fx.head_dir, fx.plan)
         self.assertEqual("unchanged", json.loads(fx.plan.read_text())["scope"]["kind"])
         for change, expected in (("unrelated", "unchanged"), ("repository", "full"),
@@ -535,7 +678,7 @@ class IntegrationTests(unittest.TestCase):
                     state["evaluation_date"] = "2100-01-01"
                     (self.directory / "state.json").write_text(json.dumps(state))
                 policy, depth = j.settings()
-                ctx, _ = j.context(policy, depth)
+                ctx, _ = j.context(policy, depth, learning_data=l.from_env(policy))
                 self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
                 j.prepare(fx.head_dir, fx.plan)
                 plan = json.loads(fx.plan.read_text())
@@ -571,7 +714,7 @@ class IntegrationTests(unittest.TestCase):
         fx = self.fx
         proof, _ = self.published_record()
         policy, depth = j.settings()
-        ctx, _ = j.context(policy, depth)
+        ctx, _ = j.context(policy, depth, learning_data=l.from_env(policy))
         self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
         changes = {"repository": "other/project", "number": 2, "base": "0" * 40,
                    "reviewer": "0" * 40, "profile_sha": "0" * 40, "profile_hash": "0" * 64,
@@ -603,6 +746,7 @@ class IntegrationTests(unittest.TestCase):
         fx = self.fx
         self.enable()
         proof, root = fx.prior_threads()
+        snapshot(self.directory)
         plan = fx.reply_plan(proof, root)
         policy, _ = j.settings()
         with patch.object(e, "run_claude", return_value=fx.answer("none")) as run:
@@ -612,13 +756,17 @@ class IntegrationTests(unittest.TestCase):
         assert_public_learning_prompt(self, plan["prompt"])
         self.assertNotIn(l.FRAMING, plan["prompt"])
         self.assertEqual(1, plan["learnings"]["count"])
+        self.assertFalse(self.directory.exists())
+        with patch.object(e, "run_claude", return_value=fx.answer("none")):
+            j.infer(fx.plan, fx.artifact, fx.head_dir)
+        self.assertNotIn(l.FRAMING, fx.artifact.read_text())
 
     def test_reply_omits_context_when_optional_path_discovery_cannot_fit(self):
         self.enable()
         policy, depth = j.settings()
-        ctx, _ = j.context(policy, depth)
+        ctx, _ = j.context(policy, depth, learning_data=l.from_env(policy))
         with patch.object(e, "git", side_effect=e.ReviewAbort("Source exceeds allowance")):
-            meta, text = j.reply_learnings(ctx, policy, self.fx.head_dir)
+            meta, text = j.reply_learnings(ctx, policy, self.fx.head_dir, l.from_env(policy))
         self.assertEqual("input too large", meta["reason"])
         self.assertEqual("", text)
 
@@ -632,12 +780,12 @@ class IntegrationTests(unittest.TestCase):
             plan = fx.reply_plan(proof, root)
         self.assertEqual("prompt allowance exceeded", plan["learnings"]["reason"])
         self.assertNotIn(l.PUBLIC_OUTPUT, plan["prompt"])
-        snapshot(self.directory)
         changed = copy.deepcopy(plan)
-        changed["learnings"] = dict(meta, digest="0" * 64)
+        changed["context"]["learnings"]["digest"] = "0" * 64
+        fx.plan.write_text(json.dumps(changed))
         with patch.object(e, "run_claude", return_value=fx.answer("none")) as provider:
-            with self.assertRaises(e.ReviewAbort):
-                j.infer_reply(policy, changed, fx.head_dir)
+            with self.assertRaisesRegex(e.ReviewAbort, "trusted workflow context"):
+                j.infer(fx.plan, fx.artifact, fx.head_dir)
         provider.assert_not_called()
 
     def test_fixed_summary_for_no_learnings_and_identity_tampering(self):
@@ -701,13 +849,39 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(prepare["env"]["REVIEW_DEPTH"], fetch["env"]["REVIEW_DEPTH"], name)
         self.assertEqual({"review", "reply"}, set(fetched))
 
+    def test_no_step_after_prepare_can_reference_raw_learnings(self):
+        prepared = []
+        for name, job in self.workflow()["jobs"].items():
+            steps = job.get("steps", [])
+            self.assertNotIn("REVIEW_LEARNINGS_DIR", json.dumps(job.get("env", {})), name)
+            self.assertNotIn("learnings-fetch.outputs.directory", json.dumps(job.get("env", {})), name)
+            for step in steps:
+                if step.get("id") != "plan":
+                    self.assertNotIn("learnings-fetch.outputs.directory", json.dumps(step), name)
+                    self.assertNotIn("REVIEW_LEARNINGS_DIR", json.dumps(step), name)
+            for index, step in enumerate(steps):
+                if step.get("id") != "plan":
+                    continue
+                prepared.append(name)
+                self.assertEqual("${{ steps.learnings-fetch.outputs.directory }}",
+                                 step["env"]["REVIEW_LEARNINGS_DIR"])
+                for later in steps[index + 1:]:
+                    text = json.dumps(later)
+                    self.assertNotIn("learnings-fetch.outputs.directory", text, name)
+                    self.assertNotIn("REVIEW_LEARNINGS_DIR", text, name)
+                inference = next(s for s in steps[index + 1:]
+                                 if "review_jobs.py infer " in s.get("run", ""))
+                self.assertEqual("${{ steps.plan.outputs.learnings_identity }}",
+                                 inference["env"]["REVIEW_LEARNINGS_IDENTITY"])
+        self.assertEqual({"review", "reply"}, set(prepared))
+
     def test_token_revocation_runs_immediately_after_fetch_before_head_and_inference(self):
         for name in ("review", "reply"):
             steps = self.workflow()["jobs"][name]["steps"]
             token = next(s for s in steps if s.get("id") == "learnings-token")
             fetch = next(s for s in steps if s.get("id") == "learnings-fetch")
             revoke = next(s for s in steps if s.get("id") == "learnings-revoke")
-            self.assertEqual("true", token["with"]["skip-token-revoke"])
+            self.assertNotIn("skip-token-revoke", token["with"])
             self.assertEqual("true", revoke["continue-on-error"])
             self.assertIn("always()", revoke["if"])
             self.assertIn("steps.learnings-token.outcome == 'success'", revoke["if"])

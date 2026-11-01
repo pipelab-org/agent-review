@@ -50,7 +50,7 @@ def settings():
     return engine.policy(depth), depth
 
 
-def context(policy, depth):
+def context(policy, depth, *, learning_data=None):
     profile, fingerprint = load_profile(Path(os.environ["REVIEW_PROFILE_PATH"]))
     repo, number = os.environ["GITHUB_REPOSITORY"], os.environ["PR_NUMBER"]
     fields = {name: os.environ[key] for name, key in
@@ -60,8 +60,8 @@ def context(policy, depth):
             or not re.fullmatch(r"[1-9][0-9]*", number)
             or any(not followups.full_sha(value) for value in fields.values())):
         raise ReviewAbort("Invalid admitted repository or immutable source identity")
-    identity = engine.learnings.identity(engine.learnings.from_env(policy))
-    if os.environ.get("REVIEW_LEARNINGS_IDENTITY"):
+    identity = engine.learnings.identity(learning_data or engine.learnings.empty())
+    if learning_data is None and os.environ.get("REVIEW_LEARNINGS_IDENTITY"):
         try:
             identity = json.loads(os.environ["REVIEW_LEARNINGS_IDENTITY"])
             if not engine.learnings.valid_identity(identity):
@@ -134,11 +134,12 @@ def records(repo, pr, ctx, policy, *, all_depths=False):
 
 def prepare(head_dir, output, reply=False):
     policy, depth = settings()
-    ctx, profile = context(policy, depth)
+    learning_data = engine.learnings.consume_from_env(policy)
+    ctx, profile = context(policy, depth, learning_data=learning_data)
     repo = github().get_repo(ctx["repository"])
     pr = check_pr(repo, ctx)
     if reply:
-        prepare_reply(repo, pr, ctx, policy, output, head_dir)
+        prepare_reply(repo, pr, ctx, policy, output, head_dir, learning_data)
         return
     check_command(repo, pr, depth)
     proof = records(repo, pr, ctx, policy)
@@ -147,14 +148,15 @@ def prepare(head_dir, output, reply=False):
                                  profile["ignore"]["glob"],
                                  start=scope["from"] if scope["kind"] == "incremental" else None,
                                  instructions=profile["review"]["instructions"],
-                                 learning_data=engine.learnings.from_env(policy))
+                                 learning_data=learning_data)
     threads = []
     if scope["kind"] != "unchanged":
         try:
             threads = collect_threads(pr, records(repo, pr, ctx, policy, all_depths=True))
         except Exception:
             print(FOLLOWUP_NOTE)
-    plan = {"context": ctx, "scope": scope, "bundle": bundle, "kind": "review", "threads": threads}
+    plan = {"context": ctx, "scope": scope, "bundle": bundle, "kind": "review", "threads": threads,
+            "learnings_date": learning_data.get("evaluation_date")}
     engine.save(output, plan)
     write_learning_identity(ctx)
     # Fixed output values only, never model/PR text in Actions commands.
@@ -210,8 +212,8 @@ def write_learning_identity(ctx):
             stream.write("learnings_identity=" + followups.canonical(ctx["learnings"]) + "\n")
 
 
-def reply_learnings(ctx, policy, head_dir):
-    data = engine.learnings.from_env(policy)
+def reply_learnings(ctx, policy, head_dir, data):
+    # The raw snapshot has already been consumed and removed by prepare.
     if not data["entries"]:
         return engine.learnings.select(data, [])
     available = engine.learnings.allowance(policy)
@@ -225,7 +227,7 @@ def reply_learnings(ctx, policy, head_dir):
     return engine.learnings.select(data, paths)
 
 
-def prepare_reply(repo, pr, ctx, policy, output, head_dir=None):
+def prepare_reply(repo, pr, ctx, policy, output, head_dir=None, learning_data=None):
     live, root, findings = reply_check(repo, pr, ctx, policy)
     marker = followups.reply_marker(live.id, root.id)
     thread = [c for c in followups.listed_comments(pr)
@@ -247,14 +249,17 @@ def prepare_reply(repo, pr, ctx, policy, output, head_dir=None):
                  "root": {"body": root.body, "path": root.path, "diff_hunk": root.raw_data.get("diff_hunk", "")},
                  "thread": [{"id": c["id"], "author": c["user"]["login"], "body": c["body"]}
                             for c in sorted(thread, key=lambda c: c["id"])], "question": live.body}))
-    meta, text = reply_learnings(ctx, policy, head_dir)
+    meta, text = reply_learnings(ctx, policy, head_dir, learning_data or engine.learnings.empty())
     public_prompt = engine.learnings.PUBLIC_OUTPUT + prompt if text else prompt
     if engine.token_bound(public_prompt + text + json.dumps(REPLY_SCHEMA)) > engine.learnings.allowance(policy):
         meta = engine.learnings.without_context(meta, "prompt allowance exceeded")
+        text = ""
     else:
         prompt = public_prompt
     write_learning_identity(ctx)
-    engine.save(output, {"learnings": meta, "kind": "reply", "context": ctx, "root": root.id, "trigger": live.id,
+    engine.save(output, {"learnings": meta, "learnings_text": text,
+                         "learnings_date": (learning_data or {}).get("evaluation_date"),
+                         "kind": "reply", "context": ctx, "root": root.id, "trigger": live.id,
                          "root_digest": followups.digest(root.body), "findings": findings,
                          "prompt": prompt, "reused": reused, "resolve_command": command})
 
@@ -302,15 +307,17 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
     # metadata lets publication reproduce bundle sizing without fetching it again.
     if plan["kind"] == "review":
         plan["bundle"].pop("learnings_text", None)
+    else:
+        plan.pop("learnings_text", None)
     engine.save(output, {"plan": plan, "result": result, "verification": verification})
 
 
 def infer_reply(policy, plan, head_dir):
-    meta, text = reply_learnings(plan["context"], policy, head_dir)
-    if plan.get("learnings", {}).get("reason") == "prompt allowance exceeded":
-        meta, text = engine.learnings.without_context(meta, "prompt allowance exceeded"), ""
-    if meta != plan["learnings"]:
-        raise ReviewAbort("Reply learnings changed since preparation")
+    meta = engine.learnings.validate_metadata(plan["learnings"], policy)
+    text = plan.get("learnings_text", "")
+    if (not isinstance(text, str) or len(text.encode("utf-8")) != meta["bytes"]
+            or meta["sha"] != plan["context"]["learnings"]["sha"]):
+        raise ReviewAbort("Reply learnings differ from prepared context")
     result = engine.run_claude(policy, {"files": []}, "reply", head_dir,
         prompt=plan["prompt"] + text, schema=REPLY_SCHEMA, validate_output=validate_reply, output_key="output")
     result["output"] = validate_reply_result(result, plan, policy, head_dir)

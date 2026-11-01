@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import tempfile
 import tomllib
@@ -149,7 +150,7 @@ def load(directory, settings):
         if sha != "none" and (not isinstance(sha, str) or not SHA.fullmatch(sha)):
             raise ValueError
         if state["reason"] in REASONS:
-            return empty(state["reason"], sha, files)
+            return {**empty(state["reason"], sha, files), "evaluation_date": today.isoformat()}
         if state["reason"] != "" or sha == "none":
             raise ValueError
         maintainers = read_bounded(root / "maintainers.toml", limit)
@@ -158,7 +159,7 @@ def load(directory, settings):
             raise ValueError
         entries = parse(maintainers.decode("utf-8"), repository.decode("utf-8"), today)
         return {"sha": sha, "reason": "no applicable entries" if not entries else "",
-                "entries": entries, "files": files}
+                "entries": entries, "files": files, "evaluation_date": today.isoformat()}
     except OverflowError:
         return empty("input too large", sha)
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
@@ -170,6 +171,16 @@ def from_env(settings):
     if not directory:
         return empty("fetch failed" if "REVIEW_LEARNINGS_DIR" in os.environ else "credentials unavailable")
     return load(directory, settings)
+
+
+def consume_from_env(settings):
+    """Preparation owns the raw snapshot; deletion failure stops the job."""
+    directory = os.environ.get("REVIEW_LEARNINGS_DIR")
+    try:
+        return from_env(settings)
+    finally:
+        if directory and Path(directory).exists():
+            shutil.rmtree(directory)
 
 
 def section(entries):
@@ -287,10 +298,12 @@ def main():
             import review_engine as engine
         settings = engine.policy(os.environ.get("REVIEW_DEPTH", "default"))
         directory = tempfile.mkdtemp(prefix="agent-review-learnings-", dir=os.environ["RUNNER_TEMP"])
-        fetch(directory, os.environ["GITHUB_REPOSITORY"], os.environ.get("LEARNINGS_TOKEN", ""),
-              os.environ.get("LEARNINGS_CREDENTIALS") == "true", settings)
+        # Publish ownership before fetching, so preparation can remove a partial
+        # snapshot even when the optional fetch step fails.
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
             stream.write(f"directory={directory}\n")
+        fetch(directory, os.environ["GITHUB_REPOSITORY"], os.environ.get("LEARNINGS_TOKEN", ""),
+              os.environ.get("LEARNINGS_CREDENTIALS") == "true", settings)
     except Exception:
         # Workflow step is also continue-on-error. Missing output means no learnings.
         print("Learnings: none loaded (fetch failed)")
