@@ -27,10 +27,11 @@ from urllib.parse import urlparse
 
 if __package__:
     from .agent_review_contract import MAX_DATA_BYTES
-    from . import review_reliability as reliability
+    from . import review_reliability as reliability, review_learnings as learnings
 else:
     from agent_review_contract import MAX_DATA_BYTES
     import review_reliability as reliability
+    import review_learnings as learnings
 
 
 class FollowupAbort(Exception):
@@ -84,9 +85,17 @@ def context(settings, repository, number, head, base, source, profile_sha, profi
             "models": [settings.config.model, *settings.config.fallback_models]}
 
 
-def same_policy(old, current):
+def same_policy(old, current, *, ownership=False):
+    # Thread ownership ignores optional context. Coverage compares file content
+    # and eligible entries; the learnings commit remains provenance only.
+    ignored = {"head", "learnings"}
+    if (not ownership and ("learnings" in old or "learnings" in current)
+            and (not learnings.valid_identity(old.get("learnings"))
+                 or not learnings.valid_identity(current.get("learnings"))
+                 or old["learnings"]["digest"] != current["learnings"]["digest"])):
+        return False
     return (set(old) == set(current)
-            and all(old[key] == current[key] for key in current if key != "head"))
+            and all(old[key] == current[key] for key in current if key not in ignored))
 
 
 def valid_findings(findings):
@@ -127,6 +136,7 @@ def parse_record(comment, comments):
                 or type(ctx["number"]) is not int or not positive(ctx["number"])
                 or not all(full_sha(ctx[k]) for k in ("base", "head", "reviewer", "profile_sha"))
                 or not all(isinstance(ctx[k], str) and re.fullmatch(DIGEST, ctx[k]) for k in ("profile_hash", "common_config"))
+                or ("learnings" in ctx and not learnings.valid_identity(ctx["learnings"]))
                 or ctx["depth"] not in ("default", "deep", "codex", "codex-deep")
                 or not isinstance(ctx["models"], list) or not ctx["models"]
                 or any(not isinstance(m, str) or not m for m in ctx["models"])
@@ -229,7 +239,7 @@ def download_record(artifact, token, timeout):
         return strict_json(bundle.read(files[0]))
 
 
-def verified_records(repo, pr, current, load_artifact, *, contexts=None):
+def verified_records(repo, pr, current, load_artifact, *, contexts=None, ownership=False):
     try:
         comments = {c.id: c for c in pr.get_issue_comments()}
     except Exception as error:
@@ -241,7 +251,8 @@ def verified_records(repo, pr, current, load_artifact, *, contexts=None):
     records = {}
     for comment in comments.values():
         record = parse_record(comment, comments)
-        if record is None or not any(same_policy(record["context"], ctx) for ctx in (contexts or [current])):
+        if record is None or not any(same_policy(record["context"], ctx, ownership=ownership)
+                                     for ctx in (contexts or [current])):
             continue
         try:
             run = repo.get_workflow_run(record["run_id"])

@@ -10,6 +10,10 @@ name: Reusable agentic review
         required: false
       ORG_MEMBERS_TOKEN:
         required: false
+      AGENT_REVIEW_LEARNINGS_APP_ID:
+        required: false
+      AGENT_REVIEW_LEARNINGS_APP_KEY:
+        required: false
 permissions: {}
 jobs:
   source:
@@ -71,6 +75,8 @@ jobs:
       actions: read
       contents: read
       pull-requests: read
+    outputs:
+      learnings_identity: ${{ steps.plan.outputs.learnings_identity }}
     steps:
     - name: Check out trusted base at workspace root
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -102,6 +108,62 @@ jobs:
         CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
       run: python trusted-agent-review/scripts/agent_review_contract.py --root trusted-agent-profile --source-sha "$REVIEW_SOURCE_SHA"
+    - name: Set up the Python version the pinned dependencies were hashed for
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Install pinned engine dependencies
+      run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
+    - name: Check optional learnings credentials
+      id: learnings-credentials
+      env:
+        APP_ID: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        APP_KEY: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
+      run: |
+        if [[ -n "$APP_ID" && -n "$APP_KEY" ]]; then
+          echo 'available=true' >> "$GITHUB_OUTPUT"
+        else
+          echo 'available=false' >> "$GITHUB_OUTPUT"
+        fi
+    - name: Mint read-only token for the learnings repository only
+      id: learnings-token
+      if: steps.learnings-credentials.outputs.available == 'true'
+      continue-on-error: true
+      # https://github.com/actions/create-github-app-token/releases/tag/v3.3.0
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        app-id: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        private-key: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
+        owner: pipelab-org
+        repositories: agent-review-learnings
+        permission-contents: read
+        permission-metadata: read
+    - name: Fetch optional learnings at one immutable revision
+      id: learnings-fetch
+      continue-on-error: true
+      # Four REST reads; GitHub ends any request after 10 s of processing
+      # (docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api).
+      # One minute bounds slow transfers so optional learnings never cost the job.
+      timeout-minutes: 1
+      env:
+        LEARNINGS_TOKEN: ${{ steps.learnings-token.outputs.token }}
+        LEARNINGS_CREDENTIALS: ${{ steps.learnings-credentials.outputs.available }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+      run: python trusted-agent-review/scripts/review_learnings.py --fetch
+    - name: Revoke the learnings installation token before inference
+      id: learnings-revoke
+      if: ${{ always() && steps.learnings-token.outcome == 'success' }}
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
+      # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
+      run: |
+        if gh api --method DELETE /installation/token >/dev/null 2>&1; then
+          echo 'Learnings token revoked.'
+        else
+          echo '::warning::Early learnings-token revoke failed before inference; review continues.'
+        fi
     - name: Check out immutable head as read-only data
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
@@ -110,15 +172,11 @@ jobs:
         path: pr-head
         persist-credentials: false
         fetch-depth: 0
-    - name: Set up the Python version the pinned dependencies were hashed for
-      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-      with:
-        python-version: '3.12'
-    - name: Install pinned engine dependencies
-      run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
     - name: Prepare admitted snapshot
+      id: plan
       run: python trusted-agent-review/scripts/review_jobs.py prepare --head pr-head --output "$RUNNER_TEMP/agent-review/plan.json"
       env:
+        REVIEW_LEARNINGS_DIR: ${{ steps.learnings-fetch.outputs.directory }}
         GITHUB_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.issue.number }}
@@ -206,6 +264,7 @@ jobs:
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Review the admitted diff
       env:
+        REVIEW_LEARNINGS_IDENTITY: ${{ steps.plan.outputs.learnings_identity }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.issue.number }}
         REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
@@ -272,6 +331,8 @@ jobs:
       actions: read
       contents: read
       pull-requests: read
+    outputs:
+      learnings_identity: ${{ steps.plan.outputs.learnings_identity }}
     steps:
     - name: Resolve trusted shared source before checkout
       id: reply-source
@@ -356,6 +417,56 @@ jobs:
         CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
         REVIEW_SOURCE_SHA: ${{ steps.reply-source.outputs.reviewer_sha }}
       run: python trusted-agent-review/scripts/agent_review_contract.py --root trusted-agent-profile --source-sha "$REVIEW_SOURCE_SHA"
+    - name: Check optional learnings credentials
+      id: learnings-credentials
+      env:
+        APP_ID: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        APP_KEY: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
+      run: |
+        if [[ -n "$APP_ID" && -n "$APP_KEY" ]]; then
+          echo 'available=true' >> "$GITHUB_OUTPUT"
+        else
+          echo 'available=false' >> "$GITHUB_OUTPUT"
+        fi
+    - name: Mint read-only token for the learnings repository only
+      id: learnings-token
+      if: steps.learnings-credentials.outputs.available == 'true'
+      continue-on-error: true
+      # https://github.com/actions/create-github-app-token/releases/tag/v3.3.0
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        app-id: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        private-key: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
+        owner: pipelab-org
+        repositories: agent-review-learnings
+        permission-contents: read
+        permission-metadata: read
+    - name: Fetch optional learnings at one immutable revision
+      id: learnings-fetch
+      continue-on-error: true
+      # Four REST reads; GitHub ends any request after 10 s of processing
+      # (docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api).
+      # One minute bounds slow transfers so optional learnings never cost the job.
+      timeout-minutes: 1
+      env:
+        LEARNINGS_TOKEN: ${{ steps.learnings-token.outputs.token }}
+        LEARNINGS_CREDENTIALS: ${{ steps.learnings-credentials.outputs.available }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        REVIEW_DEPTH: default
+      run: python trusted-agent-review/scripts/review_learnings.py --fetch
+    - name: Revoke the learnings installation token before inference
+      id: learnings-revoke
+      if: ${{ always() && steps.learnings-token.outcome == 'success' }}
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
+      # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
+      run: |
+        if gh api --method DELETE /installation/token >/dev/null 2>&1; then
+          echo 'Learnings token revoked.'
+        else
+          echo '::warning::Early learnings-token revoke failed before inference; review continues.'
+        fi
     - name: Check out immutable head as read-only data
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
@@ -365,8 +476,10 @@ jobs:
         persist-credentials: false
         fetch-depth: 0
     - name: Prepare admitted snapshot
+      id: plan
       run: python trusted-agent-review/scripts/review_jobs.py prepare --head pr-head --output "$RUNNER_TEMP/agent-review/plan.json" --reply
       env:
+        REVIEW_LEARNINGS_DIR: ${{ steps.learnings-fetch.outputs.directory }}
         GITHUB_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -454,6 +567,7 @@ jobs:
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Review the admitted diff
       env:
+        REVIEW_LEARNINGS_IDENTITY: ${{ steps.plan.outputs.learnings_identity }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REVIEW_SOURCE_SHA: ${{ steps.reply-source.outputs.reviewer_sha }}
@@ -766,6 +880,7 @@ jobs:
         path: ${{ runner.temp }}/agent-review
     - name: Validate and publish immutable findings
       env:
+        REVIEW_LEARNINGS_IDENTITY: ${{ needs.review.outputs.learnings_identity }}
         GITHUB_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.issue.number }}
@@ -900,6 +1015,7 @@ jobs:
         path: ${{ runner.temp }}/agent-review
     - name: Validate and publish immutable findings
       env:
+        REVIEW_LEARNINGS_IDENTITY: ${{ needs.reply.outputs.learnings_identity }}
         GITHUB_TOKEN: ${{ github.token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
