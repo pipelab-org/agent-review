@@ -119,7 +119,7 @@ def read_bounded(path, limit):
     return raw
 
 
-def load(directory, settings, today=None):
+def load(directory, settings):
     """Local snapshot only. It contains no credential and both files share one commit."""
     limit = allowance(settings)
     sha = "none"
@@ -127,6 +127,7 @@ def load(directory, settings, today=None):
         root = Path(directory)
         state = json.loads(read_bounded(root / "state.json", limit))
         sha = state["sha"]
+        today = dt.date.fromisoformat(state["evaluation_date"])
         if sha != "none" and (not isinstance(sha, str) or not SHA.fullmatch(sha)):
             raise ValueError
         if state["reason"] in REASONS:
@@ -198,6 +199,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def fetch(directory, repository, token, credentials, settings, *, opener=None):
     """Credential-bearing process. Fetch just two files at one default-branch commit."""
     root = Path(directory)
+    today = dt.datetime.now(dt.timezone.utc).date()
     state = empty("credentials unavailable" if not credentials else "token unavailable")
     limit = allowance(settings)
     try:
@@ -232,7 +234,7 @@ def fetch(directory, repository, token, credentials, settings, *, opener=None):
                 else:
                     raise
             if not state["reason"]:
-                parse(maintainers.decode("utf-8"), content.decode("utf-8"))
+                parse(maintainers.decode("utf-8"), content.decode("utf-8"), today)
                 for name, body in (("maintainers.toml", maintainers), ("repository.toml", content)):
                     path = root / name
                     path.write_bytes(body)
@@ -245,7 +247,8 @@ def fetch(directory, repository, token, credentials, settings, *, opener=None):
         # Fixed reasons only. Never print a response body, exception or private file.
         state = empty("fetch failed", state["sha"])
     path = root / "state.json"
-    path.write_text(canonical({"sha": state["sha"], "reason": state["reason"]}), encoding="utf-8")
+    path.write_text(canonical({"sha": state["sha"], "reason": state["reason"],
+                               "evaluation_date": today.isoformat()}), encoding="utf-8")
     path.chmod(0o600)
 
 

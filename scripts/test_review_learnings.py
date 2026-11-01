@@ -43,7 +43,8 @@ def data(text=ENTRY, owners=OWNERS, sha=SHA):
 
 def snapshot(root, text=ENTRY, owners=OWNERS, sha=SHA, reason=""):
     root.mkdir(exist_ok=True)
-    (root / "state.json").write_text(json.dumps({"sha": sha, "reason": reason}))
+    (root / "state.json").write_text(json.dumps({"sha": sha, "reason": reason,
+                                                   "evaluation_date": TODAY.isoformat()}))
     (root / "maintainers.toml").write_text(owners)
     (root / "repository.toml").write_text(text)
     return root
@@ -59,7 +60,7 @@ class SelectionTests(unittest.TestCase):
 
     def load(self, text=ENTRY, owners=OWNERS):
         snapshot(self.root, text, owners)
-        return l.load(self.root, self.policy, TODAY)
+        return l.load(self.root, self.policy)
 
     def test_status_guard_and_repository_wide_selection(self):
         for status, count in (("active", 1), ("proposed", 0), ("retired", 0)):
@@ -122,7 +123,7 @@ class SelectionTests(unittest.TestCase):
         limit = l.allowance(self.policy)
         self.assertEqual(self.policy["max_model_tokens"] - self.policy["max_output_tokens"], limit)
         snapshot(self.root, ENTRY + "#" * limit, OWNERS)
-        loaded = l.load(self.root, self.policy, TODAY)
+        loaded = l.load(self.root, self.policy)
         self.assertEqual([], loaded["entries"])
         self.assertEqual("input too large", loaded["reason"])
 
@@ -130,10 +131,20 @@ class SelectionTests(unittest.TestCase):
         (self.root / "repository.toml").unlink()
         target = self.root / "other"; target.write_text(ENTRY)
         (self.root / "repository.toml").symlink_to(target)
-        self.assertEqual("invalid data", l.load(self.root, self.policy, TODAY)["reason"])
+        self.assertEqual("invalid data", l.load(self.root, self.policy)["reason"])
         (self.root / "repository.toml").unlink()
         os.mkfifo(self.root / "repository.toml")
-        self.assertEqual("invalid data", l.load(self.root, self.policy, TODAY)["reason"])
+        self.assertEqual("invalid data", l.load(self.root, self.policy)["reason"])
+
+    def test_missing_or_invalid_snapshot_date_omits_optional_context(self):
+        for value in (None, "invalid", "2026-02-30", 123):
+            state = json.loads((self.root / "state.json").read_text())
+            state["evaluation_date"] = value
+            (self.root / "state.json").write_text(json.dumps(state))
+            self.assertEqual("invalid data", l.load(self.root, self.policy)["reason"])
+        state.pop("evaluation_date")
+        (self.root / "state.json").write_text(json.dumps(state))
+        self.assertEqual("invalid data", l.load(self.root, self.policy)["reason"])
 
     def test_model_process_environment_has_no_learning_or_github_credentials(self):
         with patch.dict(os.environ, {"LEARNINGS_TOKEN": "fixture", "AGENT_REVIEW_LEARNINGS_APP_KEY": "fixture",
@@ -179,7 +190,7 @@ class FetchTests(unittest.TestCase):
 
     def fetch(self, token="private-fixture-token", credentials=True):
         l.fetch(self.root, "example/project", token, credentials, engine_tests.POLICY, opener=self.opener)
-        return l.load(self.root, engine_tests.POLICY, TODAY)
+        return l.load(self.root, engine_tests.POLICY)
 
     def test_fetch_pins_both_exact_files_to_one_default_branch_commit(self):
         loaded = self.fetch()
@@ -305,6 +316,48 @@ class IntegrationTests(unittest.TestCase):
 
     def enable(self):
         patch.dict(os.environ, {"REVIEW_LEARNINGS_DIR": str(self.directory)}).start()
+
+    def test_fetch_date_survives_midnight_for_review_and_reply(self):
+        before = dt.datetime(2026, 10, 31, 23, 59, 59, tzinfo=dt.timezone.utc)
+        after = dt.datetime(2026, 11, 1, 0, 0, 1, tzinfo=dt.timezone.utc)
+        content = ENTRY.replace("2099-01-01", "2026-10-31")
+        def read(request, timeout):
+            url = request.full_url
+            body = (content.encode() if "/contents/repos/" in url else OWNERS.encode()
+                    if "/contents/" in url else json.dumps({"sha": SHA}).encode()
+                    if "/commits/" in url else b'{"default_branch":"main"}')
+            return io.BytesIO(body)
+        fx = self.fx
+        proof, root = fx.prior_threads()
+        self.enable()
+        original_infer = j.infer
+        with patch.object(l.dt, "datetime", wraps=dt.datetime) as clock:
+            for reply in (False, True):
+                with self.subTest(reply=reply):
+                    clock.reset_mock()
+                    clock.now.return_value = before
+                    l.fetch(self.directory, "example/project", "fixture", True,
+                            engine_tests.POLICY, opener=NS(open=read))
+                    self.assertEqual("2026-10-31",
+                                     json.loads((self.directory / "state.json").read_text())["evaluation_date"])
+                    if reply:
+                        plan = fx.reply_plan(proof, root)
+                        self.assertEqual(1, plan["learnings"]["count"])
+                        clock.now.return_value = after
+                        with patch.object(e, "run_claude", return_value=fx.answer()) as provider:
+                            j.infer(fx.plan, fx.artifact, fx.head_dir)
+                        self.assertIn(l.FRAMING, provider.call_args.kwargs["prompt"])
+                    else:
+                        def cross_midnight(*args, **kwargs):
+                            clock.now.return_value = after
+                            return original_infer(*args, **kwargs)
+                        with patch.object(j, "infer", side_effect=cross_midnight):
+                            fx.build([engine_tests.finding(path="app.py")])
+                        artifact = json.loads(fx.artifact.read_text())
+                        self.assertEqual(1, artifact["plan"]["bundle"]["learnings"]["count"])
+                        self.assertEqual(1, len(artifact["result"]["findings"]))
+                    clock.now.assert_called_once_with(dt.timezone.utc)
+                    self.assertEqual(1, len(l.from_env(engine_tests.POLICY)["entries"]))
 
     def test_never_filter_findings_and_no_private_text_in_public_artifact_or_summary(self):
         fx = self.fx
