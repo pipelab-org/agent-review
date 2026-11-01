@@ -195,7 +195,7 @@ class FetchTests(unittest.TestCase):
         def request(req, timeout):
             self.requests.append(req)
             self.paths.append(req.full_url)
-            self.assertEqual(engine_tests.POLICY["ai_timeout"], timeout)
+            self.assertEqual(l.REQUEST_TIMEOUT, timeout)
             self.assertEqual("Bearer " + self.token, req.get_header("Authorization"))
             if "/contents/repos/" in req.full_url:
                 if self.error:
