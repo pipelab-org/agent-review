@@ -567,7 +567,7 @@ class CodexTests(unittest.TestCase):
                 "total_token_usage": {"input_tokens": 300_000, "output_tokens": 10, "total_tokens": 300_010},
                 "last_token_usage": {"input_tokens": 300_000, "output_tokens": 10, "total_tokens": 300_010}}}}
             (home / "sessions/rollout.jsonl").write_text(json.dumps(event))
-            with self.assertRaisesRegex(e.ReviewAbort, "exceeded config.max_model_tokens"):
+            with self.assertRaisesRegex(e.ReviewAbort, "exceeded the review depth's max_model_tokens"):
                 e.codex_progress(home, Path("/head"), model="gpt-6.1-terra", request_limit=256_000)
             # At the allowance it is accepted; without a limit (old callers) it is unchanged.
             self.assertEqual(1, e.codex_progress(home, Path("/head"), model="gpt-6.1-terra",

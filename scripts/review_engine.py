@@ -146,14 +146,14 @@ def git(repo, *args, binary=False, limit=None):
         result = subprocess.run(command, capture_output=True, check=False)
         raw, code = result.stdout, result.returncode
     else:
-        # The byte bound derives only from config.max_model_tokens minus output reserve.
+        # The byte bound derives only from the depth's max_model_tokens minus output reserve.
         # Avoid materializing a hostile oversized diff/blob merely to reject it.
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
             raw = process.stdout.read(limit + 1)
             if len(raw) > limit:
                 process.kill()
                 process.wait()
-                raise ReviewAbort("Source or diff exceeds config.max_model_tokens; review coverage is incomplete")
+                raise ReviewAbort("Source or diff exceeds the review depth's max_model_tokens; review coverage is incomplete")
             code = process.wait()
     if code:
         raise ReviewAbort("Immutable Git source unavailable; check admitted refs and fetch depth")
@@ -246,7 +246,7 @@ def build_bundle(repo, head, base, settings, exclusions=(), start=None, instruct
             if size() <= available:
                 break
     if size() > available:
-        raise ReviewAbort("Diff and changed regions exceed config.max_model_tokens; review coverage is incomplete")
+        raise ReviewAbort("Diff and changed regions exceed the review depth's max_model_tokens; review coverage is incomplete")
     return bundle
 
 
@@ -387,7 +387,7 @@ def claude_result(events, settings, bundle, strategy, head, *, validate_output=v
                 raise ReviewAbort("Invalid per-request Claude token receipt")
             input_tokens = sum(usage.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
             if input_tokens > settings["max_model_tokens"] - settings["max_output_tokens"]:
-                raise ReviewAbort("Claude request exceeded config.max_model_tokens; review incomplete")
+                raise ReviewAbort("Claude request exceeded the review depth's max_model_tokens; review incomplete")
             if usage.get("output_tokens", 0) > settings["max_output_tokens"]:
                 raise ReviewAbort("Claude request exceeded config.max_output_tokens; review incomplete")
         content = event_message(event).get("content", [])
@@ -486,7 +486,7 @@ def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHE
                validate_output=validate_schema, output_key="findings"):
     text = prompt or claude_prompt(bundle, strategy)
     if token_bound(text + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
-        raise ReviewAbort("Complete prompt exceeds config.max_model_tokens")
+        raise ReviewAbort("Complete prompt exceeds the review depth's max_model_tokens")
     try:
         result = subprocess.run(claude_args(settings, schema), input=text,
                                 cwd=head, env=clean_env(settings), capture_output=True, text=True,
@@ -731,7 +731,7 @@ def codex_progress(home, head, strict=False, model=None, request_limit=None, ign
                 # (protocol.rs TokenUsageInfo.last_token_usage).
                 if (request_limit is not None and type(last.get("input_tokens")) is int
                         and last["input_tokens"] > request_limit):
-                    raise ReviewAbort("Codex request exceeded config.max_model_tokens; review incomplete")
+                    raise ReviewAbort("Codex request exceeded the review depth's max_model_tokens; review incomplete")
                 total = (payload.get("info") or {}).get("total_token_usage", {})
                 tokens = total.get("total_tokens")
                 if request_limit is not None and pending_response:
@@ -867,7 +867,7 @@ def run_codex(settings, bundle, strategy, head, action, home, workspace, *, prom
     save(schema_path, schema)
     prompt = codex_prompt(bundle) if prompt is None else prompt
     if token_bound(prompt + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
-        raise ReviewAbort("Codex prompt exceeds config.max_model_tokens")
+        raise ReviewAbort("Codex prompt exceeds the review depth's max_model_tokens")
     output.with_suffix(".prompt").write_text(prompt)
     command = codex_command(settings, head, home, schema_path, output, action)
     earlier = frozenset(Path(home).glob("sessions/**/*.jsonl"))
