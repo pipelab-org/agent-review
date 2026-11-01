@@ -110,6 +110,10 @@ jobs:
         path: pr-head
         persist-credentials: false
         fetch-depth: 0
+    - name: Set up the Python version the pinned dependencies were hashed for
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
     - name: Install pinned engine dependencies
       run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
     - name: Prepare admitted snapshot
@@ -322,6 +326,10 @@ jobs:
         ref: ${{ steps.reply-source.outputs.reviewer_sha }}
         path: trusted-agent-review
         persist-credentials: 'false'
+    - name: Set up the Python version the pinned dependencies were hashed for
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
     - name: Install pinned engine dependencies before importing them
       run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
     - name: Resolve immutable default-branch policy and validate the loaded caller as data
@@ -745,6 +753,10 @@ jobs:
         path: pr-head
         persist-credentials: false
         fetch-depth: 0
+    - name: Set up the Python version the pinned dependencies were hashed for
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
     - name: Install pinned engine dependencies
       run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
     - name: Download this run's inference artifact
@@ -843,6 +855,10 @@ jobs:
         ref: ${{ steps.reply-source.outputs.reviewer_sha }}
         path: trusted-agent-review
         persist-credentials: 'false'
+    - name: Set up the Python version the pinned dependencies were hashed for
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
     - name: Install pinned engine dependencies before importing them
       run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
     - name: Resolve immutable default-branch policy and validate the loaded caller as data

@@ -200,15 +200,20 @@ class CallerTests(unittest.TestCase):
 
 
     def test_engine_dependencies_install_before_any_step_that_imports_them(self):
+        # Also requires the install to run on the Python version its hashes were resolved for.
         # Steps that import the pinned GitHub client (reply-policy resolution and review_jobs.py)
         # must follow the hash-pinned install in their job; otherwise the import fails and the
         # contract's fixed "Invalid review caller or profile" message hides the cause.
         checked = 0
         for name, job in WORKFLOW['jobs'].items():
-            installed = False
+            installed, pinned = False, None
             for step in job.get('steps', []):
                 run = step.get('run', '')
+                if step.get('uses', '').startswith('actions/setup-python@'):
+                    pinned = step.get('with', {}).get('python-version')
                 if 'pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt' in run:
+                    # Hashes are for one interpreter (requirements-runtime.txt header); runner images change it.
+                    self.assertEqual('3.12', pinned, f"{name}: install runs without the hashed Python version")
                     installed = True
                 if '--resolve-reply-policy' in run or 'trusted-agent-review/scripts/review_jobs.py' in run:
                     checked += 1
