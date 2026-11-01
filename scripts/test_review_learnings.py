@@ -4,6 +4,7 @@
 import copy
 import datetime as dt
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import yaml
 
 from scripts import review_engine as e, review_jobs as j, review_learnings as l, review_followups as f
 from scripts import test_review_engine as engine_tests, test_review_jobs as job_tests
+from scripts.test_review_followups import run_data, comments
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
@@ -337,6 +339,107 @@ class IntegrationTests(unittest.TestCase):
         expired, _ = j.context(policy, depth)
         self.assertFalse(f.same_policy(first, expired))
         self.assertTrue(f.same_policy(first, dict(first, head="e" * 40)))
+
+    def published_record(self, *, advance=False):
+        self.enable()
+        fx = self.fx
+        if advance:
+            proof, root = fx.prior_threads()
+        else:
+            fx.build([engine_tests.finding(path="app.py")])
+            j.publish_artifact(fx.artifact, fx.head_dir)
+            proof = json.loads((fx.root / "completion.json").read_text())
+            root = fx.pr.roots[0]
+        artifact = NS(name="agent-review-completion", expired=False)
+        run = NS(raw_data=run_data(proof), get_artifacts=lambda: [artifact])
+        patch.object(fx.repo, "get_workflow_run", return_value=run).start()
+        patch.object(f, "download_record", return_value=proof).start()
+        fx.pr.writes.clear()
+        return proof, root
+
+    def test_learnings_change_preserves_verification_ownership(self):
+        fx = self.fx
+        proof, root = self.published_record(advance=True)
+        snapshot(self.directory, sha="b" * 40)
+        policy, depth = j.settings()
+        ctx, _ = j.context(policy, depth)
+        self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
+        j.prepare(fx.head_dir, fx.plan)
+        plan = json.loads(fx.plan.read_text())
+        self.assertEqual([root.id], [t["root"]["id"] for t in plan["threads"]])
+        j.publish_verification(fx.repo, fx.pr, ctx, policy, plan, fx.verified(plan), fx.head_dir)
+        self.assertTrue(fx.pr.threads[root.id]["isResolved"])
+
+    def test_learnings_change_preserves_reply_and_resolve_ownership(self):
+        fx = self.fx
+        proof, root = self.published_record(advance=True)
+        snapshot(self.directory, sha="b" * 40)
+        for command in (False, True):
+            with self.subTest(command=command):
+                fx.pr.roots = [root]
+                fx.pr.threads[root.id]["isResolved"] = False
+                if command:
+                    fx.resolve_plan(proof, root)
+                else:
+                    fx.reply_plan(proof, root)
+                # Fixture event creation above mocks records; admission and
+                # publication below use the real ownership/artifact path.
+                j.prepare(fx.head_dir, fx.plan, reply=True)
+                plan = json.loads(fx.plan.read_text())
+                policy, depth = j.settings()
+                ctx, _ = j.context(policy, depth)
+                j.publish_reply(fx.repo, fx.pr, ctx, policy, plan,
+                                None if command else fx.answer(), fx.head_dir)
+                self.assertTrue(any(c.raw_data.get("in_reply_to_id") == root.id
+                                    and f.identity(c.user, f.BOT) for c in fx.pr.roots))
+                self.assertEqual(command, fx.pr.threads[root.id]["isResolved"])
+
+    def test_identical_review_skip_requires_same_learnings(self):
+        fx = self.fx
+        proof, _ = self.published_record()
+        j.prepare(fx.head_dir, fx.plan)
+        self.assertEqual("unchanged", json.loads(fx.plan.read_text())["scope"]["kind"])
+        for change in ("revision", "digest"):
+            with self.subTest(change=change):
+                snapshot(self.directory, sha="b" * 40) if change == "revision" else snapshot(
+                    self.directory, ENTRY.replace("This pattern is fine", "This pattern is documented"))
+                policy, depth = j.settings()
+                ctx, _ = j.context(policy, depth)
+                self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
+                j.prepare(fx.head_dir, fx.plan)
+                self.assertEqual("full", json.loads(fx.plan.read_text())["scope"]["kind"])
+
+    def test_ownership_still_rejects_other_identity_changes_and_malformed_records(self):
+        fx = self.fx
+        proof, _ = self.published_record()
+        policy, depth = j.settings()
+        ctx, _ = j.context(policy, depth)
+        self.assertEqual({123: proof}, j.records(fx.repo, fx.pr, ctx, policy, all_depths=True))
+        changes = {"repository": "other/project", "number": 2, "base": "0" * 40,
+                   "reviewer": "0" * 40, "profile_sha": "0" * 40, "profile_hash": "0" * 64,
+                   "common_config": "0" * 64, "depth": "deep", "models": ["different"]}
+        self.assertEqual(ctx.keys() - {"head", "learnings"}, changes.keys())
+        for key, value in changes.items():
+            changed = dict(ctx, **{key: value})
+            with self.subTest(key=key):
+                self.assertEqual({}, f.verified_records(fx.repo, fx.pr, changed, lambda a: proof,
+                                                       ownership=True))
+        for identity in (ctx["learnings"], None, {}, {"sha": "bad", "digest": "0" * 64},
+                         {"sha": SHA, "digest": "bad"}, dict(ctx["learnings"], extra="untrusted")):
+            broken = copy.deepcopy(proof)
+            broken["context"]["learnings"] = identity
+            # Rebuild consistent public markers so rejection tests the record
+            # shape, not a stale key or summary digest.
+            broken["summary"] = 8
+            broken["key"] = hashlib.sha256(json.dumps(broken["context"], sort_keys=True).encode()).hexdigest()
+            status, entries = comments(broken)
+            broken["digest"] = f.digest(entries[8].body)
+            status, entries = comments(broken)
+            with self.subTest(identity=identity), patch.object(
+                    fx.pr, "get_issue_comments", return_value=list(entries.values())):
+                expected = {123: broken} if identity == ctx["learnings"] else {}
+                self.assertEqual(expected, f.verified_records(fx.repo, fx.pr, ctx, lambda a: broken,
+                                                              ownership=True))
 
     def test_reply_prompt_includes_context_but_its_artifact_does_not(self):
         fx = self.fx

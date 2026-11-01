@@ -128,7 +128,8 @@ def records(repo, pr, ctx, policy, *, all_depths=False):
     if all_depths:
         contexts = [dict(ctx, depth=name, models=[engine.policy(name)["model"]]) for name in engine.DEPTHS]
     return followups.verified_records(repo, pr, ctx, lambda a:
-        followups.download_record(a, os.environ["GITHUB_TOKEN"], policy["ai_timeout"]), contexts=contexts)
+        followups.download_record(a, os.environ["GITHUB_TOKEN"], policy["ai_timeout"]), contexts=contexts,
+        ownership=all_depths)
 
 
 def prepare(head_dir, output, reply=False):
