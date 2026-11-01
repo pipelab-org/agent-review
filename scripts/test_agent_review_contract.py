@@ -199,6 +199,23 @@ class CallerTests(unittest.TestCase):
         self.assertTrue(WORKFLOW['jobs']['notify-failure']['if'].startswith('always() && ' + gate + ' && ('))
 
 
+    def test_engine_dependencies_install_before_any_step_that_imports_them(self):
+        # Steps that import the pinned GitHub client (reply-policy resolution and review_jobs.py)
+        # must follow the hash-pinned install in their job; otherwise the import fails and the
+        # contract's fixed "Invalid review caller or profile" message hides the cause.
+        checked = 0
+        for name, job in WORKFLOW['jobs'].items():
+            installed = False
+            for step in job.get('steps', []):
+                run = step.get('run', '')
+                if 'pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt' in run:
+                    installed = True
+                if '--resolve-reply-policy' in run or 'trusted-agent-review/scripts/review_jobs.py' in run:
+                    checked += 1
+                    self.assertTrue(installed, f"{name}: {step.get('name')} runs before the dependency install")
+        self.assertGreaterEqual(checked, 4)
+
+
 class SourceBindingTests(unittest.TestCase):
     """The helper must bind the engine checkout to this repository's loaded revision."""
 
