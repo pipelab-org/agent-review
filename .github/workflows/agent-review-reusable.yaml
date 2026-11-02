@@ -77,6 +77,7 @@ jobs:
       pull-requests: read
     outputs:
       learnings_identity: ${{ steps.plan.outputs.learnings_identity }}
+      learnings_revoke_failed: ${{ steps.learnings-revoke.outcome == 'failure' }}
     steps:
     - name: Check out trusted base at workspace root
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -117,10 +118,11 @@ jobs:
     - name: Check optional learnings credentials
       id: learnings-credentials
       env:
+        CLIENT_ID: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID }}
         APP_ID: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         APP_KEY: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
       run: |
-        if [[ -n "$APP_ID" && -n "$APP_KEY" ]]; then
+        if [[ -n "$APP_KEY" && ( -n "$CLIENT_ID" || -n "$APP_ID" ) ]]; then
           echo 'available=true' >> "$GITHUB_OUTPUT"
         else
           echo 'available=false' >> "$GITHUB_OUTPUT"
@@ -131,8 +133,11 @@ jobs:
       continue-on-error: true
       # https://github.com/actions/create-github-app-token/releases/tag/v3.3.0
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      # main.js:22 and lib/main.js:38 at the pinned action pass either ID as appId.
+      # Omit app-id entirely: the runner warns even for an empty deprecated input.
+      # https://github.com/actions/runner/blob/110142c2c501c6ae9373d553efa826bedbaab5f7/src/Runner.Worker/ActionRunner.cs#L189-L196
       with:
-        app-id: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        client-id: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID || secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         private-key: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
         owner: pipelab-org
         repositories: agent-review-learnings
@@ -153,17 +158,40 @@ jobs:
       run: python trusted-agent-review/scripts/review_learnings.py --fetch
     - name: Revoke the learnings installation token before inference
       id: learnings-revoke
-      if: ${{ always() && steps.learnings-token.outcome == 'success' }}
-      continue-on-error: true
+      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outcome == 'failure') }}
+      timeout-minutes: 1
       env:
         GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
+      # Operator policy: three attempts, 15 s per request, 2 s between attempts,
+      # and a 1 minute step ceiling (requests plus backoff take at most 49 s).
+      # GitHub's 10 s processing limit excludes transfer time:
+      # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#timeouts
+      # Only 204 confirms revocation in the endpoint contract; 401 is not confirmation:
       # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
       run: |
-        if gh api --method DELETE /installation/token >/dev/null 2>&1; then
-          echo 'Learnings token revoked.'
-        else
-          echo '::warning::Early learnings-token revoke failed before inference; review continues.'
+        # An attempted mint that failed may still hold a live token it never wrote to its
+        # output (the action receives the token before setOutput). No token to revoke means
+        # its state is unknown, so inference is refused rather than assumed safe.
+        if [[ -z "${GH_TOKEN:-}" ]]; then
+          echo '::error::Learnings token step failed without a token to revoke; inference refused.'
+          exit 1
         fi
+        for attempt in 1 2 3; do
+          # printf is a shell builtin and curl reads the header from stdin, so the token
+          # never appears in a process argument list.
+          if status="$(printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | curl --silent \
+              --output /dev/null --write-out '%{http_code}' --max-time 15 --request DELETE \
+              --header @- https://api.github.com/installation/token 2>/dev/null)" \
+              && [[ "$status" == 204 ]]; then
+            echo 'Learnings token revoked.'
+            exit 0
+          fi
+          if [[ "$attempt" != 3 ]]; then
+            sleep 2
+          fi
+        done
+        echo '::error::Learnings-token revocation unconfirmed; inference refused.'
+        exit 1
     - name: Check out immutable head as read-only data
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
@@ -333,6 +361,7 @@ jobs:
       pull-requests: read
     outputs:
       learnings_identity: ${{ steps.plan.outputs.learnings_identity }}
+      learnings_revoke_failed: ${{ steps.learnings-revoke.outcome == 'failure' }}
     steps:
     - name: Resolve trusted shared source before checkout
       id: reply-source
@@ -420,10 +449,11 @@ jobs:
     - name: Check optional learnings credentials
       id: learnings-credentials
       env:
+        CLIENT_ID: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID }}
         APP_ID: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         APP_KEY: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
       run: |
-        if [[ -n "$APP_ID" && -n "$APP_KEY" ]]; then
+        if [[ -n "$APP_KEY" && ( -n "$CLIENT_ID" || -n "$APP_ID" ) ]]; then
           echo 'available=true' >> "$GITHUB_OUTPUT"
         else
           echo 'available=false' >> "$GITHUB_OUTPUT"
@@ -434,8 +464,11 @@ jobs:
       continue-on-error: true
       # https://github.com/actions/create-github-app-token/releases/tag/v3.3.0
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      # main.js:22 and lib/main.js:38 at the pinned action pass either ID as appId.
+      # Omit app-id entirely: the runner warns even for an empty deprecated input.
+      # https://github.com/actions/runner/blob/110142c2c501c6ae9373d553efa826bedbaab5f7/src/Runner.Worker/ActionRunner.cs#L189-L196
       with:
-        app-id: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        client-id: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID || secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         private-key: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
         owner: pipelab-org
         repositories: agent-review-learnings
@@ -456,17 +489,40 @@ jobs:
       run: python trusted-agent-review/scripts/review_learnings.py --fetch
     - name: Revoke the learnings installation token before inference
       id: learnings-revoke
-      if: ${{ always() && steps.learnings-token.outcome == 'success' }}
-      continue-on-error: true
+      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outcome == 'failure') }}
+      timeout-minutes: 1
       env:
         GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
+      # Operator policy: three attempts, 15 s per request, 2 s between attempts,
+      # and a 1 minute step ceiling (requests plus backoff take at most 49 s).
+      # GitHub's 10 s processing limit excludes transfer time:
+      # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#timeouts
+      # Only 204 confirms revocation in the endpoint contract; 401 is not confirmation:
       # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
       run: |
-        if gh api --method DELETE /installation/token >/dev/null 2>&1; then
-          echo 'Learnings token revoked.'
-        else
-          echo '::warning::Early learnings-token revoke failed before inference; review continues.'
+        # An attempted mint that failed may still hold a live token it never wrote to its
+        # output (the action receives the token before setOutput). No token to revoke means
+        # its state is unknown, so inference is refused rather than assumed safe.
+        if [[ -z "${GH_TOKEN:-}" ]]; then
+          echo '::error::Learnings token step failed without a token to revoke; inference refused.'
+          exit 1
         fi
+        for attempt in 1 2 3; do
+          # printf is a shell builtin and curl reads the header from stdin, so the token
+          # never appears in a process argument list.
+          if status="$(printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | curl --silent \
+              --output /dev/null --write-out '%{http_code}' --max-time 15 --request DELETE \
+              --header @- https://api.github.com/installation/token 2>/dev/null)" \
+              && [[ "$status" == 204 ]]; then
+            echo 'Learnings token revoked.'
+            exit 0
+          fi
+          if [[ "$attempt" != 3 ]]; then
+            sleep 2
+          fi
+        done
+        echo '::error::Learnings-token revocation unconfirmed; inference refused.'
+        exit 1
     - name: Check out immutable head as read-only data
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
@@ -625,10 +681,12 @@ jobs:
     - admit
     - review
     - publish
+    - reply
     if: |-
-      always() && github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
+      always() && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
-          needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled')
+          needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled') ||
+          (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id) && needs.reply.outputs.learnings_revoke_failed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -641,6 +699,7 @@ jobs:
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         ADMISSION_RESULT: ${{ needs.admit.result }}
+        LEARNINGS_REVOKE_FAILED: ${{ needs.review.outputs.learnings_revoke_failed == 'true' || needs.reply.outputs.learnings_revoke_failed == 'true' }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-notifier/outcome.json
       shell: bash
       run: |
@@ -730,16 +789,24 @@ jobs:
             comment = event.get("comment", {})
             user = comment.get("user", {})
             issue = event.get("issue", {})
-            if not (os.environ["GITHUB_EVENT_NAME"] == "issue_comment" and event.get("action") == "created"
+            revoke_failed = os.environ.get("LEARNINGS_REVOKE_FAILED") == "true"
+            command = (os.environ["GITHUB_EVENT_NAME"] == "issue_comment"
                     and os.environ["GITHUB_ACTOR"] == "luckyPipewrench"
                     and os.environ["GITHUB_ACTOR_ID"] == "142104046"
-                    and os.environ["GITHUB_TRIGGERING_ACTOR"] == "luckyPipewrench"
-                    and os.environ["GITHUB_RUN_ATTEMPT"] == "1"
                     and user.get("login") == "luckyPipewrench" and user.get("id") == 142104046
-                    and user.get("type") == "User" and comment.get("author_association") == "MEMBER"
-                    and comment.get("body") in ("/review", "/review deep", "/review codex", "/review codex deep") and issue.get("pull_request")):
+                    and comment.get("author_association") == "MEMBER"
+                    and comment.get("body") in ("/review", "/review deep", "/review codex", "/review codex deep")
+                    and bool(issue.get("pull_request")))
+            inline = (os.environ["GITHUB_EVENT_NAME"] == "pull_request_review_comment"
+                    and revoke_failed and type(comment.get("in_reply_to_id")) is int
+                    and comment["in_reply_to_id"] > 0
+                    and os.environ["GITHUB_ACTOR"] == user.get("login"))
+            if not ((command or inline) and event.get("action") == "created"
+                    and os.environ["GITHUB_TRIGGERING_ACTOR"] == os.environ["GITHUB_ACTOR"]
+                    and os.environ["GITHUB_RUN_ATTEMPT"] == "1" and user.get("type") == "User"):
                 return
-            repo, number, run_id = os.environ["GITHUB_REPOSITORY"], issue.get("number"), os.environ["GITHUB_RUN_ID"]
+            number = event.get("pull_request", {}).get("number") if inline else issue.get("number")
+            repo, run_id = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"]
             if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
                     or repo != event.get("repository", {}).get("full_name")
                     or type(number) is not int or number <= 0
@@ -766,12 +833,21 @@ jobs:
             head, base = os.environ.get("REVIEW_HEAD", ""), os.environ.get("REVIEW_BASE", "")
             captured = bool(re.fullmatch(r"[0-9a-f]{40}", head) and re.fullmatch(r"[0-9a-f]{40}", base))
             marker = f"<!-- agent-review-notice:v1 run={run_id} -->"
-            if captured and (head != pr["head"]["sha"] or base != pr["base"]["sha"]):
-                message = "The requested diff review didn't complete because the commits changed. Post a new command on the current snapshot."
+            if revoke_failed:
+                message = ("The requested review didn't complete because learnings-token revocation couldn't be confirmed. "
+                           "Treat this run as incomplete.")
+            elif captured and (head != pr["head"]["sha"] or base != pr["base"]["sha"]):
+                message = "The requested diff review didn't complete because the commits changed."
             elif os.environ["ADMISSION_RESULT"] != "success" or not captured:
                 message = "The requested diff review never started. Treat this run as incomplete."
             else:
                 message = "The requested diff review didn't complete. Treat this run as incomplete."
+            # An inline question is answered again by a new thread reply; review commands
+            # are maintainer-only and start a whole-PR review instead.
+            if inline:
+                message += " Post a new reply in the review thread; Actions reruns are refused."
+            else:
+                message += " Post a fresh review command on the current snapshot; Actions reruns are refused."
             body = marker + "\n" + message
             if captured:
                 body += f"\n\nCaptured base `{base}` and head `{head}`."

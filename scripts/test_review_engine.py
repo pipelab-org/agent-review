@@ -426,6 +426,83 @@ class ClaudeTests(unittest.TestCase):
                 e.run_claude(POLICY, BUNDLE, "bundle", Path("/head"))
             self.assertEqual(1, run.call_count)
 
+    # Shapes recorded from the pinned CLI 2.1.312 against a fixture API (no model call).
+    def api_failure(self, error, status, extra=None):
+        assistant = {"type": "assistant", "error": error,
+                     "message": {"content": [{"type": "text", "text": "API Error: SECRET provider body"}]}}
+        result = {"type": "result", "subtype": "success", "is_error": True, "api_error_status": status,
+                  "terminal_reason": "api_error", "num_turns": 1, "result": "SECRET provider body",
+                  "errors": ["SECRET provider body"]}
+        result.update(extra or {})
+        return [assistant, result]
+
+    def test_nonzero_exit_names_the_recorded_claude_cause_without_provider_text(self):
+        from types import SimpleNamespace as NS
+        cases = {("rate_limit", 429): "Anthropic rate limit", ("server_error", 529): "Anthropic server error",
+                 ("authentication_failed", 401): "Anthropic rejected the API key",
+                 ("billing_error", 400): "Anthropic billing error"}
+        for (error, status), text in cases.items():
+            stdout = "\n".join(json.dumps(v) for v in self.api_failure(error, status)) + "\nnot json\n"
+            with self.subTest(error=error), patch.object(
+                    e.subprocess, "run", return_value=NS(returncode=1, stdout=stdout, stderr="SECRET")) as run:
+                with self.assertRaises(e.ReviewAbort) as raised:
+                    e.run_claude(POLICY, BUNDLE, "bundle", Path("/head"))
+                message = str(raised.exception)
+                self.assertEqual(1, run.call_count)
+                self.assertIn(text, message)
+                self.assertIn(f"error={error}, HTTP {status}", message)
+                self.assertIn("no paid retry", message)
+                self.assertNotIn("SECRET", message)
+
+    def test_failed_result_cause_precedence_and_bounds(self):
+        # The assistant classification wins over terminal_reason, which wins over subtype.
+        self.assertIn("error=rate_limit", e.claude_failure_cause(self.api_failure("rate_limit", 429)))
+        # A recoverable assistant error does not hide the reason the pass actually ended.
+        events = self.api_failure("max_output_tokens", None, {"terminal_reason": "max_turns", "subtype": "error_max_turns"})
+        self.assertIn("Claude reached max_turns (claude terminal_reason=max_turns)", e.claude_failure_cause(events))
+        events = self.api_failure("not-a-category", 429)
+        self.assertIn("terminal_reason=api_error, HTTP 429", e.claude_failure_cause(events))
+        events = [{"type": "result", "subtype": "error_max_turns", "is_error": True, "terminal_reason": "max_turns"}]
+        self.assertIn("Claude reached max_turns (claude terminal_reason=max_turns)", e.claude_failure_cause(events))
+        events = [{"type": "result", "subtype": "error_max_budget_usd", "is_error": True}]
+        self.assertIn("subtype=error_max_budget_usd", e.claude_failure_cause(events))
+        events = [{"type": "result", "subtype": "success", "is_error": True, "api_error_status": 503}]
+        self.assertIn("(claude api_error_status, HTTP 503)", e.claude_failure_cause(events))
+        # Out-of-range or non-integer statuses and unknown values classify nothing.
+        for status in (99, 600, "429", True, 429.0):
+            events = [{"type": "result", "subtype": "success", "is_error": True, "api_error_status": status}]
+            self.assertIsNone(e.claude_failure_cause(events), status)
+        for events in ([], None, "text", [1, "x", None], [{"type": "assistant", "error": "made_up"}],
+                       [{"type": "result", "terminal_reason": "made_up", "subtype": "made_up"}]):
+            self.assertIsNone(e.claude_failure_cause(events), events)
+        # Container-shaped categories classify nothing instead of raising (review round 1).
+        for bad in ([], {}, ["rate_limit"], {"rate_limit": 1}):
+            for events in ([{"type": "assistant", "error": bad}], [{"type": "result", "terminal_reason": bad}],
+                           [{"type": "result", "subtype": bad}]):
+                self.assertIsNone(e.claude_failure_cause(events), events)
+        from types import SimpleNamespace as NS
+        stdout = json.dumps({"type": "assistant", "error": []}) + "\n" + json.dumps({"type": "result", "subtype": {}})
+        with patch.object(e.subprocess, "run", return_value=NS(returncode=1, stdout=stdout, stderr="")):
+            with self.assertRaisesRegex(e.ReviewAbort, "^Claude API/turn/budget/output failure"):
+                e.run_claude(POLICY, BUNDLE, "bundle", Path("/head"))
+        self.assertEqual([{"a": 1}], e.lenient_events('{"a": 1}\n{broken\n\n'))
+        self.assertEqual([], e.lenient_events(None))
+
+    def test_unclassified_failures_keep_the_fixed_messages(self):
+        from types import SimpleNamespace as NS
+        with patch.object(e.subprocess, "run", return_value=NS(returncode=1, stdout="garbage", stderr="")):
+            with self.assertRaisesRegex(e.ReviewAbort, "^Claude API/turn/budget/output failure"):
+                e.run_claude(POLICY, BUNDLE, "bundle", Path("/head"))
+        events = transcript(); events[-1]["subtype"] = "made_up"
+        with self.assertRaisesRegex(e.ReviewAbort, "^Claude stopped on a turn/budget/API/output limit"):
+            e.claude_result(events, POLICY, BUNDLE, "bundle", Path("/head"))
+
+    def test_failed_result_in_a_clean_exit_names_its_cause(self):
+        events = transcript()
+        events[-1].update(subtype="error_max_budget_usd", is_error=True, terminal_reason="budget_exhausted")
+        with self.assertRaisesRegex(e.ReviewAbort, r"max_budget_usd \(claude terminal_reason=budget_exhausted\)"):
+            e.claude_result(events, POLICY, BUNDLE, "bundle", Path("/head"))
+
 
 class CoverageTests(unittest.TestCase):
     def test_unopened_region_files_are_reported_not_refused(self):

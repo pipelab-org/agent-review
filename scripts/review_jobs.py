@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 
 try:
     from . import review_engine as engine, review_followups as followups, review_publish as publish
@@ -313,6 +314,11 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
                 verification = engine.run_codex(policy, {"files": []}, "verify-threads", head_dir,
                     action, codex_home, Path(output).parent / "verification", **kwargs)
             verification["output"] = validate_verification_result(verification, plan["threads"], policy, head_dir, ctx["head"])
+        except engine.ReviewAbort as error:
+            # ReviewAbort text is fixed engine wording, never provider output.
+            verification = None
+            print(FOLLOWUP_NOTE)
+            print(f"Thread verification stopped: {error}", file=sys.stderr)
         except Exception:
             verification = None
             print(FOLLOWUP_NOTE)

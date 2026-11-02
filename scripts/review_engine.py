@@ -397,6 +397,88 @@ def event_message(event):
     return message if isinstance(message, dict) else {}
 
 
+# Claude Code's own error classification, never provider text. Field names and values:
+# SDKAssistantMessage.error (SDKAssistantMessageError), SDKResultMessage.api_error_status,
+# terminal_reason and subtype in https://code.claude.com/docs/en/agent-sdk/typescript.
+# The pinned CLI 2.1.312 labels HTTP 529 server_error, so the status is reported too.
+CLAUDE_ERROR_CAUSES = {
+    "authentication_failed": "Anthropic rejected the API key; check the ANTHROPIC_API_KEY secret",
+    "oauth_org_not_allowed": "Anthropic refused this organization for the credential",
+    "account_on_hold": "Anthropic account is on hold; check the provider account",
+    "billing_error": "Anthropic billing error, such as a low credit balance; check the provider account",
+    "rate_limit": "Anthropic rate limit; request the review again after it resets",
+    "overloaded": "Anthropic API overloaded; request the review again later",
+    "invalid_request": "Anthropic rejected the request",
+    "model_not_found": "configured Claude model is unavailable to this Anthropic key",
+    "server_error": "Anthropic server error; request the review again",
+    "max_output_tokens": "Claude reached max_output_tokens",
+    "cloud_credential_error": "cloud provider credential error; check the provider account",
+    "unknown": "unclassified Claude API error; inspect the Actions log",
+}
+CLAUDE_TERMINAL_CAUSES = {
+    "max_turns": "Claude reached max_turns",
+    "budget_exhausted": "Claude reached max_budget_usd",
+    "prompt_too_long": "Claude prompt exceeded the model context",
+    "structured_output_retry_exhausted": "Claude did not return schema-valid output",
+    "malformed_tool_use_exhausted": "Claude kept making malformed tool calls",
+    "api_error": "Claude API error; inspect the provider account",
+    "model_error": "Claude model error; request the review again",
+    "blocking_limit": "Claude stopped at a blocking limit",
+}
+CLAUDE_SUBTYPE_CAUSES = {
+    "error_max_turns": "Claude reached max_turns",
+    "error_max_budget_usd": "Claude reached max_budget_usd",
+    "error_max_structured_output_retries": "Claude did not return schema-valid output",
+    "error_during_execution": "Claude stopped with an execution error",
+}
+
+
+def claude_failure_cause(events):
+    """A fixed operator message from the pass's recorded classification, or None; never raises."""
+    def known(value, causes):
+        # Only a string can name a category; any other shape classifies nothing.
+        return value if isinstance(value, str) and value in causes else None
+
+    error = terminal = subtype = status = None
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "assistant" and known(event.get("error"), CLAUDE_ERROR_CAUSES):
+            error = event["error"]
+        if event.get("type") == "result":
+            code = event.get("api_error_status")
+            status = code if type(code) is int and 100 <= code <= 599 else None
+            terminal = known(event.get("terminal_reason"), CLAUDE_TERMINAL_CAUSES)
+            subtype = known(event.get("subtype"), CLAUDE_SUBTYPE_CAUSES)
+    # A specific assistant category explains an API stop; any other recorded terminal
+    # reason is why the pass actually ended, even after a recoverable assistant error.
+    if terminal and terminal != "api_error":
+        text, label = CLAUDE_TERMINAL_CAUSES[terminal], f"terminal_reason={terminal}"
+    elif error:
+        text, label = CLAUDE_ERROR_CAUSES[error], f"error={error}"
+    elif terminal:
+        text, label = CLAUDE_TERMINAL_CAUSES[terminal], f"terminal_reason={terminal}"
+    elif subtype:
+        text, label = CLAUDE_SUBTYPE_CAUSES[subtype], f"subtype={subtype}"
+    elif status:
+        text, label = "Claude API error; inspect the provider account", "api_error_status"
+    else:
+        return None
+    suffix = f", HTTP {status}" if status else ""
+    return f"{text} (claude {label}{suffix}); no paid retry"
+
+
+def lenient_events(stdout):
+    """Parse what a failed pass printed; malformed lines carry no classification."""
+    events = []
+    for line in (stdout or "").splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
 def claude_result(events, settings, bundle, strategy, head, *, validate_output=validate_schema,
                   output_key="findings"):
     results = [e for e in events if e.get("type") == "result"]
@@ -404,7 +486,8 @@ def claude_result(events, settings, bundle, strategy, head, *, validate_output=v
         raise ReviewAbort("Claude result missing, extra, or truncated; inspect provider output")
     final = results[0]
     if final.get("subtype") != "success" or final.get("is_error") is not False:
-        raise ReviewAbort("Claude stopped on a turn/budget/API/output limit; inspect max_turns and max_budget_usd")
+        raise ReviewAbort(claude_failure_cause(events)
+                          or "Claude stopped on a turn/budget/API/output limit; inspect max_turns and max_budget_usd")
     model = settings["model"].removeprefix("anthropic/")
     if model not in final.get("modelUsage", {}):
         raise ReviewAbort("Claude transcript does not attest the configured model")
@@ -526,7 +609,8 @@ def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHE
     except subprocess.TimeoutExpired:
         raise ReviewAbort("Provider timed out at config.ai_timeout; no paid retry") from None
     if result.returncode:
-        raise ReviewAbort("Claude API/turn/budget/output failure; inspect approved limits and provider account")
+        raise ReviewAbort(claude_failure_cause(lenient_events(result.stdout))
+                          or "Claude API/turn/budget/output failure; inspect approved limits and provider account")
     events = [strict_json(line) for line in result.stdout.splitlines() if line.strip()]
     if not events or any(not isinstance(e, dict) for e in events):
         raise ReviewAbort("Invalid Claude transcript")
