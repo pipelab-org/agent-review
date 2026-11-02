@@ -196,7 +196,9 @@ class CallerTests(unittest.TestCase):
         gate = WORKFLOW['jobs']['admit']['if']
         reply_gate = WORKFLOW['jobs']['reply']['if']
         self.assertEqual(f'({gate}) || ({reply_gate})', WORKFLOW['jobs']['source']['if'])
-        self.assertTrue(WORKFLOW['jobs']['notify-failure']['if'].startswith('always() && ' + gate + ' && ('))
+        condition = WORKFLOW['jobs']['notify-failure']['if']
+        self.assertTrue(condition.startswith('always() && ((' + gate + ') && ('))
+        self.assertTrue(condition.endswith("(" + reply_gate + ") && needs.reply.outputs.learnings_revoke_failed == 'true')"))
 
 
     def test_engine_dependencies_install_before_any_step_that_imports_them(self):
@@ -381,6 +383,7 @@ class ReporterTests(unittest.TestCase):
                     'GITHUB_ACTOR_ID': '142104046', 'GITHUB_TRIGGERING_ACTOR': 'luckyPipewrench',
                     'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_RUN_ID': '123', 'GH_TOKEN': 'fixture',
                     'REVIEW_HEAD': 'a' * 40, 'REVIEW_BASE': 'b' * 40, 'ADMISSION_RESULT': 'success',
+                    'LEARNINGS_REVOKE_FAILED': 'false',
                     'REVIEW_OUTCOME_PATH': str(Path(self.temp.name).resolve() / 'notifier' / 'outcome.json'),
                     'GITHUB_STEP_SUMMARY': str(Path(self.temp.name).resolve() / 'summary.md')}
         self.pr = {'state': 'open', 'head': {'repo': {'full_name': 'example/project', 'fork': False}, 'sha': 'a' * 40},
@@ -410,7 +413,7 @@ class ReporterTests(unittest.TestCase):
 
     def test_reporter_is_host_only_and_minimally_privileged(self):
         job = WORKFLOW['jobs']['notify-failure']
-        self.assertEqual(['source', 'admit', 'review', 'publish'], job['needs'])
+        self.assertEqual(['source', 'admit', 'review', 'publish', 'reply'], job['needs'])
         self.assertIn('always()', job['if'])
         self.assertEqual({'pull-requests': 'write'}, job['permissions'])
         self.assertNotIn('container', job)
@@ -442,6 +445,59 @@ class ReporterTests(unittest.TestCase):
         self.comments[0]['user']['login'] = 'contributor'
         self.execute()
         self.assertEqual('POST', self.calls[-1][0])
+
+    def test_revoke_failure_notifies_commands_and_inline_replies_with_fixed_text(self):
+        env = WORKFLOW['jobs']['notify-failure']['steps'][0]['env']
+        self.assertEqual("${{ needs.review.outputs.learnings_revoke_failed == 'true' || needs.reply.outputs.learnings_revoke_failed == 'true' }}",
+                         env['LEARNINGS_REVOKE_FAILED'])
+        self.env['LEARNINGS_REVOKE_FAILED'] = 'true'
+        self.execute()
+        command_body = self.calls[-1][2]['body']
+        self.assertIn("revocation couldn't be confirmed", command_body)
+        self.assertIn('incomplete', command_body)
+        self.assertIn('Post a fresh review command; Actions reruns are refused.', command_body)
+        self.event.pop('issue')
+        self.event['pull_request'] = {'number': 1}
+        self.event['comment'].update(in_reply_to_id=8, body='SENTINEL_private_text')
+        self.event['comment']['user']['login'] = 'contributor'
+        self.env.update(GITHUB_EVENT_NAME='pull_request_review_comment', GITHUB_ACTOR='contributor',
+                        GITHUB_TRIGGERING_ACTOR='contributor', REVIEW_HEAD='', REVIEW_BASE='')
+        self.calls.clear()
+        self.execute()
+        self.assertEqual('POST', self.calls[-1][0])
+        self.assertIn("revocation couldn't be confirmed", self.calls[-1][2]['body'])
+        self.assertIn('Post a fresh review command', self.calls[-1][2]['body'])
+        self.assertNotIn('SENTINEL_private_text', self.calls[-1][2]['body'])
+        for field, value in (('LEARNINGS_REVOKE_FAILED', 'false'), ('GITHUB_RUN_ATTEMPT', '2'),
+                             ('GITHUB_TRIGGERING_ACTOR', 'other'), ('GITHUB_ACTOR', 'other')):
+            with self.subTest(field=field):
+                previous = self.env[field]
+                self.env[field] = value
+                self.calls.clear()
+                self.execute()
+                self.assertEqual([], self.calls)
+                self.env[field] = previous
+        self.env.update(GITHUB_ACTOR='other', GITHUB_TRIGGERING_ACTOR='other')
+        self.calls.clear()
+        self.execute()
+        self.assertEqual([], self.calls)
+        self.env.update(GITHUB_ACTOR='contributor', GITHUB_TRIGGERING_ACTOR='contributor')
+        for parent in (None, True, 0, -1, "8"):
+            with self.subTest(parent=parent):
+                self.event['comment']['in_reply_to_id'] = parent
+                self.calls.clear()
+                self.execute()
+                self.assertEqual([], self.calls)
+        self.event['comment']['in_reply_to_id'] = 8
+        self.event['action'] = 'edited'
+        self.calls.clear()
+        self.execute()
+        self.assertEqual([], self.calls)
+        self.event['action'] = 'created'
+        self.event['comment']['user']['type'] = 'Bot'
+        self.calls.clear()
+        self.execute()
+        self.assertEqual([], self.calls)
 
     def test_admission_and_stale_snapshot_have_fixed_messages(self):
         self.env.update(REVIEW_HEAD='', REVIEW_BASE='', ADMISSION_RESULT='failure')
