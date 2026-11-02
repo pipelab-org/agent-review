@@ -158,7 +158,7 @@ jobs:
       run: python trusted-agent-review/scripts/review_learnings.py --fetch
     - name: Revoke the learnings installation token before inference
       id: learnings-revoke
-      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outputs.token != '') }}
+      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outcome == 'failure') }}
       timeout-minutes: 1
       env:
         GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
@@ -169,6 +169,13 @@ jobs:
       # Only 204 confirms revocation in the endpoint contract; 401 is not confirmation:
       # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
       run: |
+        # An attempted mint that failed may still hold a live token it never wrote to its
+        # output (the action receives the token before setOutput). No token to revoke means
+        # its state is unknown, so inference is refused rather than assumed safe.
+        if [[ -z "${GH_TOKEN:-}" ]]; then
+          echo '::error::Learnings token step failed without a token to revoke; inference refused.'
+          exit 1
+        fi
         for attempt in 1 2 3; do
           # printf is a shell builtin and curl reads the header from stdin, so the token
           # never appears in a process argument list.
@@ -482,7 +489,7 @@ jobs:
       run: python trusted-agent-review/scripts/review_learnings.py --fetch
     - name: Revoke the learnings installation token before inference
       id: learnings-revoke
-      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outputs.token != '') }}
+      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outcome == 'failure') }}
       timeout-minutes: 1
       env:
         GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
@@ -493,6 +500,13 @@ jobs:
       # Only 204 confirms revocation in the endpoint contract; 401 is not confirmation:
       # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
       run: |
+        # An attempted mint that failed may still hold a live token it never wrote to its
+        # output (the action receives the token before setOutput). No token to revoke means
+        # its state is unknown, so inference is refused rather than assumed safe.
+        if [[ -z "${GH_TOKEN:-}" ]]; then
+          echo '::error::Learnings token step failed without a token to revoke; inference refused.'
+          exit 1
+        fi
         for attempt in 1 2 3; do
           # printf is a shell builtin and curl reads the header from stdin, so the token
           # never appears in a process argument list.

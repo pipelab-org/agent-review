@@ -1003,12 +1003,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("skip-token-revoke", token["with"])
             self.assertNotIn("continue-on-error", revoke)
             self.assertEqual("1", revoke["timeout-minutes"])
-            self.assertEqual("${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outputs.token != '') }}", revoke["if"])
+            self.assertEqual("${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outcome == 'failure') }}", revoke["if"])
             self.assertEqual("${{ steps.learnings-revoke.outcome == 'failure' }}",
                              self.workflow()["jobs"][name]["outputs"]["learnings_revoke_failed"])
             self.assertIn("always()", revoke["if"])
             self.assertIn("steps.learnings-token.outcome == 'success'", revoke["if"])
-            self.assertIn("steps.learnings-token.outputs.token != ''", revoke["if"])
+            self.assertIn("steps.learnings-token.outcome == 'failure'", revoke["if"])
             self.assertEqual(steps.index(fetch) + 1, steps.index(revoke))
             consumers = [s for s in steps if s.get("with", {}).get("path") == "pr-head"
                          or "review_jobs.py infer " in s.get("run", "")]
@@ -1051,6 +1051,7 @@ sys.exit(code)
                     ("wrong-success", [[0, "200"]], 1, 3),
                     ("timeout", [[28, "000"]], 1, 3),
                     ("transport-with-204", [[28, "204"]], 1, 3),
+                    ("failed-mint-no-token", [[0, "204"]], 1, 0),
                 )
                 for label, replies, expected, count in cases:
                     with self.subTest(job=name, case=label):
@@ -1058,12 +1059,13 @@ sys.exit(code)
                         call.unlink(missing_ok=True)
                         backoff.unlink(missing_ok=True)
                         env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
-                               "GH_TOKEN": "SENTINEL_revoke_token", "REVOKE_CALL": str(call),
+                               "GH_TOKEN": "" if label == "failed-mint-no-token" else "SENTINEL_revoke_token",
+                               "REVOKE_CALL": str(call),
                                "REVOKE_BACKOFF": str(backoff), "REVOKE_REPLIES": json.dumps(replies)}
                         result = subprocess.run(["bash", "-euo", "pipefail", "-c", revoke["run"]],
                                                 env=env, capture_output=True, text=True, timeout=5)
                         self.assertEqual(expected, result.returncode, result.stderr)
-                        calls = json.loads(call.read_text())
+                        calls = json.loads(call.read_text()) if call.exists() else []
                         self.assertEqual(count, len(calls), "retry count must be bounded")
                         for recorded in calls:
                             # The token travels on stdin, never in the argument list.
@@ -1073,7 +1075,9 @@ sys.exit(code)
                             self.assertEqual("Authorization: Bearer SENTINEL_revoke_token\n", recorded["stdin"])
                         self.assertEqual(["2"] * (count - 1),
                                          backoff.read_text().splitlines() if backoff.exists() else [])
-                        self.assertIn("::error::Learnings-token revocation unconfirmed; inference refused."
+                        self.assertIn("::error::Learnings token step failed without a token to revoke; inference refused."
+                                      if label == "failed-mint-no-token" else
+                                      "::error::Learnings-token revocation unconfirmed; inference refused."
                                       if expected else "Learnings token revoked.", result.stdout)
                         for denied in ("SENTINEL_revoke_token", "SENTINEL_provider_detail"):
                             self.assertNotIn(denied, result.stdout + result.stderr)
@@ -1102,8 +1106,9 @@ sys.exit(code)
             self.assertEqual("steps.learnings-credentials.outputs.available == 'true'", mint["if"])
             self.assertEqual("true", mint["continue-on-error"])
             # GitHub gives a failed continue-on-error step outcome=failure, conclusion=success.
-            # A failed or skipped mint runs revocation only if it still left a token.
-            self.assertEqual("${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outputs.token != '') }}", revoke["if"])
+            # An attempted mint (success or failure) always reaches revocation; a skipped mint
+            # (no credentials) never does. A failed mint without a token refuses inference.
+            self.assertEqual("${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outcome == 'failure') }}", revoke["if"])
 
     def test_client_id_uses_caller_variable_with_legacy_id_fallback_and_no_deprecated_input(self):
         jobs = self.workflow()["jobs"]
