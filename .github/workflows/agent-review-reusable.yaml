@@ -422,6 +422,12 @@ jobs:
         python-version: '3.12'
     - name: Install pinned engine dependencies before importing them
       run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
+    - name: Refuse a reply that is not an exact /ask or /resolve command
+      # Expressions compare case-insensitively, so the job gate also admits typos such
+      # as /ASK. Refuse them here, before any token is minted or revoked.
+      env:
+        REPLY_BODY: ${{ github.event.comment.body }}
+      run: python -c "import os, sys; sys.path.insert(0, 'trusted-agent-review/scripts'); import review_followups as f; sys.exit(0 if f.reply_command(os.environ['REPLY_BODY'])[0] else 'Reply is not an /ask or /resolve command')"
     - name: Resolve immutable default-branch policy and validate the loaded caller as data
       id: policy
       env:
@@ -845,7 +851,7 @@ jobs:
             # An inline question is answered again by a new thread reply; review commands
             # are maintainer-only and start a whole-PR review instead.
             if inline:
-                message += " Post a new reply in the review thread; Actions reruns are refused."
+                message += " Reply /ask in the review thread to retry; Actions reruns are refused."
             else:
                 message += " Post a fresh review command on the current snapshot; Actions reruns are refused."
             body = marker + "\n" + message

@@ -46,11 +46,13 @@ def reply_command(body):
     """Return ("resolve", "") or ("ask", question) for an inline reply, else (None, "").
 
     Only these two commands do anything; any other reply text is ignored, so a
-    plain reply never starts a paid answer. Both are case-sensitive and must
-    start the trimmed reply, like CodeRabbit's thread commands
-    (https://docs.coderabbit.ai/reference/review-commands).
+    plain reply never starts a paid answer. Both are case-sensitive and must be
+    the first characters of the reply, like CodeRabbit's thread commands
+    (https://docs.coderabbit.ai/reference/review-commands). Only trailing
+    whitespace is ignored, so this grammar and the reusable workflow's
+    startsWith gate select the same replies.
     """
-    text = body.strip() if isinstance(body, str) else ""
+    text = body.rstrip() if isinstance(body, str) else ""
     if text == "/resolve":
         return "resolve", ""
     if text == ASK or (text.startswith(ASK) and text[len(ASK)].isspace()):

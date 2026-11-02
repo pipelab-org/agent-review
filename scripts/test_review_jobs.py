@@ -1151,7 +1151,7 @@ class JobTests(unittest.TestCase):
         proof, root = self.prior_threads(outdated=False)
         # An explicit request may resolve a live or previously judged thread.
         self.pr.create_review_comment_reply(root.id, f.verification_marker(root.id, self.pr.head.sha) + "\nEvidence")
-        plan = self.resolve_plan(proof, root, " \n/resolve\t ")
+        plan = self.resolve_plan(proof, root, "/resolve\t \n")
         with patch.object(j, "records", return_value={123: proof}), \
                 patch.object(j, "reconstruct_root", side_effect=AssertionError("command does not judge findings")):
             j.prepare(self.head_dir, self.plan, reply=True)
@@ -1205,7 +1205,8 @@ class JobTests(unittest.TestCase):
         # Only an exact /resolve or a /ask reply does anything; other text is refused
         # before ownership work or inference, so it can never buy an answer.
         for body in ("/Resolve", "/resolve please", "please /resolve", "/resolve\nplease",
-                     "Thanks, fixed in the next commit.", "/Ask why", "/askwhy", "please /ask why"):
+                     "Thanks, fixed in the next commit.", "/Ask why", "/askwhy", "please /ask why",
+                     " /resolve", " /ask why"):
             self.pr.roots = [root]
             with patch.object(e, "run_claude") as claude, patch.object(e, "run_codex") as codex,                     self.assertRaisesRegex(f.FollowupAbort, "not an /ask or /resolve command"):
                 self.resolve_plan(proof, root, body)
@@ -1219,7 +1220,7 @@ class JobTests(unittest.TestCase):
     def test_ask_question_reaches_the_prompt_without_the_command(self):
         proof, root = self.prior_threads()
         for body, question in (("/ask Which state is lost?", "Which state is lost?"),
-                               (" /ask\n  Is line 3 still wrong? ", "Is line 3 still wrong?"),
+                               ("/ask\n  Is line 3 still wrong? ", "Is line 3 still wrong?"),
                                ("/ask", f.DEFAULT_QUESTION)):
             self.pr.roots = [root]
             plan = self.resolve_plan(proof, root, body)
