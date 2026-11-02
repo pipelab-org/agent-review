@@ -158,7 +158,7 @@ jobs:
       run: python trusted-agent-review/scripts/review_learnings.py --fetch
     - name: Revoke the learnings installation token before inference
       id: learnings-revoke
-      if: ${{ always() && steps.learnings-token.outcome == 'success' }}
+      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outputs.token != '') }}
       timeout-minutes: 1
       env:
         GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
@@ -170,10 +170,12 @@ jobs:
       # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
       run: |
         for attempt in 1 2 3; do
-          if status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-              --max-time 15 --request DELETE \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              https://api.github.com/installation/token 2>/dev/null)" && [[ "$status" == 204 ]]; then
+          # printf is a shell builtin and curl reads the header from stdin, so the token
+          # never appears in a process argument list.
+          if status="$(printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | curl --silent \
+              --output /dev/null --write-out '%{http_code}' --max-time 15 --request DELETE \
+              --header @- https://api.github.com/installation/token 2>/dev/null)" \
+              && [[ "$status" == 204 ]]; then
             echo 'Learnings token revoked.'
             exit 0
           fi
@@ -480,7 +482,7 @@ jobs:
       run: python trusted-agent-review/scripts/review_learnings.py --fetch
     - name: Revoke the learnings installation token before inference
       id: learnings-revoke
-      if: ${{ always() && steps.learnings-token.outcome == 'success' }}
+      if: ${{ always() && (steps.learnings-token.outcome == 'success' || steps.learnings-token.outputs.token != '') }}
       timeout-minutes: 1
       env:
         GH_TOKEN: ${{ steps.learnings-token.outputs.token }}
@@ -492,10 +494,12 @@ jobs:
       # https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
       run: |
         for attempt in 1 2 3; do
-          if status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-              --max-time 15 --request DELETE \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              https://api.github.com/installation/token 2>/dev/null)" && [[ "$status" == 204 ]]; then
+          # printf is a shell builtin and curl reads the header from stdin, so the token
+          # never appears in a process argument list.
+          if status="$(printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | curl --silent \
+              --output /dev/null --write-out '%{http_code}' --max-time 15 --request DELETE \
+              --header @- https://api.github.com/installation/token 2>/dev/null)" \
+              && [[ "$status" == 204 ]]; then
             echo 'Learnings token revoked.'
             exit 0
           fi
@@ -819,12 +823,17 @@ jobs:
                 message = ("The requested review didn't complete because learnings-token revocation couldn't be confirmed. "
                            "Treat this run as incomplete.")
             elif captured and (head != pr["head"]["sha"] or base != pr["base"]["sha"]):
-                message = "The requested diff review didn't complete because the commits changed. Post a new command on the current snapshot."
+                message = "The requested diff review didn't complete because the commits changed."
             elif os.environ["ADMISSION_RESULT"] != "success" or not captured:
                 message = "The requested diff review never started. Treat this run as incomplete."
             else:
                 message = "The requested diff review didn't complete. Treat this run as incomplete."
-            message += " Post a fresh review command; Actions reruns are refused."
+            # An inline question is answered again by a new thread reply; review commands
+            # are maintainer-only and start a whole-PR review instead.
+            if inline:
+                message += " Post a new reply in the review thread; Actions reruns are refused."
+            else:
+                message += " Post a fresh review command on the current snapshot; Actions reruns are refused."
             body = marker + "\n" + message
             if captured:
                 body += f"\n\nCaptured base `{base}` and head `{head}`."

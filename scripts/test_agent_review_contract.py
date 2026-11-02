@@ -455,7 +455,7 @@ class ReporterTests(unittest.TestCase):
         command_body = self.calls[-1][2]['body']
         self.assertIn("revocation couldn't be confirmed", command_body)
         self.assertIn('incomplete', command_body)
-        self.assertIn('Post a fresh review command; Actions reruns are refused.', command_body)
+        self.assertIn('Post a fresh review command on the current snapshot; Actions reruns are refused.', command_body)
         self.event.pop('issue')
         self.event['pull_request'] = {'number': 1}
         self.event['comment'].update(in_reply_to_id=8, body='SENTINEL_private_text')
@@ -466,7 +466,8 @@ class ReporterTests(unittest.TestCase):
         self.execute()
         self.assertEqual('POST', self.calls[-1][0])
         self.assertIn("revocation couldn't be confirmed", self.calls[-1][2]['body'])
-        self.assertIn('Post a fresh review command', self.calls[-1][2]['body'])
+        self.assertIn('Post a new reply in the review thread; Actions reruns are refused.', self.calls[-1][2]['body'])
+        self.assertNotIn('review command', self.calls[-1][2]['body'])
         self.assertNotIn('SENTINEL_private_text', self.calls[-1][2]['body'])
         for field, value in (('LEARNINGS_REVOKE_FAILED', 'false'), ('GITHUB_RUN_ATTEMPT', '2'),
                              ('GITHUB_TRIGGERING_ACTOR', 'other'), ('GITHUB_ACTOR', 'other')):

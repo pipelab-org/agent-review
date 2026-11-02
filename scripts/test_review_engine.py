@@ -457,6 +457,9 @@ class ClaudeTests(unittest.TestCase):
     def test_failed_result_cause_precedence_and_bounds(self):
         # The assistant classification wins over terminal_reason, which wins over subtype.
         self.assertIn("error=rate_limit", e.claude_failure_cause(self.api_failure("rate_limit", 429)))
+        # A recoverable assistant error does not hide the reason the pass actually ended.
+        events = self.api_failure("max_output_tokens", None, {"terminal_reason": "max_turns", "subtype": "error_max_turns"})
+        self.assertIn("Claude reached max_turns (claude terminal_reason=max_turns)", e.claude_failure_cause(events))
         events = self.api_failure("not-a-category", 429)
         self.assertIn("terminal_reason=api_error, HTTP 429", e.claude_failure_cause(events))
         events = [{"type": "result", "subtype": "error_max_turns", "is_error": True, "terminal_reason": "max_turns"}]

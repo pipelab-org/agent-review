@@ -450,7 +450,11 @@ def claude_failure_cause(events):
             status = code if type(code) is int and 100 <= code <= 599 else None
             terminal = known(event.get("terminal_reason"), CLAUDE_TERMINAL_CAUSES)
             subtype = known(event.get("subtype"), CLAUDE_SUBTYPE_CAUSES)
-    if error:
+    # A specific assistant category explains an API stop; any other recorded terminal
+    # reason is why the pass actually ended, even after a recoverable assistant error.
+    if terminal and terminal != "api_error":
+        text, label = CLAUDE_TERMINAL_CAUSES[terminal], f"terminal_reason={terminal}"
+    elif error:
         text, label = CLAUDE_ERROR_CAUSES[error], f"error={error}"
     elif terminal:
         text, label = CLAUDE_TERMINAL_CAUSES[terminal], f"terminal_reason={terminal}"
