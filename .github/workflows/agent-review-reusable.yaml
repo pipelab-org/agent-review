@@ -118,10 +118,11 @@ jobs:
     - name: Check optional learnings credentials
       id: learnings-credentials
       env:
+        CLIENT_ID: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID }}
         APP_ID: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         APP_KEY: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
       run: |
-        if [[ -n "$APP_ID" && -n "$APP_KEY" ]]; then
+        if [[ -n "$APP_KEY" && ( -n "$CLIENT_ID" || -n "$APP_ID" ) ]]; then
           echo 'available=true' >> "$GITHUB_OUTPUT"
         else
           echo 'available=false' >> "$GITHUB_OUTPUT"
@@ -132,8 +133,11 @@ jobs:
       continue-on-error: true
       # https://github.com/actions/create-github-app-token/releases/tag/v3.3.0
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      # main.js:22 and lib/main.js:38 at the pinned action pass either ID as appId.
+      # Omit app-id entirely: the runner warns even for an empty deprecated input.
+      # https://github.com/actions/runner/blob/110142c2c501c6ae9373d553efa826bedbaab5f7/src/Runner.Worker/ActionRunner.cs#L189-L196
       with:
-        app-id: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        client-id: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID || secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         private-key: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
         owner: pipelab-org
         repositories: agent-review-learnings
@@ -436,10 +440,11 @@ jobs:
     - name: Check optional learnings credentials
       id: learnings-credentials
       env:
+        CLIENT_ID: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID }}
         APP_ID: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         APP_KEY: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
       run: |
-        if [[ -n "$APP_ID" && -n "$APP_KEY" ]]; then
+        if [[ -n "$APP_KEY" && ( -n "$CLIENT_ID" || -n "$APP_ID" ) ]]; then
           echo 'available=true' >> "$GITHUB_OUTPUT"
         else
           echo 'available=false' >> "$GITHUB_OUTPUT"
@@ -450,8 +455,11 @@ jobs:
       continue-on-error: true
       # https://github.com/actions/create-github-app-token/releases/tag/v3.3.0
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      # main.js:22 and lib/main.js:38 at the pinned action pass either ID as appId.
+      # Omit app-id entirely: the runner warns even for an empty deprecated input.
+      # https://github.com/actions/runner/blob/110142c2c501c6ae9373d553efa826bedbaab5f7/src/Runner.Worker/ActionRunner.cs#L189-L196
       with:
-        app-id: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
+        client-id: ${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID || secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
         private-key: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
         owner: pipelab-org
         repositories: agent-review-learnings

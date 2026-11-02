@@ -1082,12 +1082,16 @@ sys.exit(code)
             credentials = next(s for s in steps if s.get("id") == "learnings-credentials")
             mint = next(s for s in steps if s.get("id") == "learnings-token")
             revoke = next(s for s in steps if s.get("id") == "learnings-revoke")
-            for app_id, key, available in (("", "", False), ("123", "", False),
-                                           ("", "fixture-key", False), ("123", "fixture-key", True)):
-                with self.subTest(job=name, app_id=app_id, key=bool(key)):
+            for client_id, app_id, key, available in (
+                    ("", "", "", False), ("", "123", "", False),
+                    ("client-fixture", "", "", False), ("client-fixture", "123", "", False),
+                    ("", "", "fixture-key", False), ("", "123", "fixture-key", True),
+                    ("client-fixture", "", "fixture-key", True),
+                    ("client-fixture", "123", "fixture-key", True)):
+                with self.subTest(job=name, client_id=client_id, app_id=app_id, key=bool(key)):
                     with tempfile.NamedTemporaryFile() as output:
                         result = subprocess.run(["bash", "-euo", "pipefail", "-c", credentials["run"]],
-                                                env={**os.environ, "APP_ID": app_id, "APP_KEY": key,
+                                                env={**os.environ, "CLIENT_ID": client_id, "APP_ID": app_id, "APP_KEY": key,
                                                      "GITHUB_OUTPUT": output.name},
                                                 capture_output=True, text=True, timeout=5)
                         self.assertEqual(0, result.returncode, result.stderr)
@@ -1098,6 +1102,25 @@ sys.exit(code)
             # GitHub gives a failed continue-on-error step outcome=failure, conclusion=success.
             # Compare outcome so a failed mint (and a skipped mint) never runs revocation.
             self.assertEqual("${{ always() && steps.learnings-token.outcome == 'success' }}", revoke["if"])
+
+    def test_client_id_uses_caller_variable_with_legacy_id_fallback_and_no_deprecated_input(self):
+        jobs = self.workflow()["jobs"]
+        for name in ("review", "reply"):
+            with self.subTest(job=name):
+                steps = jobs[name]["steps"]
+                credentials = next(s for s in steps if s.get("id") == "learnings-credentials")
+                mint = next(s for s in steps if s.get("id") == "learnings-token")
+                self.assertEqual("${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID }}", credentials["env"]["CLIENT_ID"])
+                self.assertEqual("${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}", credentials["env"]["APP_ID"])
+                self.assertEqual("${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}", credentials["env"]["APP_KEY"])
+                # The pinned action resolves either input to the same createAppAuth.appId.
+                # Pin || precedence and both sources; leaving an empty app-id still warns.
+                self.assertEqual("${{ vars.AGENT_REVIEW_LEARNINGS_CLIENT_ID || secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}",
+                                 mint["with"]["client-id"])
+                self.assertNotIn("app-id", mint["with"])
+        for step_id in ("learnings-credentials", "learnings-token"):
+            self.assertEqual(next(s for s in jobs["review"]["steps"] if s.get("id") == step_id),
+                             next(s for s in jobs["reply"]["steps"] if s.get("id") == step_id))
 
     def test_token_is_scoped_optional_and_not_in_any_inference_step_environment(self):
         workflow = self.workflow()
