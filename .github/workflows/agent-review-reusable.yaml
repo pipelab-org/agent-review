@@ -17,7 +17,7 @@ name: Reusable agentic review
 permissions: {}
 jobs:
   source:
-    if: (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id)
+    if: (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')))
     permissions: {}
     uses: ./.github/workflows/agent-review-source.yaml
   admit:
@@ -348,7 +348,7 @@ jobs:
   reply:
     name: Answer an inline review question
     needs: source
-    if: github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id
+    if: github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve'))
     concurrency:
       group: agent-review-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: false
@@ -686,7 +686,7 @@ jobs:
       always() && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
           needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled') ||
-          (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id) && needs.reply.outputs.learnings_revoke_failed == 'true')
+          (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve'))) && needs.reply.outputs.learnings_revoke_failed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

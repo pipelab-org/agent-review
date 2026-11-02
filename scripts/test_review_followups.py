@@ -55,6 +55,18 @@ def run_data(record):
                     "path": f"pipelab-org/agent-review/.github/workflows/agent-review-reusable.yaml@{SOURCE}", "sha": SOURCE}])
 
 
+
+class ReplyCommandTests(unittest.TestCase):
+    def test_only_resolve_and_ask_are_commands(self):
+        self.assertEqual(("resolve", ""), f.reply_command(" \n/resolve\t "))
+        self.assertEqual(("ask", "why?"), f.reply_command("/ask why?"))
+        self.assertEqual(("ask", "line 2\nline 3"), f.reply_command("/ask\tline 2\nline 3"))
+        self.assertEqual(("ask", f.DEFAULT_QUESTION), f.reply_command(" /ask "))
+        for body in ("", "Fixed, thanks.", "/Ask why", "/ASK", "/askwhy", "please /ask why",
+                     "/resolve please", "/Resolve", "@agent-review /ask", None, 7):
+            self.assertEqual((None, ""), f.reply_command(body), body)
+
+
 class RecordTests(unittest.TestCase):
     def test_record_requires_complete_structured_context_and_intact_summary(self):
         good = evidence()
