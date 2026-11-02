@@ -38,6 +38,28 @@ class FollowupAbort(Exception):
     """Fail closed before suppressing review or publishing an unbound reply."""
 
 
+ASK = "/ask"
+DEFAULT_QUESTION = "Re-check this finding against the head checkout."
+
+
+def reply_command(body):
+    """Return ("resolve", "") or ("ask", question) for an inline reply, else (None, "").
+
+    Only these two commands do anything; any other reply text is ignored, so a
+    plain reply never starts a paid answer. Both are case-sensitive and must be
+    the first characters of the reply, like CodeRabbit's thread commands
+    (https://docs.coderabbit.ai/reference/review-commands). Only trailing
+    whitespace is ignored, so this grammar and the reusable workflow's
+    startsWith gate select the same replies.
+    """
+    text = body.rstrip() if isinstance(body, str) else ""
+    if text == "/resolve":
+        return "resolve", ""
+    if text == ASK or (text.startswith(ASK) and text[len(ASK)].isspace()):
+        return "ask", text[len(ASK):].strip() or DEFAULT_QUESTION
+    return None, ""
+
+
 # GitHub account identity: GET /users/github-actions%5Bbot%5D (2026-10-18).
 BOT = {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}
 JOSH = {"login": "luckyPipewrench", "id": 142104046, "type": "User"}

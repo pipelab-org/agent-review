@@ -466,7 +466,7 @@ class ReporterTests(unittest.TestCase):
         self.execute()
         self.assertEqual('POST', self.calls[-1][0])
         self.assertIn("revocation couldn't be confirmed", self.calls[-1][2]['body'])
-        self.assertIn('Post a new reply in the review thread; Actions reruns are refused.', self.calls[-1][2]['body'])
+        self.assertIn('Reply /ask in the review thread to retry; Actions reruns are refused.', self.calls[-1][2]['body'])
         self.assertNotIn('review command', self.calls[-1][2]['body'])
         self.assertNotIn('SENTINEL_private_text', self.calls[-1][2]['body'])
         for field, value in (('LEARNINGS_REVOKE_FAILED', 'false'), ('GITHUB_RUN_ATTEMPT', '2'),

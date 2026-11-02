@@ -299,7 +299,7 @@ class JobTests(unittest.TestCase):
         j.publish_artifact(self.artifact, self.head_dir)
         proof = json.loads((self.root / "completion.json").read_text())
         root = self.pr.roots[0]
-        raw = {"id": 500, "body": "Which state is lost?", "in_reply_to_id": root.id,
+        raw = {"id": 500, "body": "/ask Which state is lost?", "in_reply_to_id": root.id,
                "pull_request_review_id": root.raw_data["pull_request_review_id"],
                "commit_id": self.pr.head.sha, "original_commit_id": self.pr.head.sha,
                "path": root.path, "created_at": "2026-10-28T01:00:00Z", "updated_at": "2026-10-28T01:00:00Z",
@@ -910,7 +910,7 @@ class JobTests(unittest.TestCase):
         collect.assert_not_called()
 
     def reply_plan(self, proof, root):
-        raw = {"id": 500, "body": "Fixed now, please check the code.", "in_reply_to_id": root.id,
+        raw = {"id": 500, "body": "/ask Fixed now, please check the code.", "in_reply_to_id": root.id,
             "pull_request_review_id": root.raw_data["pull_request_review_id"],
             "commit_id": root.commit_id, "original_commit_id": root.raw_data["original_commit_id"],
             "path": root.path, "created_at": "2026-10-28T01:00:00Z", "updated_at": "2026-10-28T01:00:00Z",
@@ -1151,7 +1151,7 @@ class JobTests(unittest.TestCase):
         proof, root = self.prior_threads(outdated=False)
         # An explicit request may resolve a live or previously judged thread.
         self.pr.create_review_comment_reply(root.id, f.verification_marker(root.id, self.pr.head.sha) + "\nEvidence")
-        plan = self.resolve_plan(proof, root, " \n/resolve\t ")
+        plan = self.resolve_plan(proof, root, "/resolve\t \n")
         with patch.object(j, "records", return_value={123: proof}), \
                 patch.object(j, "reconstruct_root", side_effect=AssertionError("command does not judge findings")):
             j.prepare(self.head_dir, self.plan, reply=True)
@@ -1202,18 +1202,30 @@ class JobTests(unittest.TestCase):
             j.publish_reply(self.repo, self.pr, ctx, policy, plan, None, self.head_dir)
         self.assertEqual([], self.pr.writes)
         self.pr.threads[root.id]["isResolved"] = False
-        for body in ("/Resolve", "/resolve please", "please /resolve", "/resolve\nplease"):
+        # Only an exact /resolve or a /ask reply does anything; other text is refused
+        # before ownership work or inference, so it can never buy an answer.
+        for body in ("/Resolve", "/resolve please", "please /resolve", "/resolve\nplease",
+                     "Thanks, fixed in the next commit.", "/Ask why", "/askwhy", "please /ask why",
+                     " /resolve", " /ask why"):
+            self.pr.roots = [root]
+            with patch.object(e, "run_claude") as claude, patch.object(e, "run_codex") as codex,                     self.assertRaisesRegex(f.FollowupAbort, "not an /ask or /resolve command"):
+                self.resolve_plan(proof, root, body)
+            claude.assert_not_called(); codex.assert_not_called()
+            self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        # A forged command flag never revives a refused reply at publication.
+        with patch.object(j, "records", return_value={123: proof}), self.assertRaises(f.FollowupAbort):
+            j.publish_reply(self.repo, self.pr, ctx, policy, dict(plan, resolve_command=True), None, self.head_dir)
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+
+    def test_ask_question_reaches_the_prompt_without_the_command(self):
+        proof, root = self.prior_threads()
+        for body, question in (("/ask Which state is lost?", "Which state is lost?"),
+                               ("/ask\n  Is line 3 still wrong? ", "Is line 3 still wrong?"),
+                               ("/ask", f.DEFAULT_QUESTION)):
             self.pr.roots = [root]
             plan = self.resolve_plan(proof, root, body)
             self.assertFalse(plan["resolve_command"])
-            with patch.object(j, "infer_reply", return_value=self.answer()) as infer:
-                j.infer(self.plan, self.artifact, self.head_dir)
-            infer.assert_called_once()
-            with patch.object(j, "records", return_value={123: proof}):
-                j.publish_artifact(self.artifact, self.head_dir)
-            self.assertFalse(self.pr.threads[root.id]["isResolved"])
-            with patch.object(j, "records", return_value={123: proof}), self.assertRaises(e.ReviewAbort):
-                j.publish_reply(self.repo, self.pr, ctx, policy, dict(plan, resolve_command=True), None, self.head_dir)
+            self.assertIn('"question":' + json.dumps(question) + ',"root":', plan["prompt"])
 
     def test_resolution_markers_describe_attempts_not_unobserved_success(self):
         import io
