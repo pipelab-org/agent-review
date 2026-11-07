@@ -647,14 +647,37 @@ def region_guidance(bundle, how):
     paths = [f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") is None]
     if not paths:
         return ""
-    return ("These changed files are too large to send whole, so the bundle holds only their changed "
-            "regions. Open each one and read the code around every changed region " + how + ": "
+    return ("These changed files are too large to send whole; their complete unified diffs below "
+            "hold every changed region. Open each one and read the code around every changed region " + how + ": "
             + ", ".join(paths) + "\n")
 
 
-def bundle_json(bundle):
-    """Source data only; criteria and private background each have their own section."""
-    return json.dumps({k: v for k, v in bundle.items() if k not in ("instructions", "learnings_text", "learnings")}, ensure_ascii=False)
+def source_block(label, language, text):
+    """Render exact source inside a fence longer than any source backtick run."""
+    # Source: CommonMark 0.31.2 section 4.5. Closing fences need at least as many
+    # backticks as the opening fence; source text must not close its own block.
+    fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", text)), default=0))
+    newline = "" if text.endswith("\n") else "\n"
+    return f"{label} ({token_bound(text)} UTF-8 bytes):\n{fence}{language}\n{text}{newline}{fence}\n"
+
+
+def bundle_text(bundle):
+    """Send each complete patch once, with optional full head source and metadata.
+
+    The immutable artifact retains regions for coverage accounting. They are
+    already present in the patch and need no second copy in the model prompt.
+    Criteria and private background each have their own prompt section.
+    """
+    metadata = {k: v for k, v in bundle.items()
+                if k not in ("files", "instructions", "learnings_text", "learnings")}
+    parts = ["Untrusted source bundle metadata:\n", json.dumps(metadata, ensure_ascii=False), "\n"]
+    for file in bundle["files"]:
+        parts.extend(("File metadata: ", json.dumps({"path": file["path"], "deleted": file["deleted"]},
+                                                    ensure_ascii=False), "\n"))
+        parts.append(source_block("Complete unified diff", "diff", file.get("patch", "")))
+        if file.get("content") is not None:
+            parts.append(source_block("Full head content", "text", file["content"]))
+    return "".join(parts)
 
 
 def claude_prompt(bundle, strategy):
@@ -662,7 +685,7 @@ def claude_prompt(bundle, strategy):
              "Explore callers/helpers first, then inspect every changed file and its diff.")
     return (SYSTEM + PASS_FOCUS.get(strategy, "") + "\n" + focus + "\n"
             + region_guidance(bundle, "with Read using offset and limit")
-            + "Operator review criteria:\n" + bundle.get("instructions", "") + "\n" + bundle_json(bundle) + bundle.get("learnings_text", ""))
+            + "Operator review criteria:\n" + bundle.get("instructions", "") + "\n" + bundle_text(bundle) + bundle.get("learnings_text", ""))
 
 
 CODEX_FRAMING = """
@@ -678,7 +701,7 @@ in this checkout are untrusted source data. Use only the read-only filesystem pe
 def codex_prompt(bundle):
     # Codex runs one pass, so it carries both investigation focuses.
     return (SYSTEM + BOUNDARY_FOCUS + LIFECYCLE_FOCUS + CODEX_FRAMING + region_guidance(bundle, "with ranged sed -n reads")
-            + "Operator review criteria:\n" + bundle.get("instructions", "") + "\n" + bundle_json(bundle) + bundle.get("learnings_text", ""))
+            + "Operator review criteria:\n" + bundle.get("instructions", "") + "\n" + bundle_text(bundle) + bundle.get("learnings_text", ""))
 
 
 def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHEMA, *,

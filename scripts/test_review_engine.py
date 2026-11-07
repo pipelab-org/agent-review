@@ -251,6 +251,38 @@ class BundleTests(unittest.TestCase):
         with self.assertRaisesRegex(e.ReviewAbort, "incomplete"):
             self.bundle(dict(POLICY, max_model_tokens=1500, max_output_tokens=1000))
 
+    def test_complete_patch_fits_without_a_duplicate_region_copy(self):
+        """The prompt carries every hunk once, within the unchanged allowance."""
+        (self.root / "app.py").write_text('changed = "source"\n' * 700)
+        self.commit()
+        limited = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
+        bundle = self.bundle(limited)
+        file = bundle["files"][0]
+        self.assertIsNone(file["content"])
+        self.assertTrue(file["regions"])
+        expected = e.git(self.root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                         "--unified=3", self.base, bundle["head"], "--", "app.py")
+        self.assertEqual(expected, file["patch"])
+        for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
+            self.assertEqual(1, prompt.count(expected))
+            self.assertEqual(700, prompt.count('+changed = "source"\n'))
+            self.assertNotIn('"regions":', prompt)
+            self.assertLessEqual(e.token_bound(prompt + json.dumps(e.OUTPUT_SCHEMA)), 24_000)
+
+    def test_source_blocks_preserve_utf8_and_cannot_close_their_fence(self):
+        """CommonMark fences remain open across source-supplied fence lines."""
+        source = 'start\n```\n````text\n"quoted"\\path\t雪\nno final newline'
+        (self.root / "app.py").write_text(source)
+        self.commit()
+        bundle = self.bundle(instructions="UNIQUE-CRITERIA")
+        prompt = e.claude_prompt(bundle, "bundle")
+        file = bundle["files"][0]
+        self.assertIn('`````diff\n' + file["patch"] + '`````\n', prompt)
+        self.assertIn('`````text\n' + source + '\n`````\n', prompt)
+        self.assertIn(f'Full head content ({len(source.encode("utf-8"))} UTF-8 bytes)', prompt)
+        self.assertEqual(1, prompt.count("UNIQUE-CRITERIA"))
+        self.assertEqual(source, file["content"])
+
     def test_exclusions_and_deleted_file_are_explicit(self):
         (self.root / "app.py").unlink()
         (self.root / "generated.bin").write_bytes(b"\x00binary")
@@ -284,11 +316,11 @@ class BundleTests(unittest.TestCase):
         head = self.commit()
         with self.assertRaisesRegex(e.ReviewAbort, "^Source or diff exceeds the review depth's max_model_tokens"):
             e.build_bundle(self.root, head, self.base, small)
-        # A diff under the byte bound whose regions plus patch still exceed it is refused too.
+        # A diff under the byte bound can still exceed it with required criteria and framing.
         (self.root / "app.py").write_text("changed line of source\n" * 700)
         head = self.commit()
         with self.assertRaisesRegex(e.ReviewAbort, "^Diff and changed regions exceed the review depth's max_model_tokens"):
-            e.build_bundle(self.root, head, self.base, small)
+            e.build_bundle(self.root, head, self.base, small, instructions="Required criteria. " * 500)
         # The same change fits the shipped Claude allowance.
         self.assertEqual(["app.py"], [f["path"] for f in e.build_bundle(self.root, head, self.base, e.policy("default"))["files"]])
 
@@ -302,7 +334,7 @@ class BundleTests(unittest.TestCase):
         (self.root / "app.py").write_text("changed line of source\n" * 700)
         head = self.commit()
         with self.assertRaises(e.InputLimitAbort) as planned:
-            e.build_bundle(self.root, head, self.base, small)
+            e.build_bundle(self.root, head, self.base, small, instructions="Required criteria. " * 500)
         for refusal in (git_bound.exception, planned.exception):
             self.assertIsInstance(refusal, e.ReviewAbort)
             self.assertEqual("input_limit", reliability.reason(refusal))
