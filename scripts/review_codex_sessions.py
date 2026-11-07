@@ -63,8 +63,16 @@ ENV_ALLOWED = frozenset((
 SCAN_INTERVAL = 0.05  # seconds between process-table scans; not a policy bound
 LEAVES = ("home", "codex-home", "tmp", "output")
 OUTPUT_NAME = "last-message.json"
-# Identity-owned scratch locations outside the session tree (sticky world-writable dirs).
-SCRATCH_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
+# Locations outside the session tree where an account with no home can create files: the
+# sticky world-writable directories Ubuntu and the Filesystem Hierarchy Standard define
+# (/tmp, /var/tmp, /run/lock, /var/crash), POSIX shared memory and message queues
+# (shm_overview(7), mq_overview(7)). Everything the identity owns there is removed after a
+# session, and a find over these and the root filesystem must then come back empty.
+SCRATCH_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue", "/run/lock", "/var/crash")
+RESIDUE_ROOTS = ("/",) + SCRATCH_DIRS
+# SysV IPC objects are not files: proc(5) /proc/sysvipc/{shm,msg,sem} list them with the
+# owner and creator UID, and ipcrm(1) removes them by id.
+IPC_KINDS = (("shm", "shmid", "-m"), ("msg", "msqid", "-q"), ("sem", "semid", "-s"))
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
@@ -142,6 +150,32 @@ def resolve_identity(user):
     except KeyError:
         raise ReviewAbort("Codex review identity is not provisioned") from None
     return Identity(user, entry.pw_uid, entry.pw_gid)
+
+
+def sysv_ipc(proc_root, uid):
+    """(ipcrm flag, id) of every SysV IPC object the identity owns or created; fails closed on a bad table."""
+    found = []
+    for kind, ident, flag in IPC_KINDS:
+        try:
+            lines = (Path(proc_root) / "sysvipc" / kind).read_text().splitlines()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SessionCleanupError("Codex session IPC objects could not be listed; no further session may start") from None
+        if not lines:
+            continue
+        columns = lines[0].split()
+        try:
+            positions = [columns.index(name) for name in (ident, "uid", "cuid")]
+        except ValueError:
+            raise SessionCleanupError("Codex session IPC table is unreadable; no further session may start") from None
+        for row in lines[1:]:
+            fields = row.split()
+            if len(fields) < len(columns):
+                raise SessionCleanupError("Codex session IPC table is unreadable; no further session may start")
+            if str(uid) in (fields[positions[1]], fields[positions[2]]):
+                found.append((flag, fields[positions[0]]))
+    return found
 
 
 def uid_pids(proc_root, uid):
@@ -461,6 +495,43 @@ class CodexSessions:
             if status != 1:
                 raise ReviewAbort("Access to a privileged service socket could not be verified")
 
+    def stage_head(self, source, workspace):
+        """Copy the checked-out tree, without Git history, to where the identity can read it.
+
+        The identity is given no access to the runner's home or to any ancestor of the real
+        checkout: it reads this copy under the controller-owned workspace, which is the only
+        tree it can traverse. Group and other write bits are cleared, and every file stays owned
+        by the controller. `.git/agent-review` (the exact patch store) is the only part of `.git`
+        that is copied.
+        """
+        source, workspace = Path(source), Path(workspace)
+        if workspace.is_symlink() or not workspace.is_dir():
+            raise ReviewAbort("Codex session workspace is invalid")
+        target = workspace / "head"
+        try:
+            if target.is_symlink() or target.is_file():
+                raise ReviewAbort("Codex staged head location is invalid")
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(source, target, symlinks=True,
+                            ignore=lambda directory, names: [".git"] if Path(directory) == source else [])
+            store = source / ".git" / "agent-review"
+            if store.is_dir() and not store.is_symlink():
+                (target / ".git").mkdir()
+                shutil.copytree(store, target / ".git" / "agent-review", symlinks=False)
+            for current, directories, files in os.walk(target):
+                for name, kind in [(n, True) for n in directories] + [(n, False) for n in files]:
+                    path = os.path.join(current, name)
+                    mode = os.lstat(path).st_mode
+                    if not stat.S_ISLNK(mode):
+                        os.chmod(path, ((mode | (0o555 if kind else 0o444)) & ~0o022) & 0o7777)
+            target.chmod(0o755)
+        except (OSError, shutil.Error):
+            raise ReviewAbort("Head checkout could not be staged for the Codex review identity") from None
+        if self._as_identity(["/usr/bin/test", "-d", str(target), "-a", "-r", str(target), "-a", "-x", str(target)]):
+            raise ReviewAbort("The Codex review identity cannot read the staged head checkout")
+        return target
+
     # -- sessions ----------------------------------------------------------
     @contextlib.contextmanager
     def session(self, workspace, *, trusted_home, configure, schema_text, deadline, max_bytes) -> Iterator[Session]:
@@ -564,9 +635,20 @@ class CodexSessions:
                 raise SessionCleanupError("Codex session files could not be removed; no further session may start")
             os.rmdir(path)
         shutil.rmtree(live.parent)
+        uid = str(self.identity.uid)
         for directory in SCRATCH_DIRS:
             if os.path.isdir(directory):
-                self._need_cleanup(self._sudo("/usr/bin/find", directory, "-xdev", "-user", str(self.identity.uid), "-delete"))
+                self._need_cleanup(self._sudo("/usr/bin/find", directory, "-xdev", "-user", uid, "-delete"))
+        for flag, number in sysv_ipc(self.proc_root, self.identity.uid):
+            self._need_cleanup(self._sudo("/usr/bin/ipcrm", flag, number))
+        if sysv_ipc(self.proc_root, self.identity.uid):
+            raise SessionCleanupError("Codex session IPC objects could not be removed; no further session may start")
+        # Proof, not an assumption: nothing the account owns may remain on any filesystem it could write.
+        for root in RESIDUE_ROOTS:
+            if os.path.isdir(root):
+                left = self._sudo("/usr/bin/find", root, "-xdev", "-user", uid, "-print", "-quit")
+                if left.returncode or (getattr(left, "stdout", "") or "").strip():
+                    raise SessionCleanupError("Codex session left files owned by its account; no further session may start")
         if os.path.lexists(live.parent) or uid_pids(self.proc_root, self.identity.uid):
             raise SessionCleanupError("Codex session cleanup could not be confirmed; no further session may start")
 

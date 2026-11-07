@@ -79,6 +79,8 @@ head = scenario["head"]
 result["head"] = {"readable": os.access(head, os.R_OK | os.X_OK),
                   "write_denied": denied(lambda: open(os.path.join(head, "proof-write-probe"), "w")),
                   "create_denied": denied(lambda: os.mkdir(os.path.join(head, "proof-dir")))}
+result["private"] = {"runner_home_denied": denied(lambda: os.listdir(scenario["runner_home"])),
+                     "source_checkout_denied": denied(lambda: os.listdir(scenario["source"]))}
 if scenario.get("escape"):
     reader, writer = os.pipe()
     if os.fork() == 0:
@@ -188,7 +190,9 @@ def run_probe(launcher, head, suid, capcat, sentinel, workspace, **extra):
                           deadline=time.monotonic() + 120, max_bytes=1 << 20) as live:
         process = live.start(scenario(launcher.identity, head, suid, capcat, sentinel, **extra),
                              head=head, model="probe", effort="high")
-        out, _ = process.communicate(timeout=120)
+        # The session's feeder thread owns and closes stdin, so read and wait instead of communicate().
+        out = process.stdout.read()
+        process.wait(timeout=120)
         parent = live.parent
     return json.loads(out.strip().splitlines()[-1]), parent
 
@@ -213,7 +217,13 @@ def identity_proof(user, head):
     first = launcher()
     first.verify()
     check(True, "launcher pre-launch verification passes for the provisioned identity")
-    result, parent = run_probe(first, head, suid, capcat, sentinel, root, escape=True)
+    # The identity reads a staged copy under the controller-owned sessions directory; it is never
+    # granted access to the runner's home or any ancestor of the real checkout.
+    source = head
+    head = first.stage_head(source, root)
+    check(Path(head).parent == root and Path(head) != Path(source), "the identity's head is a staged copy under the sessions directory")
+    reach = {"runner_home": str(Path.home()), "source": str(source)}
+    result, parent = run_probe(first, head, suid, capcat, sentinel, root, escape=True, **reach)
     for field in ("self", "child"):
         who = result[field]
         label = "session process" if field == "self" else "descendant"
@@ -228,13 +238,15 @@ def identity_proof(user, head):
     check(result["canary_denied"] is True, "the root canary socket is denied to the session")
     check(all(result["sentinel"].values()), "controller environment, file, descriptors, memory and /proc entries are unreachable")
     check(result["head"] == {"readable": True, "write_denied": True, "create_denied": True},
-          "the session reads the shared head checkout and cannot write it")
+          "the session reads the staged head checkout and cannot write it")
+    check(result["private"] == {"runner_home_denied": True, "source_checkout_denied": True},
+          "the session cannot list the runner home or the original checkout")
     escapee = result["escapee"]
     check(sessions.uid_pids("/proc", identity.uid) == [], "cleanup left no process of the review identity")
     check(not Path(f"/proc/{escapee}").exists(), "a setsid escaping descendant was killed by UID-based cleanup")
     check(not parent.exists(), "the session tree was removed")
     second, _ = run_probe(launcher(), head, suid, capcat, sentinel, root,
-                          see={"parent": str(parent), "escapee": escapee})
+                          see={"parent": str(parent), "escapee": escapee}, **reach)
     check(second["see"] == {"first_tree_gone": True, "escapee_gone": True, "identity_processes": 1},
           "a second session sees no first-session tree and no surviving process")
     # A failed cleanup must stop the review: inject the failure at the helper seam only.

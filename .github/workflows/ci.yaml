@@ -96,8 +96,6 @@ jobs:
       run: python scripts/codex_identity_setup.py restrict-sockets --user "$REVIEW_PROOF_USER" --action trusted-codex-action
     - name: Canary is denied after socket restriction
       run: python scripts/hosted_codex_sandbox_proof.py canary-probe --user "$REVIEW_PROOF_USER" --expect denied
-    - name: Share the checkout read-only with the review account
-      run: python scripts/codex_identity_setup.py share --user "$REVIEW_PROOF_USER" --path "$GITHUB_WORKSPACE"
     - name: Launcher identity, isolation and cleanup proof
       run: python scripts/hosted_codex_sandbox_proof.py identity --user "$REVIEW_PROOF_USER" --head "$GITHUB_WORKSPACE"
 'on':

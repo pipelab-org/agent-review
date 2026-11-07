@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Provision and check the dedicated Codex review account on a disposable hosted runner.
 
-Workflow steps only. It changes accounts, ACLs and a directory under /var/lib, so it
-refuses to run anywhere but a GitHub-hosted runner; --print-plan only prints the
-commands and is what local tests cover.
+Workflow steps only. It changes accounts, socket ACLs and a directory under /var/lib, so
+it refuses to run anywhere but a GitHub-hosted runner; --print-plan only prints the
+commands and is what local tests cover. It never grants the account access to the runner's
+home or to any ancestor of the checkout: the launcher stages a copy of the head under the
+controller-owned sessions directory instead.
 
 Socket restriction deliberately reuses the pinned action's own code. Its hidden
 `drop-sudo --root-phase --user U --runner-credentials JSON` mode (src/dropSudo.ts in
@@ -23,7 +25,6 @@ from pathlib import Path
 import pwd
 import re
 import shutil
-import stat
 import subprocess
 import sys
 
@@ -69,22 +70,6 @@ def restrict_plan(identity, action, node):
              "--root-phase", "--user", identity.user, "--group", "sudo", "--runner-credentials", credentials]]
 
 
-def share_plan(identity, paths):
-    """Read access for the identity to exactly the given trees, plus traversal of their ancestors.
-
-    Ancestors only gain execute (search) permission, never read or list; the trees gain
-    read plus search on directories (setfacl `X`). Nothing grants write.
-    """
-    plan = []
-    for raw in paths:
-        path = Path(raw).resolve()
-        for ancestor in reversed(path.parents):
-            if str(ancestor) != "/" and not os.lstat(ancestor).st_mode & stat.S_IXOTH:
-                plan.append([SUDO, "-n", "--", "/usr/bin/setfacl", "-m", f"u:{identity.uid}:--x", "--", str(ancestor)])
-        plan.append([SUDO, "-n", "--", "/usr/bin/setfacl", "-R", "-m", f"u:{identity.uid}:rX", "--", str(path)])
-    return plan
-
-
 def execute(plan):
     for number, argv in enumerate(plan, 1):
         print(f"step {number} of {len(plan)}: {argv[3] if len(argv) > 3 else argv[0]}", flush=True)
@@ -114,9 +99,6 @@ def main(argv=None):
     two = commands.add_parser("restrict-sockets")
     two.add_argument("--user", required=True)
     two.add_argument("--action", required=True, type=Path)
-    three = commands.add_parser("share")
-    three.add_argument("--user", required=True)
-    three.add_argument("--path", action="append", required=True, type=Path)
     four = commands.add_parser("verify")
     four.add_argument("--user", required=True)
     four.add_argument("--codex", required=True)
@@ -127,7 +109,7 @@ def main(argv=None):
         plan = provision_plan(args.user, args.sessions_dir, controller_uid, controller_gid)
     else:
         valid_user(args.user)
-        if args.print_plan and args.command in ("restrict-sockets", "share", "verify"):
+        if args.print_plan and args.command in ("restrict-sockets", "verify"):
             try:
                 identity = sessions.resolve_identity(args.user)
             except Exception:
@@ -137,8 +119,6 @@ def main(argv=None):
             identity = sessions.resolve_identity(args.user)
         if args.command == "restrict-sockets":
             plan = restrict_plan(identity, args.action, os.path.realpath(shutil.which("node") or "node"))
-        elif args.command == "share":
-            plan = share_plan(identity, args.path)
         else:
             plan = [["verify", args.user]]
     if args.print_plan:

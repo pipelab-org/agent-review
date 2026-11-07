@@ -7,6 +7,8 @@ runner, the Popen seam and the OS lookups are replaced by local fixtures, and th
 argv builder is asserted separately. Kernel, sandbox and hosted evidence comes only from
 scripts/hosted_codex_sandbox_proof.py on a disposable runner.
 """
+import contextlib
+import io
 import os
 from pathlib import Path
 import stat
@@ -91,6 +93,7 @@ class Host:
         self.proc = root / "proc"
         self.proc.mkdir()
         self.calls, self.writable, self.kills_work = [], set(), True
+        self.residue, self.find_status, self.ipcrm, self.ipcrm_works = {}, 0, [], True
         self.sudo_listing = "User fixture is not allowed to run sudo on host.\n"
 
     def add_process(self, pid, uid):
@@ -130,6 +133,15 @@ class Host:
                         entry.rmdir()
             return subprocess.CompletedProcess(args, 0, "", "")
         if inner[0] == "/usr/bin/find":
+            if "-print" in inner:
+                return subprocess.CompletedProcess(args, self.find_status, self.residue.get(inner[1], ""), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if inner[0] == "/usr/bin/ipcrm":
+            self.ipcrm.append(inner[1:])
+            if self.ipcrm_works:
+                for table in (self.proc / "sysvipc").glob("*"):
+                    lines = table.read_text().splitlines()
+                    table.write_text("\n".join(l for l in lines if inner[2] not in l.split()[:2]) + "\n")
             return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError(args)
 
@@ -390,6 +402,119 @@ class ReaderTests(Base):
             session.read_output()
 
 
+class CleanupResidueTests(Base):
+    """What a session may leave behind outside its own tree: IPC objects and owned files."""
+
+    def ipc(self, *rows):
+        table = self.host.proc / "sysvipc"
+        table.mkdir(exist_ok=True)
+        (table / "shm").write_text("key shmid perms size cpid lpid nattch uid gid cuid cgid\n" + "".join(rows))
+
+    def test_sysv_ipc_objects_owned_or_created_by_the_identity_are_removed_and_others_kept(self):
+        self.ipc(f"0 77 600 4096 1 1 0 {ME} 9 9 9\n", f"0 78 600 4096 1 1 0 9 9 {ME} 9\n", "0 79 600 4096 1 1 0 9 9 9 9\n")
+        with self.open():
+            pass
+        self.assertEqual([["-m", "77"], ["-m", "78"]], self.host.ipcrm)
+        self.assertIn("79", (self.host.proc / "sysvipc" / "shm").read_text())
+
+    def test_an_ipc_object_that_cannot_be_removed_blocks_the_next_launch(self):
+        self.ipc(f"0 77 600 4096 1 1 0 {ME} 9 9 9\n")
+        self.host.ipcrm_works = False
+        with self.assertRaisesRegex(s.SessionCleanupError, "IPC objects could not be removed"), self.open():
+            pass
+        self.assertTrue(self.sessions.poisoned)
+
+    def test_an_unreadable_or_malformed_ipc_table_fails_closed(self):
+        table = self.host.proc / "sysvipc"
+        table.mkdir()
+        (table / "shm").write_text("key shmid perms\n0 1 600\n")
+        with self.assertRaisesRegex(s.SessionCleanupError, "unreadable"), self.open():
+            pass
+        self.sessions.poisoned = False
+        (table / "shm").write_text("key shmid perms size cpid lpid nattch uid gid cuid cgid\n0 1\n")
+        with self.assertRaisesRegex(s.SessionCleanupError, "unreadable"), self.open():
+            pass
+
+    def test_files_owned_by_the_identity_anywhere_on_a_scanned_root_block_the_next_launch(self):
+        self.host.residue = {"/": "/var/lib/stray-file\n"}
+        with self.assertRaisesRegex(s.SessionCleanupError, "left files owned by its account"), self.open():
+            pass
+        self.assertTrue(self.sessions.poisoned)
+        self.sessions.poisoned = False
+        self.host.residue = {"/dev/shm": "/dev/shm/leftover\n"}
+        with self.assertRaisesRegex(s.SessionCleanupError, "left files owned by its account"), self.open():
+            pass
+        self.sessions.poisoned = False
+        self.host.residue, self.host.find_status = {}, 2
+        with self.assertRaisesRegex(s.SessionCleanupError, "left files owned by its account"), self.open():
+            pass
+
+    def test_every_documented_scratch_location_is_cleaned(self):
+        self.assertEqual({"/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue", "/run/lock", "/var/crash"}, set(s.SCRATCH_DIRS))
+        self.assertIn("/", s.RESIDUE_ROOTS)
+        with self.open():
+            pass
+        cleaned = {c[c.index("/usr/bin/find") + 1] for c in self.host.calls if "-delete" in c and "-user" in c}
+        self.assertEqual({d for d in s.SCRATCH_DIRS if os.path.isdir(d)}, cleaned)
+
+
+class StageHeadTests(Base):
+    def source(self):
+        tree = self.root / "checkout"
+        (tree / "pkg").mkdir(parents=True)
+        (tree / ".git" / "objects").mkdir(parents=True)
+        (tree / ".git" / "objects" / "history").write_text("secret history")
+        (tree / ".git" / "agent-review" / "patches").mkdir(parents=True)
+        (tree / ".git" / "agent-review" / "patches" / "0.diff").write_text("patch")
+        (tree / "pkg" / "a.py").write_text("print(1)\n")
+        (tree / "pkg" / "a.py").chmod(0o600)
+        (tree / "run.sh").write_text("#!/bin/sh\n")
+        (tree / "run.sh").chmod(0o777)
+        (tree / "link").symlink_to("/etc/hostname")
+        return tree
+
+    def test_the_head_is_copied_without_history_and_stays_read_only_for_others(self):
+        tree = self.source()
+        staged = self.sessions.stage_head(tree, self.work)
+        self.assertEqual(self.work / "head", staged)
+        self.assertEqual("print(1)\n", (staged / "pkg" / "a.py").read_text())
+        self.assertFalse((staged / ".git" / "objects").exists())
+        self.assertEqual("patch", (staged / ".git" / "agent-review" / "patches" / "0.diff").read_text())
+        self.assertTrue((staged / "link").is_symlink())
+        for path in (staged / "pkg" / "a.py", staged / "run.sh", staged / "pkg", staged):
+            mode = path.stat().st_mode
+            self.assertTrue(mode & stat.S_IROTH, path)
+            self.assertFalse(mode & 0o022, path)
+        self.assertTrue((staged / "run.sh").stat().st_mode & stat.S_IXOTH)
+        # The original checkout is untouched.
+        self.assertTrue((tree / ".git" / "objects" / "history").exists())
+
+    def test_staging_again_replaces_the_copy_and_refuses_a_hostile_destination(self):
+        tree = self.source()
+        self.sessions.stage_head(tree, self.work)
+        (tree / "pkg" / "a.py").write_text("print(2)\n")
+        staged = self.sessions.stage_head(tree, self.work)
+        self.assertEqual("print(2)\n", (staged / "pkg" / "a.py").read_text())
+        import shutil as _shutil
+        _shutil.rmtree(staged)
+        staged.symlink_to(self.root)
+        with self.assertRaisesRegex(ReviewAbort, "staged head location is invalid"):
+            self.sessions.stage_head(tree, self.work)
+        staged.unlink()
+        with self.assertRaisesRegex(ReviewAbort, "workspace is invalid"):
+            self.sessions.stage_head(tree, self.root / "missing")
+
+    def test_a_copy_the_identity_cannot_read_is_refused(self):
+        real = self.host.run
+        def deny(argv, **kw):
+            if "/usr/bin/test" in argv and "-r" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return real(argv, **kw)
+        self.sessions._run = deny
+        with self.assertRaisesRegex(ReviewAbort, "cannot read the staged head"):
+            self.sessions.stage_head(self.source(), self.work)
+
+
 class LifecycleTests(Base):
     def run_one(self, tag="a", head=None, **kwargs):
         head = head or self.root / "head"
@@ -555,17 +680,11 @@ class SetupTests(unittest.TestCase):
         self.assertEqual([], credentials["supplementaryGroupIds"])
         self.assertNotEqual(os.getuid(), credentials["userId"])
 
-    def test_share_grants_read_and_search_never_write_and_only_traversal_above(self):
-        with tempfile.TemporaryDirectory() as root:
-            tree = Path(root) / "closed" / "checkout"
-            tree.mkdir(parents=True)
-            os.chmod(tree.parent, 0o700)
-            plan = self.plan("share", "--user", "agent-review-model", "--path", str(tree))
-        traversal = {c[-1]: c[-3] for c in plan[:-1]}
-        self.assertEqual("u:60001:--x", traversal[str(tree.parent.resolve())])  # the closed ancestor: search only
-        self.assertEqual(["-R", "-m", "u:60001:rX", "--", str(tree.resolve())], plan[-1][4:])
-        for command in plan:
-            self.assertNotRegex(" ".join(command), r"u:60001:[^ ]*w")
+    def test_no_ancestor_acl_grant_exists_any_more(self):
+        from scripts import codex_identity_setup as setup
+        self.assertFalse(hasattr(setup, "share_plan"))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            setup.main(["--print-plan", "share", "--user", "agent-review-model", "--path", "/tmp"])
 
     def test_invalid_names_directories_and_unhosted_execution_are_refused(self):
         from scripts import codex_identity_setup as setup
