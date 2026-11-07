@@ -228,6 +228,37 @@ class JobTests(unittest.TestCase):
         record = json.loads((self.root / "completion.json").read_text())
         self.assertEqual("helper.py", record["findings"][0]["path"])
 
+    def test_context_line_range_gets_a_verified_review_thread(self):
+        # GitHub's RIGHT side includes unchanged lines shown as diff context.
+        # PR2147 and PR2149 had valid ranges rejected at their context endpoint.
+        for text, message in (("before\nold\nafter\n", "context base"),
+                              ("before\nnew\nafter\n", "context head")):
+            (self.head_dir / "app.py").write_text(text)
+            e.git(self.head_dir, "add", "--", "app.py")
+            e.git(self.head_dir, "commit", "-qm", message)
+            if message == "context base":
+                self.pr.base.sha = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        self.pr.head.sha = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        self.env.update(REVIEW_BASE=self.pr.base.sha, REVIEW_HEAD=self.pr.head.sha)
+        os.environ.update(REVIEW_BASE=self.pr.base.sha, REVIEW_HEAD=self.pr.head.sha)
+        self.build([finding(path="app.py", line=1, end_line=3)])
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len(self.pr.roots))
+        request = next(payload for kind, payload in self.pr.writes if kind == "review")["comments"][0]
+        self.assertEqual((1, 3, "RIGHT", "RIGHT"),
+                         (request["start_line"], request["line"], request["start_side"], request["side"]))
+        record = json.loads((self.root / "completion.json").read_text())
+        status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
+        self.assertEqual(record, f.parse_record(status, self.pr.comments))
+        self.assertEqual(record["findings"], j.reconstruct_root(self.pr.roots[0], record))
+
+    def test_inline_range_cannot_cross_lines_missing_from_the_diff(self):
+        patch = "@@ -1,2 +1,2 @@\n one\n+two\n@@ -9,2 +9,2 @@\n+nine\n ten\n"
+        self.assertTrue(j.anchor_range(patch, 1, 2))
+        self.assertTrue(j.anchor_range(patch, 9, 10))
+        self.assertFalse(j.anchor_range(patch, 2, 9))
+        self.assertFalse(j.anchor_range(patch, 1, 1000000000))
+
     def test_unconfirmed_locations_stay_in_summary_without_discarding_the_review(self):
         self.build([finding(path="removed.py"), finding(path="app.py", line=900, end_line=900), finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)

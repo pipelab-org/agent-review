@@ -454,6 +454,8 @@ def finish_resolution(pr, posted, root, succeeded, expected_body):
 
 
 def anchor_lines(patch):
+    # GitHub accepts RIGHT-side additions and unchanged context lines.
+    # https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request
     line, result = None, set()
     for text in patch.splitlines():
         match = re.match(r"@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)", text)
@@ -464,8 +466,17 @@ def anchor_lines(patch):
                 result.add(line)
                 line += 1
             elif text.startswith(" "):
+                result.add(line)
                 line += 1
     return result
+
+
+def anchor_range(patch, first, last):
+    """Require the entire range to be visible on the diff's RIGHT side."""
+    lines = anchor_lines(patch)
+    return (engine.positive_int(first) and engine.positive_int(last) and first <= last
+            and last - first + 1 <= len(lines)
+            and all(line in lines for line in range(first, last + 1)))
 
 
 def public_finding(item):
@@ -498,12 +509,11 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
     placement, anchored = [], []
     for index, finding in enumerate(findings):
         file = files.get(finding["path"])
-        # Related-source or unchanged lines remain in the summary, never a fabricated anchor.
+        # Locations outside the visible diff remain in the summary, never a fabricated anchor.
         # Exact prior findings keep their full text here instead of opening an identical
         # thread: GitHub moves a live comment's commit_id to the new head and outdates it
         # when its line is rewritten, so an old thread is no proof the text is still visible.
-        if (not (file and finding["line"] in anchor_lines(file["patch"])
-                 and finding["end_line"] in anchor_lines(file["patch"]))
+        if (not (file and anchor_range(file["patch"], finding["line"], finding["end_line"]))
                 or followups.canonical(finding) in previous):
             placement.append("summary")
         else:
