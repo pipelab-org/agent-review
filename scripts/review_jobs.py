@@ -625,7 +625,7 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
     placement, reasons = place_findings(plan, result, findings, previous, store)
     anchored = [i for i, where in enumerate(placement) if where == "inline"]
     filed = [i for i, where in enumerate(placement) if where == "file"]
-    comments = [inline_comment([findings[i] for i in group]) for group in overlap_groups(findings, anchored)]
+    comments = [inline_comment([findings[i] for i in group]) for group in bounded_groups(findings, anchored)]
     key = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
     roots = []
     def fresh():
@@ -703,10 +703,40 @@ def overlap_groups(findings, indexes):
     return sorted(groups)
 
 
+def bounded_groups(findings, indexes):
+    """Retain overlap grouping while respecting the existing per-comment byte bound."""
+    result = []
+    for group in overlap_groups(findings, indexes):
+        current = []
+        for index in group:
+            candidate = current + [index]
+            if current and len(inline_comment([findings[i] for i in candidate])["body"].encode()) > followups.MAX_DATA_BYTES:
+                result.append(current)
+                current = []
+            current.append(index)
+        if current:
+            result.append(current)
+    return result
+
+
+def finding_body(finding):
+    return f"**{finding['title']}**\n\n{finding['body']}"
+
+
+def fit_thread_body(body, finding):
+    """A large individual finding keeps a bound thread and its full text in the summary."""
+    if len(body.encode()) <= followups.MAX_DATA_BYTES:
+        return body
+    marker = followups.digest(followups.canonical(finding))
+    return (f"**Review finding at {location(finding)}**\n\n"
+            "The full finding is in this run's review summary because it exceeds one comment.\n\n"
+            f"<!-- agent-review-finding:v1 digest={marker} -->")
+
+
 def inline_comment(group):
     first, last = min(f["line"] for f in group), max(f["end_line"] for f in group)
     if len(group) == 1:
-        body = f"**{group[0]['title']}**\n\n{group[0]['body']}"
+        body = fit_thread_body(finding_body(group[0]), group[0])
     else:
         body = (f"**{len(group)} findings on these lines**\n\n"
                 + "\n\n---\n\n".join(f"**{f['title']}**\n\n{f['body']}" for f in group))
@@ -1030,7 +1060,7 @@ def cell(text):
 
 
 WHERE = {"inline": "inline thread", "file": "file thread", "summary": "below"}
-CONTINUATION = "<!-- agent-review-continuation:v1 run={run} page={page} -->"
+CONTINUATION = followups.CONTINUATION
 
 
 def split_utf8(text, room):
@@ -1051,7 +1081,9 @@ def summary_items(result, findings, placement, reasons):
             for item, f, where in zip(result["findings"], findings, placement)]
     loose = [f"**{f['title']}** ({location(f)})\n\n{f['body']}"
              + (f"\n\n_Not threaded: {NO_THREAD[reason]}._" if reason else "")
-             for f, where, reason in zip(findings, placement, reasons) if where == "summary"]
+             for f, where, reason in zip(findings, placement, reasons)
+             if where == "summary" or (where == "inline" and len(finding_body(f).encode()) > followups.MAX_DATA_BYTES)
+             or (where == "file" and len(file_body(f).encode()) > followups.MAX_DATA_BYTES)]
     return rows, loose
 
 
@@ -1176,11 +1208,15 @@ def summary_pages(ctx, scope, bundle, result, findings, placement, reasons, run)
     return render, bodies
 
 
+def file_body(finding):
+    return (f"**{finding['title']}**\n\nLocation: {location(finding)} at the reviewed head, "
+            f"outside the diff lines GitHub shows for this file.\n\n{finding['body']}")
+
+
 def file_comment(finding):
     """A file-level thread for a confirmed location the visible diff does not show."""
     return {"path": finding["path"],
-            "body": (f"**{finding['title']}**\n\nLocation: {location(finding)} at the reviewed head, "
-                     f"outside the diff lines GitHub shows for this file.\n\n{finding['body']}")}
+            "body": fit_thread_body(file_body(finding), finding)}
 
 
 def summary_text(ctx, scope, bundle, result, findings, placement, reasons=None):

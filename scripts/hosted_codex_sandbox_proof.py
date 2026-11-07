@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launcher-identity proof for the multi-session Codex launcher. Disposable hosted runners only.
 
-This runs the REAL provisioning, the REAL launcher (sudo, setpriv, process cleanup) and a
-probe executable in place of Codex, so the kernel evidence it prints is about the launch
-identity and cleanup only. It is NOT proof of Codex's :read-only sandbox, of bubblewrap, or
-of any provider behavior. It uses no provider credentials and makes no model request.
+The identity command runs provisioning and the launcher with a probe executable. The
+native command runs the pinned CLI and production monitor against an offline Responses
+fixture to check read-only permissions and native receipts under that identity. Neither
+command uses provider credentials or makes a real model request.
 
 It refuses to run unless GitHub reports a hosted runner, and must never be run on a
 workstation: it creates accounts, ACLs, a root socket and setuid/capability fixtures.
@@ -279,6 +279,59 @@ def identity_proof(user, head):
           "Codex's :read-only profile, bubblewrap, or any provider.")
 
 
+def native_proof(user, codex):
+    """Run the real CLI and production monitor twice under the provisioned identity."""
+    try:
+        from . import native_codex_fixture as native
+    except ImportError:
+        import native_codex_fixture as native
+    from types import SimpleNamespace
+
+    native.require_version(codex)
+    settings = native.engine.policy("codex-deep")
+    identity = sessions.resolve_identity(user)
+    node = shutil.which("node")
+    check(node is not None, "the trusted Node runtime is available")
+    path = ":".join(dict.fromkeys([str(codex.parent), str(Path(node).parent), "/usr/bin", "/bin"]))
+    launcher = sessions.CodexSessions(identity, codex=str(codex), trusted_path=path)
+    launcher.verify()
+    with tempfile.TemporaryDirectory(prefix="native-proof-", dir=ROOT) as directory:
+        root = Path(directory)
+        root.chmod(0o711)
+        source = native.create_head(root / "source")
+        head = launcher.stage_head(source, ROOT)
+        sentinel = root / "sentinel"
+        sentinel.write_text("fixture-only-parent-sentinel")
+        sentinel.chmod(0o600)
+        previous = None
+        with native.NativeCodexFixture(root / "api", settings) as fixture:
+            for number in range(1, 3):
+                observed = {}
+
+                @contextlib.contextmanager
+                def session(*args, **kwargs):
+                    with launcher.session(*args, **kwargs) as live:
+                        observed["parent"] = live.parent
+                        fixture.begin_session(head=head, home=live.parent / "home", codex_home=live.home,
+                            tmp=live.parent / "tmp", sentinel_file=sentinel, previous_parent=previous,
+                            require_parent_denial=True)
+                        yield live
+                        observed["native"] = fixture.assert_complete(output=live.read_output(),
+                                                                    rollout_texts=live.rollout_texts())
+
+                result = native.engine.run_codex(settings, {"files": []}, "callers", head, None,
+                    fixture.trusted_home, ROOT, prompt="Run the offline native sandbox fixture.",
+                    sessions=SimpleNamespace(session=session))
+                check(result["receipt"] == observed["native"]["receipt"],
+                      f"native session {number}: production monitor verifies delivered reads and usage")
+                check(not observed["parent"].exists() and sessions.uid_pids("/proc", identity.uid) == [],
+                      f"native session {number}: cleanup removes the tree and every identity process")
+                check(True, f"native session {number}: real read-only sandbox denies writes, sockets and controller access")
+                previous = observed["parent"]
+            check(len(fixture.completed) == 2, "two real CLI sessions use distinct homes with no surviving first tree")
+    print("LIMIT: Responses and usage are synthetic; no provider access or billing is proved.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -289,6 +342,9 @@ def main(argv=None):
     identity = commands.add_parser("identity")
     identity.add_argument("--user", required=True)
     identity.add_argument("--head", required=True, type=Path)
+    native = commands.add_parser("native")
+    native.add_argument("--user", required=True)
+    native.add_argument("--codex", required=True, type=Path)
     args = parser.parse_args(argv)
     require_hosted()
     try:
@@ -296,8 +352,10 @@ def main(argv=None):
             canary_start()
         elif args.command == "canary-probe":
             canary_probe(sessions.resolve_identity(args.user), args.expect)
-        else:
+        elif args.command == "identity":
             identity_proof(args.user, args.head.resolve())
+        else:
+            native_proof(args.user, args.codex.resolve())
     except ProofFailure as failure:
         print(f"FAIL {failure}", file=sys.stderr)
         return 1

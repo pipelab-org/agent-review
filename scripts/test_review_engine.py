@@ -800,7 +800,9 @@ class CodexTests(unittest.TestCase):
     def test_zsh_wrapper_never_supplies_a_read(self):
         for shell in ("zsh", "/bin/zsh"):
             self.assertIsNone(e.codex_plain_read([shell, "-lc", "cat -- src/app.py"]))
-        self.assertEqual("src/app.py", e.codex_plain_read(["/bin/bash", "-lc", "cat -- src/app.py"]))
+        for shell in ("bash", "/bin/bash", "/usr/bin/bash", "sh", "/bin/sh", "/usr/bin/sh"):
+            with self.subTest(shell=shell):
+                self.assertEqual("src/app.py", e.codex_plain_read([shell, "-c", "cat -- src/app.py"]))
 
     def test_codex_error_cause_uses_codex_classification_never_provider_text(self):
         secret = "provider body req_fixture-only"

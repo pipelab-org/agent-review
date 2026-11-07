@@ -55,8 +55,8 @@ jobs:
       run: python scripts/test_provider_dry_run.py --codex-action trusted-codex-action
   codex-multisession-proof:
     # Disposable hosted runner only: this job creates an account, a root socket and privileged
-    # fixtures. It proves the launch identity and cleanup of the multi-session launcher with a probe
-    # executable and no provider credentials. It is not proof of Codex's :read-only sandbox.
+    # fixtures. The probe checks the identity; the pinned real CLI then checks its read-only
+    # sandbox and native receipt path against a local Responses fixture, without provider credentials.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -98,6 +98,10 @@ jobs:
       run: python scripts/hosted_codex_sandbox_proof.py canary-probe --user "$REVIEW_PROOF_USER" --expect denied
     - name: Launcher identity, isolation and cleanup proof
       run: python scripts/hosted_codex_sandbox_proof.py identity --user "$REVIEW_PROOF_USER" --head "$GITHUB_WORKSPACE"
+    - name: Install the pinned native CLI
+      run: npm install --global @openai/codex@0.165.0
+    - name: Real native Codex sessions with offline Responses and no provider credentials
+      run: python scripts/hosted_codex_sandbox_proof.py native --user "$REVIEW_PROOF_USER" --codex "$(command -v codex)"
 'on':
   pull_request:
     branches:

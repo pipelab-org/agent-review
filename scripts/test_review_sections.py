@@ -257,6 +257,30 @@ class RepositoryPlanTests(unittest.TestCase):
         public.pop("learnings_text")
         self.assertEqual(public, e.build_bundle(self.root, head, self.base, small, learning_metadata=rich["learnings"]))
 
+    def test_excluded_paths_stay_complete_without_filling_the_prompt(self):
+        (self.root / "keep.txt").write_text("changed\n")
+        ignored = self.root / "ignored"
+        ignored.mkdir()
+        for index in range(400):
+            (ignored / (f"{index:04d}-" + "a" * 100)).write_text("ignored\n")
+        head = self.head()
+        small = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
+        bundle = e.build_bundle(self.root, head, self.base, small, exclusions=("ignored/*",))
+        self.assertEqual(1, len(bundle["sections"]))
+        self.assertEqual(["keep.txt"], [file["path"] for file in bundle["files"]])
+        self.assertEqual(400, len(bundle["exclusions"]))
+        self.check_exact(bundle)
+        raw = (bundle.store.directory / "exclusions.json").read_text()
+        self.assertEqual(bundle["exclusions"], json.loads(raw))
+        for provider, strategy in e.PROMPT_KINDS:
+            prompt = e.section_prompt(bundle, provider, strategy, 0)
+            self.assertIn(s.sha256_text(raw), prompt)
+            self.assertIn(".git/agent-review/exclusions.json", prompt)
+            self.assertNotIn(bundle["exclusions"][-1], prompt)
+            self.assertLessEqual(e.token_bound(prompt + json.dumps(e.OUTPUT_SCHEMA)),
+                                 small["max_model_tokens"] - small["max_output_tokens"])
+        self.assertEqual(bundle, e.build_bundle(self.root, head, self.base, small, exclusions=("ignored/*",)))
+
     def test_the_store_needs_a_real_git_directory_and_is_rebuilt_each_time(self):
         (self.root / "keep.txt").write_text("changed\n")
         head = self.head()

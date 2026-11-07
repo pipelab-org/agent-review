@@ -467,4 +467,7 @@ def write_index(bundle, store):
     text = "".join(lines)
     store.index().write_text(text, encoding="utf-8")
     store.index().chmod(0o644)
+    excluded = store.directory / "exclusions.json"
+    excluded.write_text(canonical(bundle["exclusions"]), encoding="utf-8")
+    excluded.chmod(0o644)
     return text

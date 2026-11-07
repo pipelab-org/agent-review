@@ -2077,6 +2077,62 @@ class JobTests(unittest.TestCase):
                 f.assemble(root, bad)
         self.assertEqual(root, f.record_root(f.assemble(root, pages)))
 
+        # Exercise reuse of the publisher's actual output, not only page assembly.
+        from scripts.test_review_followups import run_data
+        record = f.assemble(root, pages)
+        artifact = NS(name="agent-review-completion", expired=False)
+        self.repo.get_workflow_run = lambda _: NS(raw_data=run_data(record), get_artifacts=lambda: [artifact])
+        def verified():
+            return f.verified_records(self.repo, self.pr, record["context"], lambda _: record)
+        self.assertEqual({123: record}, verified())
+        self.assertTrue(record["continuations"])
+        entry = record["continuations"][0]
+        continuation = self.pr.comments[entry["id"]]
+        del self.pr.comments[entry["id"]]
+        self.assertEqual({}, verified(), "missing visible findings must not suppress a fresh review")
+        self.pr.comments[entry["id"]] = continuation
+        original = continuation.body
+        continuation.body += "changed"
+        self.assertEqual({}, verified(), "the summary digest alone does not bind continuation text")
+        continuation.body = original
+        continuation.user = NS(login="another-user", id=1, type="User")
+        self.assertEqual({}, verified())
+        continuation.user = NS(**f.BOT)
+        self.assertEqual({123: record}, verified())
+
+
+    def test_many_overlapping_findings_use_bounded_verified_threads(self):
+        self.sectioned()
+        calls = []
+        def findings(strategy):
+            calls.append(1)
+            return [finding(path="app.py", line=1, end_line=1, title=f"Candidate {len(calls)}.{i}",
+                            mechanism=f"{len(calls)}.{i}: " + "evidence " * 400) for i in range(e.MAX_FINDINGS)]
+        self.build(findings, single=False)
+        j.publish_artifact(self.artifact, self.head_dir)
+        record = self.completion()
+        self.assertGreater(len(self.pr.roots), 1)
+        self.assertTrue(all(len(c.body.encode()) <= f.MAX_DATA_BYTES for c in self.pr.roots))
+        rebuilt = [item for root in self.pr.roots for item in j.reconstruct_root(root, record)]
+        self.assertCountEqual(record["findings"], rebuilt)
+
+    def test_oversized_individual_finding_keeps_a_bound_thread_and_all_summary_text(self):
+        self.build([finding(path="app.py", mechanism="雪" * 24000)])
+        j.publish_artifact(self.artifact, self.head_dir)
+        record = self.completion()
+        self.assertEqual(1, len(self.pr.roots))
+        root = self.pr.roots[0]
+        self.assertLessEqual(len(root.body.encode()), f.MAX_DATA_BYTES)
+        self.assertIn("full finding is in this run's review summary", root.body)
+        self.assertEqual(record["findings"], j.reconstruct_root(root, record))
+        continued = [self.pr.comments[c["id"]].body for c in record["continuations"]]
+        self.assertTrue(continued)
+        self.assertTrue(all(len(c.body.encode()) <= f.MAX_DATA_BYTES for c in self.pr.comments.values()))
+        text = self.summary() + "".join(continued)
+        self.assertEqual(24000, text.count("雪"))
+        root.body = root.body.replace("digest=", "digest=0")
+        with self.assertRaises(e.ReviewAbort):
+            j.reconstruct_root(root, record)
 
     def stopped_infer(self, stop_at):
         """Run the inference step as the review job does, with the provider failing on call `stop_at`."""

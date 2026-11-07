@@ -256,6 +256,7 @@ class PagedEvidenceTests(unittest.TestCase):
         # A consistent re-paging of tampered content still fails: the lists must be well formed.
         for bulk in ({"findings": [None], "roots": [], "receipt": {}, "continuations": []},
                      {"findings": [], "roots": [{"id": 1}], "receipt": {}, "continuations": []},
+                     {"findings": [], "roots": [], "receipt": {}, "continuations": [{"id": 1}]},
                      {"findings": [], "roots": [], "receipt": {}}):
             raw = f.canonical(bulk).encode()
             chunks = [raw[i:i + f.MAX_DATA_BYTES] for i in range(0, len(raw), f.MAX_DATA_BYTES)]

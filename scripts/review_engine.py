@@ -193,7 +193,7 @@ def token_bound(text):
 BINARY_MESSAGE = "Changed binary file is outside source review coverage; declare an exclusion"
 # Manifest format version. Bump it with any change to what the plan binds or how a
 # section is rendered, so an older artifact can never validate against a newer plan.
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2
 # The prompt shapes a depth can send; planning sizes the largest of them.
 PROMPT_KINDS = (("claude", "bundle"), ("claude", "callers"), ("codex", "callers"))
 # Width of every number in a section note while the section count is still unknown.
@@ -973,6 +973,10 @@ source_block = sections.source_block
 def metadata_text(bundle):
     # A fixed key order, so a bundle reloaded from sorted JSON renders the same prompt bytes.
     metadata = {k: bundle[k] for k in ("head", "base", "merge_base", "from", "exclusions", "omitted") if k in bundle}
+    excluded = metadata.get("exclusions", [])
+    if excluded:
+        metadata["exclusions"] = {"count": len(excluded), "sha256": sections.sha256_text(sections.canonical(excluded)),
+                                  "file": ".git/agent-review/exclusions.json"}
     return "Untrusted source bundle metadata:\n" + json.dumps(metadata, ensure_ascii=False) + "\n"
 
 
@@ -1187,7 +1191,8 @@ def codex_plain_read(command):
         return None
     # Only shells whose expansion rules unquoted_shell_syntax was checked against.
     # zsh expands more forms (for example =cmd), so its wrappers never supply receipts.
-    if (len(command) == 3 and command[0] in ("bash", "/bin/bash", "sh", "/bin/sh")
+    # The pinned native CLI resolves Bash to /usr/bin/bash on merged-/usr systems.
+    if (len(command) == 3 and command[0] in ("bash", "/bin/bash", "/usr/bin/bash", "sh", "/bin/sh", "/usr/bin/sh")
             and command[1] in ("-c", "-lc")):
         script = command[2]
         # Shell expansion and control flow can skip a classified read, hide its

@@ -52,6 +52,7 @@ class FollowupAbort(Exception):
 # Lists that live in v3 pages, never in the bounded root.
 BULK = ("findings", "roots", "receipt", "continuations")
 PAGE_NAME = "pages/{:06d}.part"
+CONTINUATION = "<!-- agent-review-continuation:v1 run={run} page={page} -->"
 ASK = "/ask"
 DEFAULT_QUESTION = "Re-check this finding against the head checkout."
 
@@ -170,6 +171,33 @@ def valid_evidence(evidence):
             and isinstance(evidence["chain"], str) and re.fullmatch(DIGEST, evidence["chain"]) is not None)
 
 
+def valid_continuations(entries):
+    if not isinstance(entries, list):
+        return False
+    seen = set()
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != {"id", "digest"}
+                or not positive(entry["id"]) or entry["id"] in seen
+                or not isinstance(entry["digest"], str) or not re.fullmatch(DIGEST, entry["digest"])):
+            return False
+        seen.add(entry["id"])
+    return True
+
+
+def intact_continuations(record, comments):
+    """Every page of the published summary must still be visible and unchanged."""
+    entries = record.get("continuations")
+    if not valid_continuations(entries):
+        return False
+    for number, entry in enumerate(entries, 1):
+        comment = comments.get(entry["id"])
+        marker = CONTINUATION.format(run=record["run_id"], page=number)
+        if (comment is None or not identity(comment.user, BOT) or not isinstance(comment.body, str)
+                or comment.body.split("\n", 1)[0] != marker or digest(comment.body) != entry["digest"]):
+            return False
+    return True
+
+
 def parse_record(comment, comments):
     """Validate both structured content and its independently published summary.
 
@@ -279,7 +307,7 @@ def assemble(root, pages):
         raise FollowupAbort("Completion evidence pages are not valid JSON") from None
     if (not isinstance(bulk, dict) or set(bulk) != set(BULK) or not valid_findings(bulk["findings"])
             or not valid_roots(bulk["roots"], root["context"]) or not isinstance(bulk["receipt"], dict)
-            or not isinstance(bulk["continuations"], list)):
+            or not valid_continuations(bulk["continuations"])):
         raise FollowupAbort("Completion evidence pages are malformed")
     return {**root, **bulk}
 
@@ -400,7 +428,8 @@ def verified_records(repo, pr, current, load_artifact, *, contexts=None, ownersh
             loaded = load_artifact(artifacts[0]) if len(artifacts) == 1 else None
             # A v3 root alone proves coverage but lists nothing; consumers need the verified lists.
             if (not isinstance(loaded, dict) or record_root(loaded) != record
-                    or (record["version"] == 3 and any(key not in loaded for key in BULK))):
+                    or (record["version"] == 3 and (any(key not in loaded for key in BULK)
+                                                    or not intact_continuations(loaded, comments)))):
                 continue
             records[record["run_id"]] = loaded
         except Exception as error:
