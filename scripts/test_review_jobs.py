@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from types import SimpleNamespace as NS
@@ -877,6 +878,10 @@ class JobTests(unittest.TestCase):
             with patch.object(e, active, side_effect=run) as provider, patch.object(e, inactive) as unused:
                 j.infer(self.plan, self.artifact, self.head_dir, "/action", "/home")
             unused.assert_not_called()
+            if policy["provider"] == "codex":
+                self.assertEqual(["callers"], [c.args[2] for c in provider.call_args_list])
+                self.assertIsNone(json.loads(self.artifact.read_text())["verification"])
+                continue
             self.assertEqual(1, sum(c.args[2] == "verify-threads" for c in provider.call_args_list))
             self.assertEqual(policy, provider.call_args_list[-1].args[0])
             self.assertIs(j.VERIFICATION_SCHEMA, provider.call_args_list[-1].kwargs["schema"])
@@ -898,6 +903,184 @@ class JobTests(unittest.TestCase):
             j.infer(self.plan, self.artifact, self.head_dir)
         claude.assert_not_called(); codex.assert_not_called()
         self.assertIsNone(json.loads(self.artifact.read_text())["verification"])
+
+    def codex_followup(self, depth="codex", learning_data=None):
+        proof, root = self.prior_threads()
+        os.environ["REVIEW_DEPTH"] = depth
+        command = "/review codex deep" if depth == "codex-deep" else "/review codex"
+        self.event["comment"]["body"] = command
+        self.event_path.write_text(json.dumps(self.event))
+        self.pr.comments[9].body = command
+        self.pr.comments[9].raw_data["body"] = command
+        original = j.write_learning_identity
+        def identity(ctx):
+            original(ctx)
+            os.environ["REVIEW_LEARNINGS_IDENTITY"] = json.dumps(ctx["learnings"])
+        with patch.object(j, "records", return_value={123: proof}), \
+                patch.object(e.learnings, "consume_from_env", return_value=learning_data or e.learnings.empty()), \
+                patch.object(j, "write_learning_identity", side_effect=identity):
+            j.prepare(self.head_dir, self.plan)
+        output = self.root / "outputs"
+        def run(policy, bundle, strategy, head, *args, **kwargs):
+            r = receipt(strategy)
+            r.update(provider="codex", model=policy["model"], files_opened=["app.py"])
+            return {"findings": [], "receipt": r}
+        with patch.object(e, "run_codex", side_effect=run) as provider, \
+                patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+            j.infer(self.plan, self.artifact, self.head_dir, "/action", "/home")
+        self.assertEqual(["callers"], [c.args[2] for c in provider.call_args_list])
+        self.assertEqual("run_verification=true\n", output.read_text())
+        artifact = json.loads(self.artifact.read_text())
+        self.assertIsNone(artifact["verification"])
+        self.assertNotIn("learnings_text", artifact["plan"]["bundle"])
+        self.pr.writes.clear()
+        return proof, root, artifact
+
+    def run_codex_followup(self, artifact, output):
+        verification = self.verified(artifact["plan"])
+        verification["receipt"]["provider"] = "codex"
+        with patch.object(e, "run_codex", return_value=verification) as provider, \
+                patch.object(e, "run_claude") as claude:
+            j.verify_artifact(self.artifact, output, self.head_dir, "/action", "/home")
+        claude.assert_not_called()
+        self.assertEqual(1, provider.call_count)
+        self.assertEqual("verify-threads", provider.call_args.args[2])
+        self.assertIs(j.VERIFICATION_SCHEMA, provider.call_args.kwargs["schema"])
+        self.assertNotIn("learnings_text", provider.call_args.kwargs["prompt"])
+        return json.loads(output.read_text())
+
+    def test_codex_followup_runs_separately_and_publishes_bound_resolution(self):
+        proof, root, artifact = self.codex_followup()
+        output = self.root / "verification.json"
+        result = self.run_codex_followup(artifact, output)
+        self.assertEqual(j.verification_binding(artifact), {k: v for k, v in result.items() if k != "verification"})
+        self.assertEqual(int(os.environ["GITHUB_RUN_ID"]), result["run_id"])
+        self.assertEqual([], self.pr.writes)
+        with patch.object(j, "records", return_value={123: proof}):
+            j.publish_artifact(self.artifact, self.head_dir, output)
+        self.assertTrue(self.pr.threads[root.id]["isResolved"])
+        self.assertTrue(any(kind == "resolve" for kind, _ in self.pr.writes))
+        self.assertTrue((self.root / "completion.json").is_file())
+
+    def test_codex_deep_followup_keeps_host_depth_limits(self):
+        _, _, artifact = self.codex_followup("codex-deep")
+        verification = self.verified(artifact["plan"])
+        verification["receipt"]["provider"] = "codex"
+        with patch.object(e, "run_codex", return_value=verification) as provider:
+            j.verify_artifact(self.artifact, self.root / "verification.json", self.head_dir, "/action", "/home")
+        self.assertEqual(j.settings()[0], provider.call_args.args[0])
+
+    def test_codex_followup_consumes_only_stripped_artifact_without_reopening_learnings(self):
+        from scripts.test_review_learnings import data
+        private = "PRIVATE_REVIEW_CONTEXT_SENTINEL"
+        source = data()
+        source["entries"][0]["text"] = private
+        _, _, artifact = self.codex_followup(learning_data=source)
+        self.assertEqual(1, artifact["plan"]["bundle"]["learnings"]["count"])
+        self.assertNotIn(private, self.artifact.read_text())
+        self.assertNotIn(private, self.plan.read_text())
+        output = self.root / "verification.json"
+        with patch.object(e.learnings, "consume_from_env", side_effect=AssertionError("private snapshot reopened")), \
+                patch.object(e.learnings, "from_env", side_effect=AssertionError("private snapshot reopened")):
+            self.run_codex_followup(artifact, output)
+        self.assertNotIn(private, output.read_text())
+
+    def test_codex_followup_missing_failed_or_tampered_never_loses_review_or_resolves(self):
+        proof, root, artifact = self.codex_followup()
+        output = self.root / "verification.json"
+        with patch.object(e, "run_codex", side_effect=e.ReviewAbort("fixed failure")) as provider:
+            with self.assertRaisesRegex(e.ReviewAbort, "fixed failure"):
+                j.verify_artifact(self.artifact, output, self.head_dir, "/action", "/home")
+        self.assertEqual(1, provider.call_count)
+        self.assertFalse(output.exists())
+        good = self.run_codex_followup(artifact, output)
+        mutations = [None, "{bad json", {}, dict(good, run_id=good["run_id"] + 1),
+            dict(good, artifact_digest="0" * 64), dict(good, verification=None),
+            dict(good, context=dict(good["context"], head="f" * 40)),
+            dict(good, context=dict(good["context"], reviewer="f" * 40)),
+            dict(good, context=dict(good["context"], depth="codex-deep")),
+            dict(good, context=dict(good["context"], number=True)),
+            dict(good, run_id=float(good["run_id"])),
+            dict(good, unexpected="data")]
+        incomplete = copy.deepcopy(good)
+        incomplete["verification"]["output"]["threads"] = []
+        mutations.append(incomplete)
+        for invalid in mutations:
+            with self.subTest(invalid=invalid):
+                if output.exists():
+                    output.unlink()
+                if invalid is not None:
+                    output.write_text(invalid if isinstance(invalid, str) else json.dumps(invalid))
+                self.pr.writes.clear()
+                with patch.object(j, "records", return_value={123: proof}), \
+                        patch("sys.stdout", new_callable=io.StringIO) as log:
+                    j.publish_artifact(self.artifact, self.head_dir, output)
+                self.assertIn(j.FOLLOWUP_NOTE, log.getvalue())
+                self.assertFalse(self.pr.threads[root.id]["isResolved"])
+                self.assertFalse(any(kind == "resolve" for kind, _ in self.pr.writes))
+                self.assertTrue((self.root / "completion.json").is_file())
+                summaries = [text for kind, text in self.pr.writes if kind == "issue" and "Reviewed base" in text]
+                self.assertTrue(any(j.FOLLOWUP_NOTE in text for text in summaries))
+
+    def test_codex_followup_digest_binds_otherwise_valid_changes_to_the_main_artifact(self):
+        # Only the digest can notice this edit: the receipt stays valid and nothing live disagrees.
+        proof, root, artifact = self.codex_followup()
+        output = self.root / "verification.json"
+        self.run_codex_followup(artifact, output)
+        receipt = artifact["result"]["receipt"]["passes"][0]
+        receipt["cost_usd"] = 0.0 if receipt["cost_usd"] else 0.001
+        self.artifact.write_text(json.dumps(artifact))
+        with patch.object(j, "records", return_value={123: proof}), \
+                patch("sys.stdout", new_callable=io.StringIO) as log:
+            j.publish_artifact(self.artifact, self.head_dir, output)
+        self.assertIn(j.FOLLOWUP_NOTE, log.getvalue())
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertFalse(any(kind == "resolve" for kind, _ in self.pr.writes))
+        self.assertTrue((self.root / "completion.json").is_file())
+
+    def test_codex_followup_runs_once_per_artifact(self):
+        _, _, artifact = self.codex_followup()
+        artifact["verification"] = self.verified(artifact["plan"])
+        self.artifact.write_text(json.dumps(artifact))
+        with patch.object(e, "run_codex") as provider, self.assertRaises(e.ReviewAbort):
+            j.verify_artifact(self.artifact, self.root / "verification.json", self.head_dir, "/action", "/home")
+        provider.assert_not_called()
+
+    def test_codex_followup_changed_thread_plan_fails_the_live_thread_check(self):
+        proof, root, artifact = self.codex_followup()
+        output = self.root / "verification.json"
+        self.run_codex_followup(artifact, output)
+        artifact["plan"]["threads"][0]["findings"][0]["body"] += " changed after verification"
+        self.artifact.write_text(json.dumps(artifact))
+        with patch.object(j, "records", return_value={123: proof}), \
+                patch("sys.stdout", new_callable=io.StringIO) as log:
+            j.publish_artifact(self.artifact, self.head_dir, output)
+        self.assertIn(j.FOLLOWUP_NOTE, log.getvalue())
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertFalse(any(kind == "resolve" for kind, _ in self.pr.writes))
+        self.assertTrue((self.root / "completion.json").is_file())
+
+    def test_codex_followup_rejects_modified_main_artifact_before_inference(self):
+        _, _, artifact = self.codex_followup()
+        variants = []
+        for field in ("head", "reviewer", "depth", "profile_hash", "common_config"):
+            bad = copy.deepcopy(artifact)
+            bad["plan"]["context"][field] = "changed"
+            variants.append(bad)
+        bad = copy.deepcopy(artifact)
+        bad["plan"]["context"]["number"] = True
+        variants.append(bad)
+        bad = copy.deepcopy(artifact)
+        bad["plan"]["bundle"]["learnings_text"] = "private raw text"
+        variants.append(bad)
+        bad = copy.deepcopy(artifact)
+        bad["result"]["receipt"]["passes"] = []
+        variants.append(bad)
+        for bad in variants:
+            self.artifact.write_text(json.dumps(bad))
+            with patch.object(e, "run_codex") as provider, self.assertRaises(e.ReviewAbort):
+                j.verify_artifact(self.artifact, self.root / "verification.json", self.head_dir, "/action", "/home")
+            provider.assert_not_called()
 
     def test_no_proof_and_unchanged_prepare_do_not_collect_threads(self):
         with patch.object(f, "review_threads") as query:
@@ -1473,6 +1656,104 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = yaml.safe_load((e.ROOT / ".github/workflows/agent-review-reusable.yaml").read_text())
 
+    def test_provider_health_is_manual_main_only_and_keeps_provider_credentials_separate(self):
+        workflow = yaml.load((e.ROOT / ".github/workflows/provider-health.yaml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual({"workflow_dispatch"}, set(workflow["on"]))
+        for name, job in workflow["jobs"].items():
+            with self.subTest(job=name):
+                self.assertIn("github.ref == 'refs/heads/main'", job["if"])
+                self.assertIn("github.run_attempt == '1'", job["if"])
+                self.assertIn("github.actor == 'luckyPipewrench'", job["if"])
+                self.assertIn("github.actor_id == '142104046'", job["if"])
+                self.assertEqual({"contents": "read"}, job["permissions"])
+                self.assertEqual("ubuntu-24.04", job["runs-on"])
+                self.assertEqual("${{ github.workflow_sha }}", job["steps"][0]["with"]["ref"])
+                self.assertEqual("false", job["steps"][0]["with"]["persist-credentials"])
+                self.assertNotIn("OPENAI_API_KEY" if name == "claude" else "ANTHROPIC_API_KEY", json.dumps(job))
+                for step in job["steps"]:
+                    if "uses" in step:
+                        self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
+
+    def test_codex_followup_has_fresh_read_only_setup_and_no_anthropic_credentials(self):
+        job = self.workflow["jobs"]["codex-verification"]
+        self.assertEqual("ubuntu-24.04", job["runs-on"])
+        self.assertEqual(["source", "admit", "review"], job["needs"])
+        self.assertIn("needs.review.outputs.run_verification == 'true'", job["if"])
+        self.assertTrue(all(value == "read" for value in job["permissions"].values()))
+        self.assertNotIn("ANTHROPIC", json.dumps(job))
+        self.assertNotIn("GITHUB_TOKEN", json.dumps(job.get("env", {})))
+        self.assertNotIn("LEARNINGS_APP", json.dumps(job))
+        steps = job["steps"]
+        source = next(s for s in steps if s["name"] == "Check out immutable agent-review source")
+        self.assertEqual("${{ needs.source.outputs.reviewer_sha }}", source["with"]["ref"])
+        head = next(s for s in steps if s["name"] == "Check out immutable head as read-only data")
+        self.assertEqual("${{ needs.admit.outputs.head }}", head["with"]["ref"])
+        home = next(s for s in steps if s["name"] == "Prepare trusted Codex home")
+        self.assertIn("trusted-agent-review/.github/codex-config.toml", home["run"])
+        infer = next(s for s in steps if s["name"] == "Verify recorded threads against the admitted head")
+        self.assertNotIn("env", infer)
+        self.assertIn("review_jobs.py verify", infer["run"])
+        self.assertEqual(1, sum("review_jobs.py verify" in s.get("run", "") for s in steps))
+        review = self.workflow["jobs"]["review"]
+        self.assertEqual("${{ steps.inference.outputs.run_verification }}", review["outputs"]["run_verification"])
+
+    def test_provider_health_probes_both_anthropic_slots_without_cross_account_fallback(self):
+        workflow = yaml.safe_load((e.ROOT / ".github/workflows/provider-health.yaml").read_text())
+        job = workflow["jobs"]["claude"]
+        self.assertFalse(job["strategy"]["fail-fast"])
+        self.assertEqual([
+            {"credential": "primary", "secret": "ANTHROPIC_API_KEY"},
+            {"credential": "secondary", "secret": "ANTHROPIC_API_KEY_2"},
+        ], job["strategy"]["matrix"]["include"])
+        self.assertIn("matrix.credential", job["name"])
+        probe = next(step for step in job["steps"] if "ANTHROPIC_API_KEY" in step.get("env", {}))
+        self.assertEqual({"ANTHROPIC_API_KEY": "${{ secrets[matrix.secret] }}",
+                          "ANTHROPIC_API_KEY_2": ""}, probe["env"])
+        script = probe["run"].split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        for findings in ([], [{"unexpected": "finding"}]):
+            with self.subTest(findings=findings), \
+                    patch.object(e, "run_claude", return_value={"findings": findings}), \
+                    patch("sys.stdout", new_callable=io.StringIO) as output:
+                if findings:
+                    with self.assertRaises(SystemExit):
+                        exec(compile(script, "<health-probe>", "exec"), {})
+                else:
+                    exec(compile(script, "<health-probe>", "exec"), {})
+                    self.assertIn("Anthropic connectivity passed", output.getvalue())
+
+    def test_per_pr_queue_covers_verification_and_publication(self):
+        concurrency = self.workflow["concurrency"]
+        self.assertEqual({"cancel-in-progress": False, "queue": "max"},
+                         {k: v for k, v in concurrency.items() if k != "group"})
+        self.assertEqual(
+            "agent-review-${{ github.repository }}-${{ (github.event_name == 'issue_comment' || "
+            "startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')) "
+            "&& (github.event.issue.number || github.event.pull_request.number) || github.run_id }}",
+            concurrency["group"])
+        self.assertTrue(all("concurrency" not in job for job in self.workflow["jobs"].values()))
+
+    def test_queue_membership_matches_reply_admission_prefixes(self):
+        # The caller admits any human inline reply; plain conversation must not take a
+        # slot in the 100-pending per-PR queue, so the group names the reply job's prefixes.
+        prefixes = lambda text: set(re.findall(r"startsWith\(github\.event\.comment\.body, '(/[a-z]+)'\)", text))
+        reply = prefixes(self.workflow["jobs"]["reply"]["if"])
+        self.assertEqual({"/ask", "/resolve"}, reply)
+        self.assertEqual(reply, prefixes(self.workflow["concurrency"]["group"]))
+        self.assertIn("|| github.run_id }}", self.workflow["concurrency"]["group"])
+
+    def test_publication_preserves_main_review_when_optional_verification_skips_or_fails(self):
+        job = self.workflow["jobs"]["publish"]
+        self.assertIn("codex-verification", job["needs"])
+        self.assertEqual("!cancelled() && needs.review.result == 'success'", job["if"])
+        notifier = self.workflow["jobs"]["notify-failure"]
+        self.assertIn("codex-verification", notifier["needs"])
+        self.assertIn("|| cancelled()", notifier["if"])
+        download = next(s for s in job["steps"] if s["name"] == "Download optional thread verification")
+        self.assertEqual("needs.codex-verification.result == 'success'", download["if"])
+        self.assertTrue(download["continue-on-error"])
+        infer = next(s for s in job["steps"] if s["name"] == "Validate and publish immutable findings")
+        self.assertIn('--verification "$RUNNER_TEMP/agent-review-verification/verification.json"', infer["run"])
+
     def test_inference_has_no_write_permissions_and_publish_has_no_provider_secrets(self):
         for name in ("review", "reply"):
             job = self.workflow["jobs"][name]
@@ -1511,7 +1792,7 @@ class WorkflowTests(unittest.TestCase):
         # Both jobs that run Codex (review and inline reply) carry their own setup copy.
         setups = [(name, step) for name, job in self.workflow["jobs"].items() for step in job.get("steps", [])
                   if "openai/codex-action@" in step.get("uses", "")]
-        self.assertEqual(["reply", "review"], sorted(name for name, _ in setups))
+        self.assertEqual(["codex-verification", "reply", "review"], sorted(name for name, _ in setups))
         for name, action in setups:
             with self.subTest(job=name):
                 self.assertEqual(":read-only", action["with"]["permission-profile"])
@@ -1525,7 +1806,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("2.1.312", json.dumps(self.workflow["jobs"]["review"]))
 
     def test_root_base_head_subdirectory_and_trusted_policy_binding(self):
-        for name in ("review", "reply", "publish", "publish-reply"):
+        for name in ("review", "reply", "codex-verification", "publish", "publish-reply"):
             steps = self.workflow["jobs"][name]["steps"]
             base = next(s for s in steps if s.get("name") == "Check out trusted base at workspace root")
             head = next(s for s in steps if s.get("name") == "Check out immutable head as read-only data")

@@ -546,8 +546,14 @@ class IntegrationTests(unittest.TestCase):
                     with patch.object(e, "run_claude", side_effect=claude), \
                             patch.object(e, "codex_command", side_effect=command):
                         j.infer(fx.plan, fx.artifact, fx.head_dir, "/fixture-action", home)
+                        if provider == "codex":
+                            self.assertIsNone(json.loads(fx.artifact.read_text())["verification"])
+                            separate = work / "verification.json"
+                            j.verify_artifact(fx.artifact, separate, fx.head_dir, "/fixture-action", home)
                 artifact = json.loads(fx.artifact.read_text())
-                self.assertIsNotNone(artifact["verification"])
+                verification = (json.loads(separate.read_text())["verification"]
+                                if provider == "codex" else artifact["verification"])
+                self.assertIsNotNone(verification)
                 self.assertEqual("verification", calls[-1])
                 self.assertNotIn("learnings_text", artifact["plan"]["bundle"])
                 self.assertNotIn("learnings_date", artifact["plan"])

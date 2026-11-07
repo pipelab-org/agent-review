@@ -413,7 +413,7 @@ class ReporterTests(unittest.TestCase):
 
     def test_reporter_is_host_only_and_minimally_privileged(self):
         job = WORKFLOW['jobs']['notify-failure']
-        self.assertEqual(['source', 'admit', 'review', 'publish', 'reply'], job['needs'])
+        self.assertEqual(['source', 'admit', 'review', 'codex-verification', 'publish', 'reply'], job['needs'])
         self.assertIn('always()', job['if'])
         self.assertEqual({'pull-requests': 'write'}, job['permissions'])
         self.assertNotIn('container', job)
@@ -455,7 +455,7 @@ class ReporterTests(unittest.TestCase):
         command_body = self.calls[-1][2]['body']
         self.assertIn("revocation couldn't be confirmed", command_body)
         self.assertIn('incomplete', command_body)
-        self.assertIn('Post a fresh review command on the current snapshot; Actions reruns are refused.', command_body)
+        self.assertIn('Inspect and fix the diagnosed cause before a fresh review command on the current snapshot; Actions reruns are refused.', command_body)
         self.event.pop('issue')
         self.event['pull_request'] = {'number': 1}
         self.event['comment'].update(in_reply_to_id=8, body='SENTINEL_private_text')
@@ -466,7 +466,7 @@ class ReporterTests(unittest.TestCase):
         self.execute()
         self.assertEqual('POST', self.calls[-1][0])
         self.assertIn("revocation couldn't be confirmed", self.calls[-1][2]['body'])
-        self.assertIn('Reply /ask in the review thread to retry; Actions reruns are refused.', self.calls[-1][2]['body'])
+        self.assertIn('Inspect and fix the diagnosed cause before a new /ask in the review thread; Actions reruns are refused.', self.calls[-1][2]['body'])
         self.assertNotIn('review command', self.calls[-1][2]['body'])
         self.assertNotIn('SENTINEL_private_text', self.calls[-1][2]['body'])
         for field, value in (('LEARNINGS_REVOKE_FAILED', 'false'), ('GITHUB_RUN_ATTEMPT', '2'),

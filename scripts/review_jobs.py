@@ -281,9 +281,10 @@ def strip_learning_text(plan):
 
 def infer(plan_path, output, head_dir, action=None, codex_home=None):
     policy, depth = settings()
+    credentials = engine.ClaudeCredentials() if policy["provider"] == "claude" else None
     ctx, _ = context(policy, depth)
     plan = engine.strict_json(Path(plan_path).read_text())
-    if plan["context"] != ctx:
+    if followups.canonical(plan["context"]) != followups.canonical(ctx):
         raise ReviewAbort("Inference plan differs from trusted workflow context")
     # Models need the selection only in memory. No later pass may read it from
     # the prepared plan, even if the first inference fails.
@@ -292,14 +293,14 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
         if plan["reused"] or plan["resolve_command"]:
             result = None
         else:
-            result = infer_reply(policy, plan, head_dir)
+            result = infer_reply(policy, plan, head_dir, credentials=credentials)
     elif plan["scope"]["kind"] == "unchanged":
         result = None
     else:
         results = []
         for strategy in policy["passes"]:
             if policy["provider"] == "claude":
-                results.append(engine.run_claude(policy, plan["bundle"], strategy, head_dir))
+                results.append(engine.run_claude(policy, plan["bundle"], strategy, head_dir, credentials=credentials))
             else:
                 results.append(engine.run_codex(policy, plan["bundle"], strategy, head_dir, action,
                                                 codex_home, Path(output).parent))
@@ -308,16 +309,15 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
         validate_locations(result, head_dir, ctx["head"])
     strip_learning_text(plan)
     verification = None
-    if plan["kind"] == "review" and plan["scope"]["kind"] != "unchanged" and plan.get("threads"):
+    needs_verification = (plan["kind"] == "review" and plan["scope"]["kind"] != "unchanged"
+                          and bool(plan.get("threads")))
+    if needs_verification and policy["provider"] == "claude":
         try:
             prompt = verification_prompt(plan)
             kwargs = dict(prompt=prompt, schema=VERIFICATION_SCHEMA,
                           validate_output=validate_verification, output_key="output")
-            if policy["provider"] == "claude":
-                verification = engine.run_claude(policy, {"files": []}, "verify-threads", head_dir, **kwargs)
-            else:
-                verification = engine.run_codex(policy, {"files": []}, "verify-threads", head_dir,
-                    action, codex_home, Path(output).parent / "verification", **kwargs)
+            verification = engine.run_claude(policy, {"files": []}, "verify-threads", head_dir,
+                                             credentials=credentials, **kwargs)
             verification["output"] = validate_verification_result(verification, plan["threads"], policy, head_dir, ctx["head"])
         except engine.ReviewAbort as error:
             # ReviewAbort text is fixed engine wording, never provider output.
@@ -329,9 +329,12 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
             print(FOLLOWUP_NOTE)
     # Exact byte metadata reproduces bundle sizing without fetching private text.
     engine.save(output, {"plan": plan, "result": result, "verification": verification})
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+            stream.write(f"run_verification={'true' if needs_verification and policy['provider'] == 'codex' else 'false'}\n")
 
 
-def infer_reply(policy, plan, head_dir):
+def infer_reply(policy, plan, head_dir, *, credentials=None):
     meta = engine.learnings.validate_metadata(plan["learnings"], policy)
     text = plan.get("learnings_text", "")
     if (not isinstance(text, str) or len(text.encode("utf-8")) != meta["bytes"]
@@ -339,7 +342,8 @@ def infer_reply(policy, plan, head_dir):
             or meta["sha"] != plan["context"]["learnings"]["sha"]):
         raise ReviewAbort("Reply learnings differ from prepared context")
     result = engine.run_claude(policy, {"files": []}, "reply", head_dir,
-        prompt=plan["prompt"] + text, schema=REPLY_SCHEMA, validate_output=validate_reply, output_key="output")
+        prompt=plan["prompt"] + text, schema=REPLY_SCHEMA, validate_output=validate_reply, output_key="output",
+        credentials=credentials)
     result["output"] = validate_reply_result(result, plan, policy, head_dir)
     return result
 
@@ -514,6 +518,8 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
     if comments:
         publish.InlinePublisher(pr, ctx["head"], fresh, roots)(commit=repo.get_commit(ctx["head"]), event="COMMENT", comments=comments)
     text = summary_text(ctx, scope, plan["bundle"], result, findings, placement)
+    if plan.get("threads") and verification is None:
+        text += "\n\n" + FOLLOWUP_NOTE
     # Check sizes before any success transition; a partial publication is never reusable.
     if len(text.encode()) > followups.MAX_DATA_BYTES:
         raise ReviewAbort("Summary exceeds the existing data budget")
@@ -987,24 +993,17 @@ def validate_locations(result, repo, head):
             finding["consequence"] = finding["consequence"].rstrip() + "\n\n" + UNVERIFIED_LOCATION_NOTE
 
 
-def publish_artifact(path, head_dir):
-    policy, depth = settings()
-    ctx, profile = context(policy, depth)
-    artifact = engine.strict_json(Path(path).read_text())
+def validate_artifact(artifact, head_dir, policy, ctx, profile):
     if not isinstance(artifact, dict) or set(artifact) != {"plan", "result", "verification"}:
         raise ReviewAbort("Invalid review artifact")
     plan, result = artifact["plan"], artifact["result"]
-    if plan["context"] != ctx:
+    if followups.canonical(plan["context"]) != followups.canonical(ctx):
         raise ReviewAbort("Artifact differs from trusted source/profile/snapshot policy")
     meta = plan["learnings"] if plan["kind"] == "reply" else plan["bundle"]["learnings"]
     engine.learnings.validate_metadata(meta, policy)
     if meta["sha"] != ctx["learnings"]["sha"]:
         raise ReviewAbort("Artifact learnings differ from trusted context")
-    repo = github().get_repo(ctx["repository"])
-    pr = check_pr(repo, ctx)
-    if plan["kind"] == "reply":
-        publish_reply(repo, pr, ctx, policy, plan, result, head_dir)
-    elif plan["kind"] == "review":
+    if plan["kind"] == "review":
         expected = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy, profile["ignore"]["glob"],
                                       start=plan["scope"]["from"] if plan["scope"]["kind"] == "incremental" else None,
                                       instructions=profile["review"]["instructions"],
@@ -1012,21 +1011,90 @@ def publish_artifact(path, head_dir):
         if expected != plan["bundle"]:
             raise ReviewAbort("Artifact bundle differs from immutable source")
         if result is not None:
+            engine.validate_result(result, policy, plan["bundle"])
+    elif plan["kind"] != "reply":
+        raise ReviewAbort("Unknown review artifact kind")
+
+
+def verification_binding(artifact):
+    # Sources: the existing immutable artifact/context contract and GitHub's run ID.
+    run = os.environ["GITHUB_RUN_ID"]
+    if not re.fullmatch(r"[1-9][0-9]*", run):
+        raise ReviewAbort("Invalid workflow run identity")
+    return {"context": artifact["plan"]["context"], "run_id": int(run),
+            "artifact_digest": followups.digest(followups.canonical(artifact))}
+
+
+def verify_artifact(path, output, head_dir, action=None, codex_home=None):
+    """Run the optional Codex follow-up once, in its own fresh job."""
+    policy, depth = settings()
+    ctx, profile = context(policy, depth)
+    artifact = engine.strict_json(Path(path).read_text())
+    validate_artifact(artifact, head_dir, policy, ctx, profile)
+    plan = artifact["plan"]
+    if (policy["provider"] != "codex" or plan["kind"] != "review"
+            or plan["scope"]["kind"] == "unchanged" or not plan.get("threads")
+            or artifact["result"] is None or artifact["verification"] is not None):
+        raise ReviewAbort("Artifact does not request a separate Codex verification")
+    bound = verification_binding(artifact)
+    verification = engine.run_codex(policy, {"files": []}, "verify-threads", head_dir,
+        action, codex_home, Path(output).parent / "verification", prompt=verification_prompt(plan),
+        schema=VERIFICATION_SCHEMA, validate_output=validate_verification, output_key="output")
+    verification["output"] = validate_verification_result(verification, plan["threads"], policy, head_dir, ctx["head"])
+    engine.save(output, dict(bound, verification=verification))
+
+
+def optional_verification(path, artifact, policy, head_dir, head):
+    try:
+        if policy["provider"] == "codex":
+            if path is None:
+                raise ReviewAbort("Separate thread verification artifact is missing")
+            supplied = engine.strict_json(Path(path).read_text())
+            if (not isinstance(supplied, dict)
+                    or set(supplied) != {"context", "run_id", "artifact_digest", "verification"}
+                    or followups.canonical({k: supplied[k] for k in supplied if k != "verification"})
+                    != followups.canonical(verification_binding(artifact))):
+                raise ReviewAbort("Thread verification differs from the original inference artifact")
+            verification = supplied["verification"]
+        else:
+            verification = artifact["verification"]
+        validate_verification_result(verification, artifact["plan"]["threads"], policy, head_dir, head, confirm=False)
+        return verification
+    except Exception:
+        print(FOLLOWUP_NOTE)
+        return None
+
+
+def publish_artifact(path, head_dir, verification_path=None):
+    policy, depth = settings()
+    ctx, profile = context(policy, depth)
+    artifact = engine.strict_json(Path(path).read_text())
+    validate_artifact(artifact, head_dir, policy, ctx, profile)
+    plan, result = artifact["plan"], artifact["result"]
+    verification = (optional_verification(verification_path, artifact, policy, head_dir, ctx["head"])
+                    if plan["kind"] == "review" and plan.get("threads") else None)
+    repo = github().get_repo(ctx["repository"])
+    pr = check_pr(repo, ctx)
+    if plan["kind"] == "reply":
+        publish_reply(repo, pr, ctx, policy, plan, result, head_dir)
+    elif plan["kind"] == "review":
+        if result is not None:
             validate_locations(result, head_dir, ctx["head"])
-        publish_review(repo, pr, ctx, policy, plan, result, artifact["verification"], head_dir)
+        publish_review(repo, pr, ctx, policy, plan, result, verification, head_dir)
     else:
         raise ReviewAbort("Unknown review artifact kind")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("prepare", "infer", "publish", "check-config"))
+    parser.add_argument("mode", choices=("prepare", "infer", "verify", "publish", "check-config"))
     parser.add_argument("--head", type=Path)
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--reply", action="store_true")
     parser.add_argument("--codex-action", type=Path)
     parser.add_argument("--codex-home", type=Path)
+    parser.add_argument("--verification", type=Path)
     args = parser.parse_args()
     try:
         reliability.begin()
@@ -1037,9 +1105,11 @@ def main():
                 prepare(args.head.resolve(), args.output, args.reply)
         elif args.mode == "infer":
             infer(args.input, args.output, args.head.resolve(), args.codex_action, args.codex_home)
+        elif args.mode == "verify":
+            verify_artifact(args.input, args.output, args.head.resolve(), args.codex_action, args.codex_home)
         elif args.mode == "publish":
             with reliability.runtime():
-                publish_artifact(args.input, args.head.resolve())
+                publish_artifact(args.input, args.head.resolve(), args.verification)
     except (Exception, KeyboardInterrupt) as error:
         # Our abort messages are fixed text/config keys; vendor exceptions may echo secrets.
         message = str(error) if isinstance(error, (ReviewAbort, followups.FollowupAbort)) else type(error).__name__
