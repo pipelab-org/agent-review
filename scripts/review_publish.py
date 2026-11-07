@@ -85,6 +85,42 @@ class InlinePublisher:
         return result
 
 
+    def file_thread(self, path, body):
+        """Create one file-level review thread and verify every identity it carries.
+
+        GitHub's create-a-review-comment endpoint takes subject_type "file" with no line
+        (https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request);
+        the batch create-a-review comments are not documented to accept it. One write per
+        thread, never retried: an ambiguous failure aborts, and the head is rechecked
+        before each separate write.
+        """
+        try:
+            with reliability.phase("publication"):
+                return self.publish_file(path, body)
+        except Exception as error:
+            raise ReviewAbort(f"Inline publication verification failed ({type(error).__name__})") from None
+
+    def publish_file(self, path, body):
+        self.check_binding()
+        created = self.pr.create_review_comment(body, self.head, path, subject_type="file")
+        comment = self.pr.get_review_comment(created.id)
+        raw = comment.raw_data
+        review_id = raw.get("pull_request_review_id")
+        if (not followups.identity(comment.user, followups.BOT) or not followups.positive(comment.id)
+                or comment.id != created.id or comment.commit_id != self.head
+                or raw.get("original_commit_id") != self.head or comment.path != path or comment.body != body
+                or raw.get("in_reply_to_id") is not None or raw.get("line") is not None
+                or raw.get("subject_type") not in (None, "file") or not followups.positive(review_id)):
+            raise ReviewAbort("Inline comment publication could not be verified")
+        review = self.pr.get_review(review_id)
+        if (not followups.identity(review.user, followups.BOT) or review.commit_id != self.head
+                or review.state != "COMMENTED"):
+            raise ReviewAbort("Inline review publication identity could not be verified")
+        self.roots.append({"id": comment.id, "review_id": review_id, "path": path, "commit": self.head,
+                           "digest": followups.digest(body)})
+        return comment
+
+
 STATUS_MARKER = "agent-review-status:v1"
 RESULT_MARKER = "agent-review-result:v1"
 

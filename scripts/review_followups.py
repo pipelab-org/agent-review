@@ -11,8 +11,19 @@ https://docs.github.com/en/rest/pulls/comments
 https://docs.github.com/en/rest/orgs/members#get-organization-membership-for-a-user
 https://docs.github.com/en/rest/commits/commits#compare-two-commits
 
-The result/artifact schema below is this repository's v2 completion contract.
-It extends v1; old records never admit a reply or an incremental scope.
+The result/artifact schema below is this repository's v2 completion contract,
+which extends v1; old records never admit a reply or an incremental scope.
+
+Version 3 keeps the same bounded root in the summary comment and the artifact's
+completion.json, but moves the lists that grow with the review (findings, roots,
+receipts, continuation comments) into digest-chained pages next to it. Why a new
+version: v2 carried those lists inline, and the 65,536-byte MAX_DATA_BYTES bound that
+GitHub's comment limit and the profile reader's defensive read share cannot be raised
+or ignored, so a review with many sections could never record its complete evidence.
+A reader that only checks coverage needs the root (every v2 coverage field is unchanged;
+`findings`, `roots` and `receipt` are replaced by one `evidence` object) and may ignore
+the pages; a consumer that lists findings or roots loads and verifies them with
+`assemble`. Version 2 records stay valid under their original rules.
 """
 
 from __future__ import annotations
@@ -38,6 +49,9 @@ class FollowupAbort(Exception):
     """Fail closed before suppressing review or publishing an unbound reply."""
 
 
+# Lists that live in v3 pages, never in the bounded root.
+BULK = ("findings", "roots", "receipt", "continuations")
+PAGE_NAME = "pages/{:06d}.part"
 ASK = "/ask"
 DEFAULT_QUESTION = "Re-check this finding against the head checkout."
 
@@ -135,8 +149,33 @@ def valid_findings(findings):
     return True
 
 
+def valid_roots(roots, ctx):
+    if not isinstance(roots, list):
+        return False
+    seen = set()
+    for root in roots:
+        if (not isinstance(root, dict) or set(root) != {"id", "review_id", "digest", "path", "commit"}
+                or not positive(root["id"]) or root["id"] in seen or not positive(root["review_id"])
+                or not isinstance(root["digest"], str) or not re.fullmatch(DIGEST, root["digest"])
+                or not isinstance(root["path"], str) or not root["path"] or root["commit"] != ctx["head"]):
+            return False
+        seen.add(root["id"])
+    return True
+
+
+def valid_evidence(evidence):
+    return (isinstance(evidence, dict) and set(evidence) == {"pages", "bytes", "chain"}
+            and positive(evidence["pages"]) and positive(evidence["bytes"])
+            and evidence["pages"] == -(-evidence["bytes"] // MAX_DATA_BYTES)
+            and isinstance(evidence["chain"], str) and re.fullmatch(DIGEST, evidence["chain"]) is not None)
+
+
 def parse_record(comment, comments):
-    """Validate both structured content and its independently published summary."""
+    """Validate both structured content and its independently published summary.
+
+    A v2 record is complete. A v3 record is its bounded root: the lists it names in
+    `evidence` are verified separately by `assemble`.
+    """
     if not identity(comment.user, BOT) or not positive(comment.id) or not isinstance(comment.body, str):
         return None
     status = STATUS.fullmatch(comment.body.split("\n", 1)[0])
@@ -153,7 +192,8 @@ def parse_record(comment, comments):
         record["digest"] = status[3]
         ctx = record["context"]
         summary = comments.get(record["summary"])
-        if (record["version"] != 2 or type(record["version"]) is not int
+        version = record["version"]
+        if (type(version) is not int or version not in (2, 3)
                 or type(record["number"]) is not int
                 or type(ctx["number"]) is not int or not positive(ctx["number"])
                 or not all(full_sha(ctx[k]) for k in ("base", "head", "reviewer", "profile_sha"))
@@ -170,8 +210,12 @@ def parse_record(comment, comments):
                 or summary is None or not identity(summary.user, BOT)
                 or not isinstance(summary.body, str) or digest(summary.body) != record["digest"]
                 or RESULT.findall(summary.body) != results
-                or any(record[k] != ctx[k] for k in ("repository", "number", "base", "head", "depth"))
-                or not valid_findings(record["findings"]) or not isinstance(record["roots"], list)):
+                or any(record[k] != ctx[k] for k in ("repository", "number", "base", "head", "depth"))):
+            return None
+        if version == 2:
+            if not valid_findings(record["findings"]) or not valid_roots(record["roots"], ctx):
+                return None
+        elif any(k in record for k in BULK) or not valid_evidence(record["evidence"]):
             return None
         scope = record["scope"]
         if (set(scope) != {"kind", "from", "to", "parent", "full_head"}
@@ -183,17 +227,61 @@ def parse_record(comment, comments):
                 or (scope["kind"] == "unchanged" and scope["from"] != scope["to"])
                 or (scope["kind"] == "incremental" and scope["from"] == scope["to"])):
             return None
-        seen = set()
-        for root in record["roots"]:
-            if (set(root) != {"id", "review_id", "digest", "path", "commit"}
-                    or not positive(root["id"]) or root["id"] in seen or not positive(root["review_id"])
-                    or not isinstance(root["digest"], str) or not re.fullmatch(DIGEST, root["digest"])
-                    or not isinstance(root["path"], str) or not root["path"] or root["commit"] != ctx["head"]):
-                return None
-            seen.add(root["id"])
         return record
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def record_root(record):
+    """The bounded part of a record: itself for v2, without the paged lists for v3."""
+    if record.get("version") == 3:
+        return {k: v for k, v in record.items() if k not in BULK}
+    return record
+
+
+def page_chain(pages):
+    """Order-sensitive digest over the pages: each step binds the previous chain and one page."""
+    chain = b""
+    for page in pages:
+        chain = hashlib.sha256(chain + hashlib.sha256(page).digest()).digest()
+    return chain.hex()
+
+
+def paged(evidence):
+    """Split a complete evidence record into its bounded v3 root and its canonical pages.
+
+    The pages cut the canonical JSON of the lists into MAX_DATA_BYTES pieces, every page
+    full except the last, so a given review has exactly one valid paging.
+    """
+    raw = canonical({k: evidence[k] for k in BULK}).encode()
+    pages = [raw[i:i + MAX_DATA_BYTES] for i in range(0, len(raw), MAX_DATA_BYTES)]
+    root = {k: v for k, v in evidence.items() if k not in BULK}
+    root.update(version=3, evidence={"pages": len(pages), "bytes": len(raw), "chain": page_chain(pages)})
+    return root, pages
+
+
+def assemble(root, pages):
+    """Verify every page against the root and return the complete record.
+
+    Rejects a missing, extra, reordered, resized, altered or non-canonical page, and any
+    list that is malformed once assembled.
+    """
+    info = root.get("evidence") if isinstance(root, dict) else None
+    if (not isinstance(root, dict) or root.get("version") != 3 or not valid_evidence(info)
+            or not isinstance(pages, list)
+            or len(pages) != info["pages"] or any(not isinstance(p, bytes) for p in pages)
+            or any(len(p) != MAX_DATA_BYTES for p in pages[:-1]) or not 0 < len(pages[-1]) <= MAX_DATA_BYTES
+            or sum(len(p) for p in pages) != info["bytes"] or page_chain(pages) != info["chain"]):
+        raise FollowupAbort("Completion evidence pages do not match their root")
+    try:
+        bulk = strict_json(b"".join(pages).decode("utf-8"))
+    except (ValueError, UnicodeError, RecursionError):
+        raise FollowupAbort("Completion evidence pages are not valid JSON") from None
+    if (not isinstance(bulk, dict) or set(bulk) != set(BULK) or not valid_findings(bulk["findings"])
+            or not valid_roots(bulk["roots"], root["context"]) or not isinstance(bulk["receipt"], dict)
+            or not isinstance(bulk["continuations"], list)):
+        raise FollowupAbort("Completion evidence pages are malformed")
+    return {**root, **bulk}
 
 
 def trusted_run(run, record):
@@ -271,10 +359,22 @@ def download_record(artifact, token, timeout):
     if expected != "sha256:" + hashlib.sha256(archive.content).hexdigest():
         raise FollowupAbort("Completion artifact digest mismatch")
     with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
-        files = bundle.infolist()
-        if len(files) != 1 or files[0].filename != "completion.json" or files[0].file_size > MAX_DATA_BYTES:
+        files = {info.filename: info for info in bundle.infolist()}
+        root_info = files.get("completion.json")
+        if len(files) != len(bundle.infolist()) or root_info is None or root_info.file_size > MAX_DATA_BYTES:
             raise FollowupAbort("Invalid completion artifact contents")
-        return strict_json(bundle.read(files[0]))
+        root = strict_json(bundle.read(root_info))
+        if not isinstance(root, dict) or root.get("version") != 3:
+            if len(files) != 1:
+                raise FollowupAbort("Invalid completion artifact contents")
+            return root
+        info = root.get("evidence")
+        if not valid_evidence(info):
+            raise FollowupAbort("Invalid completion artifact contents")
+        names = ["completion.json"] + [PAGE_NAME.format(i + 1) for i in range(info["pages"])]
+        if set(files) != set(names) or any(files[name].file_size > MAX_DATA_BYTES for name in names):
+            raise FollowupAbort("Invalid completion artifact contents")
+        return assemble(root, [bundle.read(files[name]) for name in names[1:]])
 
 
 def verified_records(repo, pr, current, load_artifact, *, contexts=None, ownership=False):
@@ -297,9 +397,12 @@ def verified_records(repo, pr, current, load_artifact, *, contexts=None, ownersh
             if not trusted_run(run, record):
                 continue
             artifacts = [a for a in run.get_artifacts() if a.name == "agent-review-completion" and not a.expired]
-            if len(artifacts) != 1 or load_artifact(artifacts[0]) != record:
+            loaded = load_artifact(artifacts[0]) if len(artifacts) == 1 else None
+            # A v3 root alone proves coverage but lists nothing; consumers need the verified lists.
+            if (not isinstance(loaded, dict) or record_root(loaded) != record
+                    or (record["version"] == 3 and any(key not in loaded for key in BULK))):
                 continue
-            records[record["run_id"]] = record
+            records[record["run_id"]] = loaded
         except Exception as error:
             # Missing, stale, malformed, or unavailable proof must never suppress
             # needed review. Reply admission also refuses an unverified root.
@@ -574,11 +677,18 @@ def resolve_thread(pr, thread):
 
 
 def write_completion(path, evidence):
+    """Write the bounded root to `path` and its pages beside it, as one uploadable directory."""
     from pathlib import Path
-    raw = canonical(evidence)
+    root, pages = paged(evidence)
+    raw = canonical(root)
     if len(raw.encode()) > MAX_DATA_BYTES:
         raise FollowupAbort("Completion evidence exceeds the existing data budget")
     target = Path(path)
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for number, page in enumerate(pages, 1):
+        page_path = target.parent / PAGE_NAME.format(number)
+        page_path.parent.mkdir(mode=0o700, exist_ok=True)
+        page_path.write_bytes(page)
+        page_path.chmod(0o600)
     target.write_text(raw, encoding="utf-8")
     target.chmod(0o600)

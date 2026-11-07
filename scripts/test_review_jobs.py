@@ -41,6 +41,7 @@ class Pull:
         self.base = NS(sha=base, repo=NS(full_name=repo))
         self.comments, self.roots, self.reviews, self.writes = {}, [], {}, []
         self.node_id, self.threads = "PR_fixture", {}
+        self.file_thread_failure, self.file_thread_overrides, self.after_file_thread = 0, {}, None
         self.requester = NS(graphql_query=self.graphql_query, graphql_named_mutation=self.graphql_named_mutation)
 
     def graphql_query(self, query, variables):
@@ -86,6 +87,23 @@ class Pull:
             self.roots.append(root)
             self.threads[root.id] = {"id": "THREAD_" + str(root.id), "isResolved": False, "isOutdated": False}
         return review
+
+    def create_review_comment(self, body, commit, path, **kwargs):
+        """GitHub's single-comment endpoint: the only route that accepts subject_type file."""
+        self.writes.append(("file-thread", dict(kwargs, body=body, commit=commit, path=path)))
+        if self.file_thread_failure and len([w for w in self.writes if w[0] == "file-thread"]) >= self.file_thread_failure:
+            raise OSError("fixture: ambiguous write")
+        id = len(self.reviews) + 200
+        self.reviews[id] = NS(id=id, user=NS(**f.BOT), commit_id=commit, state="COMMENTED")
+        root = Comment(len(self.roots) + 300, body, NS(**f.BOT),
+                       {"pull_request_review_id": id, "original_commit_id": commit, "commit_id": commit,
+                        "line": None, "subject_type": "file", **self.file_thread_overrides},
+                       path=path, commit_id=commit)
+        self.roots.append(root)
+        self.threads[root.id] = {"id": "THREAD_" + str(root.id), "isResolved": False, "isOutdated": False}
+        if self.after_file_thread:
+            self.after_file_thread(root)
+        return root
 
     def create_review_comment_reply(self, root, body):
         self.writes.append(("reply", body))
@@ -153,7 +171,16 @@ class JobTests(unittest.TestCase):
         patch.object(e, "CONFIG", self.config).start()
         patch.object(j, "github", return_value=NS(get_repo=lambda _: self.repo)).start()
 
-    def build(self, findings=None):
+    def policy_fixture(self):
+        return e.policy(os.environ["REVIEW_DEPTH"])
+
+    def completion(self):
+        """The complete record: the bounded root plus every verified page."""
+        root = json.loads((self.root / "completion.json").read_text())
+        pages = [path.read_bytes() for path in sorted((self.root / "pages").glob("*.part"))]
+        return f.assemble(root, pages)
+
+    def build(self, findings=None, single=True):
         j.prepare(self.head_dir, self.plan)
         def run(policy, bundle, strategy, head, **kwargs):
             r = receipt(strategy); r["files_opened"] = ["app.py"]
@@ -161,10 +188,14 @@ class JobTests(unittest.TestCase):
                 plan = json.loads(self.plan.read_text())
                 return {"output": {"threads": [{"thread": t["thread"], "status": "present", "evidence": []}
                     for t in plan["threads"]]}, "receipt": r}
-            return {"findings": findings or [], "receipt": r}
+            produced = findings(strategy) if callable(findings) else (findings or [])
+            if kwargs.get("output_key") == "output":
+                return {"output": {"findings": produced, "questions": []}, "receipt": r}
+            return {"findings": produced, "receipt": r}
         with patch.object(e, "run_claude", side_effect=run) as provider:
             j.infer(self.plan, self.artifact, self.head_dir)
-        self.assertEqual(["bundle", "callers"], [c.args[2] for c in provider.call_args_list if c.args[2] != "verify-threads"])
+        if single:
+            self.assertEqual(["bundle", "callers"], [c.args[2] for c in provider.call_args_list if c.args[2] != "verify-threads"])
         self.assertEqual([], self.pr.writes, "read-only stages attempted a write")
 
     def test_summary_names_region_files_no_pass_opened(self):
@@ -179,12 +210,12 @@ class JobTests(unittest.TestCase):
     def test_complete_passes_publish_inline_summary_and_verifiable_completion(self):
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
-        record = json.loads((self.root / "completion.json").read_text())
+        record = self.completion()
         self.assertEqual(1, len(self.pr.roots))
         self.assertEqual(1, len(record["findings"]))
         self.assertEqual(2, len(record["receipt"]["passes"]))
         status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
-        self.assertEqual(record, f.parse_record(status, self.pr.comments))
+        self.assertEqual(f.record_root(record), f.parse_record(status, self.pr.comments))
         self.assertEqual(self.env["REVIEW_HEAD"], record["roots"][0]["commit"])
 
     def test_actual_pygithub_review_method_receives_commit_object_and_serializes_anchors(self):
@@ -216,7 +247,7 @@ class JobTests(unittest.TestCase):
     def test_clean_is_published_only_with_complete_pass_receipts(self):
         self.build()
         j.publish_artifact(self.artifact, self.head_dir)
-        record = json.loads((self.root / "completion.json").read_text())
+        record = self.completion()
         self.assertEqual([], record["findings"])
         self.assertEqual([], record["roots"])
         self.assertTrue(any("No findings reported" in c.body for c in self.pr.comments.values()))
@@ -225,7 +256,7 @@ class JobTests(unittest.TestCase):
         self.build([finding(path="helper.py")])
         j.publish_artifact(self.artifact, self.head_dir)
         self.assertEqual([], self.pr.roots)
-        record = json.loads((self.root / "completion.json").read_text())
+        record = self.completion()
         self.assertEqual("helper.py", record["findings"][0]["path"])
 
     def test_context_line_range_gets_a_verified_review_thread(self):
@@ -247,9 +278,9 @@ class JobTests(unittest.TestCase):
         request = next(payload for kind, payload in self.pr.writes if kind == "review")["comments"][0]
         self.assertEqual((1, 3, "RIGHT", "RIGHT"),
                          (request["start_line"], request["line"], request["start_side"], request["side"]))
-        record = json.loads((self.root / "completion.json").read_text())
+        record = self.completion()
         status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
-        self.assertEqual(record, f.parse_record(status, self.pr.comments))
+        self.assertEqual(f.record_root(record), f.parse_record(status, self.pr.comments))
         self.assertEqual(record["findings"], j.reconstruct_root(self.pr.roots[0], record))
 
     def test_inline_range_cannot_cross_lines_missing_from_the_diff(self):
@@ -262,7 +293,7 @@ class JobTests(unittest.TestCase):
     def test_unconfirmed_locations_stay_in_summary_without_discarding_the_review(self):
         self.build([finding(path="removed.py"), finding(path="app.py", line=900, end_line=900), finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
-        record = json.loads((self.root / "completion.json").read_text())
+        record = self.completion()
         self.assertEqual(3, len(record["findings"]))
         notes = {(f["path"], f["line"]): f["body"].count(j.UNVERIFIED_LOCATION_NOTE) for f in record["findings"]}
         self.assertEqual({("removed.py", 1): 1, ("app.py", 900): 1, ("app.py", 1): 0}, notes)
@@ -330,7 +361,7 @@ class JobTests(unittest.TestCase):
     def test_reply_revalidates_provenance_and_deduplicates_same_trigger(self):
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
-        proof = json.loads((self.root / "completion.json").read_text())
+        proof = self.completion()
         root = self.pr.roots[0]
         raw = {"id": 500, "body": "/ask Which state is lost?", "in_reply_to_id": root.id,
                "pull_request_review_id": root.raw_data["pull_request_review_id"],
@@ -406,7 +437,7 @@ class JobTests(unittest.TestCase):
         self.assertTrue(body.startswith("**2 findings on these lines**"))
         self.assertIn("One mechanism", body)
         self.assertIn("Another mechanism", body)
-        record = json.loads((self.root / "completion.json").read_text())
+        record = self.completion()
         self.assertEqual(2, len(record["findings"]))
         self.assertEqual(1, len(record["roots"]))
 
@@ -442,7 +473,7 @@ class JobTests(unittest.TestCase):
         item = finding(path="helper.py", mechanism="Only copy of this mechanism")
         self.build([item])
         j.publish_artifact(self.artifact, self.head_dir)
-        old = json.loads((self.root / "completion.json").read_text())
+        old = self.completion()
         self.assertEqual([], old["roots"])
         self.advance_head("helper.py")
         with patch.object(j, "records", return_value={123: old}):
@@ -460,7 +491,7 @@ class JobTests(unittest.TestCase):
                  finding(path="app.py", title="Second", mechanism="Another mechanism")]
         self.build(items)
         j.publish_artifact(self.artifact, self.head_dir)
-        record = json.loads((self.root / "completion.json").read_text())
+        record = self.completion()
         root = self.pr.roots[0]
         self.assertIs(root, f.owned_root(self.pr, NS(raw_data={"in_reply_to_id": root.id}, path=root.path), {123: record}))
         self.advance_head("app.py")
@@ -484,7 +515,7 @@ class JobTests(unittest.TestCase):
         self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: calls.append((name, data)))
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
-        old = json.loads((self.root / "completion.json").read_text())
+        old = self.completion()
         status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
         summary = next(c for c in self.pr.comments.values() if f.RESULT.search(c.body) and c is not status)
         status.raw_data["node_id"], summary.raw_data["node_id"] = "STATUS", "SUMMARY"
@@ -499,7 +530,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual({"STATUS"}, {data["subjectId"] for _, data in calls})
         self.assertEqual({"minimizeComment"}, {name for name, _ in calls})
         self.assertTrue(all(data["classifier"] == "OUTDATED" for _, data in calls))
-        self.assertEqual(old, f.parse_record(status, self.pr.comments))
+        self.assertEqual(f.record_root(old), f.parse_record(status, self.pr.comments))
         # The run's own status, at exactly status_id, must stay visible for the failure notifier.
         calls.clear()
         j.collapse_earlier(self.pr, status.id, summary.id, {123: old})
@@ -510,7 +541,7 @@ class JobTests(unittest.TestCase):
         self.pr.requester = NS(graphql_named_mutation=lambda name, data, schema: hidden.add(data["subjectId"]))
         self.build([finding(path="helper.py", mechanism="Only copy of this advice")])
         j.publish_artifact(self.artifact, self.head_dir)
-        old = json.loads((self.root / "completion.json").read_text())
+        old = self.completion()
         status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
         status.raw_data["node_id"] = "OLD-STATUS"
         self.pr.comments[old["summary"]].raw_data["node_id"] = "OLD-SUMMARY"
@@ -538,7 +569,7 @@ class JobTests(unittest.TestCase):
                 with patch.object(e, "unopened_regions", return_value=["docs/big.md"]):
                     self.build(findings)
                     j.publish_artifact(self.artifact, self.head_dir)
-                old = json.loads((self.root / "completion.json").read_text())
+                old = self.completion()
                 status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
                 status.raw_data["node_id"] = "OLD-STATUS"
                 self.pr.comments[old["summary"]].raw_data["node_id"] = "OLD-SUMMARY"
@@ -558,7 +589,7 @@ class JobTests(unittest.TestCase):
         self.pr.requester = NS(graphql_named_mutation=refuse, graphql_query=self.pr.graphql_query)
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
-        old = json.loads((self.root / "completion.json").read_text())
+        old = self.completion()
         status = next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1"))
         status.raw_data["node_id"] = "OLD-STATUS"
         self.advance_head("app.py")
@@ -623,7 +654,7 @@ class JobTests(unittest.TestCase):
         written = output.read_text() if output.exists() else ""
         return written, errors.getvalue(), (self.root / "outcome" / "outcome.json").read_text()
 
-    def run_notifier(self, workflow, written):
+    def run_notifier(self, workflow, written, source="plan"):
         """Resolve the review job's output expression for the prepare step, then run the shipped notifier."""
         import io
         outputs = dict(line.split("=", 1) for line in written.splitlines())
@@ -636,7 +667,7 @@ class JobTests(unittest.TestCase):
         self.assertIn("review_jobs.py prepare", runs["plan"])
         self.assertIn("review_jobs.py infer", runs["inference"])
         # This run's output file belongs to the prepare step; the other step wrote nothing.
-        reason = next((value for value in (outputs.get("failure_reason", "") if step == "plan" else "" for step in reads) if value), "")
+        reason = outputs.get("failure_reason", "") if source in reads else ""
         notifier = workflow["jobs"]["notify-failure"]["steps"][0]
         self.assertEqual("${{ needs.review.outputs.failure_reason }}", notifier["env"]["REVIEW_FAILURE_REASON"])
         script = notifier["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
@@ -697,7 +728,7 @@ class JobTests(unittest.TestCase):
             items.append(finding(path="app.py", title="Second", mechanism="Another cause"))
         self.build(items)
         j.publish_artifact(self.artifact, self.head_dir)
-        proof = json.loads((self.root / "completion.json").read_text())
+        proof = self.completion()
         root = self.pr.roots[0]
         original = root.commit_id
         if outdated:
@@ -1143,8 +1174,10 @@ class JobTests(unittest.TestCase):
         proof, root, artifact = self.codex_followup()
         output = self.root / "verification.json"
         self.run_codex_followup(artifact, output)
-        receipt = artifact["result"]["receipt"]["passes"][0]
-        receipt["cost_usd"] = 0.0 if receipt["cost_usd"] else 0.001
+        # A consistent edit of the recorded cost keeps every validator satisfied.
+        records = artifact["result"]["invocations"]["callers"]
+        records[0]["receipt"]["cost_usd"] = 0.0 if records[0]["receipt"]["cost_usd"] else 0.001
+        artifact["result"]["receipt"]["passes"][0] = e.pass_receipt(self.policy_fixture(), "callers", records)
         self.artifact.write_text(json.dumps(artifact))
         with patch.object(j, "records", return_value={123: proof}), \
                 patch("sys.stdout", new_callable=io.StringIO) as log:
@@ -1672,7 +1705,7 @@ class JobTests(unittest.TestCase):
         os.environ["REVIEW_HEAD"] = self.pr.head.sha
         self.build([finding(path=p) for p in ("app.py", "helper.py", "third.py")])
         j.publish_artifact(self.artifact, self.head_dir)
-        proof = json.loads((self.root / "completion.json").read_text())
+        proof = self.completion()
         self.advance_head("app.py")
         for state in self.pr.threads.values(): state["isOutdated"] = True
         plan = self.prepare_verification(proof)
@@ -1766,6 +1799,406 @@ class JobTests(unittest.TestCase):
             edit = patch.object(posted, "edit", side_effect=no_edit) if fault == "readback" else patch.object(f, "full_sha", wraps=f.full_sha)
             with edit, self.assertRaises(e.ReviewAbort):
                 j.finish_resolution(self.pr, posted, root.id, True, text)
+
+
+    def restage(self, base_text, head_text, path="app.py"):
+        """Replace the fixture's change: `path` is base_text at the base and head_text at the head."""
+        (self.head_dir / path).write_text(base_text)
+        e.git(self.head_dir, "add", "--", path)
+        e.git(self.head_dir, "commit", "-qm", "restaged base")
+        self.pr.base.sha = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        (self.head_dir / path).write_text(head_text)
+        e.git(self.head_dir, "add", "--", path)
+        e.git(self.head_dir, "commit", "-qm", "restaged head")
+        self.pr.head.sha = e.git(self.head_dir, "rev-parse", "HEAD").strip()
+        self.env.update(REVIEW_BASE=self.pr.base.sha, REVIEW_HEAD=self.pr.head.sha)
+        os.environ.update(REVIEW_BASE=self.pr.base.sha, REVIEW_HEAD=self.pr.head.sha)
+
+    def offdiff(self, *findings):
+        """A long file where only the first line changed, so later lines are real but not in the diff."""
+        lines = [f"line {i}\n" for i in range(60)]
+        self.restage("".join(lines), "".join(["changed first\n", *lines[1:]]))
+        self.build(list(findings))
+
+    def file_threads(self):
+        return [payload for kind, payload in self.pr.writes if kind == "file-thread"]
+
+    def test_an_off_diff_confirmed_location_gets_a_verified_file_level_thread(self):
+        item = finding(path="app.py", line=40, end_line=41, title="Late consumer", mechanism="File level mechanism")
+        self.offdiff(item)
+        j.publish_artifact(self.artifact, self.head_dir)
+        (write,) = self.file_threads()
+        # The SDK's file-level shape: a path, the head, the text and the subject type; no line anchor.
+        self.assertEqual({"body", "commit", "path", "subject_type"}, set(write))
+        self.assertEqual(("app.py", "file", self.pr.head.sha), (write["path"], write["subject_type"], write["commit"]))
+        self.assertIn("Location: `app.py:40-41` at the reviewed head", write["body"])
+        self.assertIn("File level mechanism", write["body"])
+        self.assertFalse([w for w in self.pr.writes if w[0] == "review"], "no line thread for a location outside the diff")
+        record = self.completion()
+        self.assertEqual(1, len(record["roots"]))
+        root = self.pr.roots[0]
+        self.assertEqual((root.id, root.raw_data["pull_request_review_id"]),
+                         (record["roots"][0]["id"], record["roots"][0]["review_id"]))
+        self.assertEqual(record["findings"], j.reconstruct_root(root, record))
+        summary = self.summary()
+        self.assertIn("| high | Missing state transfer | `app.py:40-41` | file thread |".replace("Missing state transfer", "Late consumer"), summary)
+        self.assertNotIn("File level mechanism", summary.split("<details>")[0])
+
+    def test_line_and_file_threads_coexist_and_each_finding_keeps_one_discussion(self):
+        self.offdiff(finding(path="app.py", line=1, end_line=1, title="In the diff", mechanism="Line mechanism"),
+                     finding(path="app.py", line=50, end_line=50, title="Outside the diff", mechanism="File mechanism"),
+                     finding(path="app.py", line=55, end_line=55, title="Also outside", mechanism="Another file mechanism"))
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len([w for w in self.pr.writes if w[0] == "review"]))
+        self.assertEqual(2, len(self.file_threads()), "file-level findings do not share a thread")
+        self.assertEqual(3, len(self.pr.roots))
+        summary = self.summary()
+        self.assertEqual(1, summary.count("| inline thread |"))
+        self.assertEqual(2, summary.count("| file thread |"))
+
+    def test_actual_pygithub_serializes_the_file_level_request_without_a_line(self):
+        from github.PullRequest import PullRequest
+        self.offdiff(finding(path="app.py", line=40, end_line=40))
+        pull, original = self.pr, self.pr.create_review_comment
+        class Requester:
+            per_page = 30
+            is_not_lazy = False
+            is_lazy = False
+            sent = None
+            def requestJsonAndCheck(self, method, url, input):
+                self.sent = (method, url, input)
+                comment = original(input["body"], input["commit_id"], input["path"], subject_type=input["subject_type"])
+                return {}, {"id": comment.id, "body": input["body"], "path": input["path"], "user": f.BOT}
+        requester = Requester()
+        pull._requester, pull.url = requester, "https://api.github.com/repos/example/project/pulls/1"
+        pull.create_review_comment = lambda *a, **k: PullRequest.create_review_comment(pull, *a, **k)
+        j.publish_artifact(self.artifact, self.head_dir)
+        method, url, sent = requester.sent
+        self.assertEqual(("POST", pull.url + "/comments"), (method, url))
+        self.assertEqual({"body", "commit_id", "path", "subject_type"}, set(sent))
+        self.assertEqual(("file", self.pr.head.sha), (sent["subject_type"], sent["commit_id"]))
+        self.assertTrue(self.completion()["roots"])
+
+    def test_ask_on_a_file_thread_reconstructs_exactly_the_recorded_finding(self):
+        item = finding(path="app.py", line=40, end_line=40, title="Late consumer", mechanism="File level mechanism")
+        self.offdiff(item)
+        j.publish_artifact(self.artifact, self.head_dir)
+        proof, root = self.completion(), self.pr.roots[0]
+        self.assertIs(root, f.owned_root(self.pr, NS(raw_data={"in_reply_to_id": root.id}, path=root.path), {123: proof}))
+        self.pr.threads[root.id]["isOutdated"] = True
+        plan = self.reply_plan(proof, root)
+        self.assertEqual(1, len(plan["findings"]))
+        self.assertEqual("Late consumer", plan["findings"][0]["title"])
+        self.assertEqual(proof["findings"], plan["findings"])
+
+    def test_a_fixed_file_thread_is_verified_answered_and_resolved_through_the_existing_path(self):
+        item = finding(path="app.py", line=40, end_line=40, title="Late consumer", mechanism="File level mechanism")
+        self.offdiff(item)
+        j.publish_artifact(self.artifact, self.head_dir)
+        proof, root = self.completion(), self.pr.roots[0]
+        self.advance_head("app.py")
+        self.assertTrue(self.pr.threads[root.id]["isOutdated"])
+        plan = self.prepare_verification(proof)
+        self.assertEqual(1, len(plan["threads"]))
+        self.publish_verified(proof, plan, self.verified(plan))
+        self.assertEqual(["reply", "resolve"], [kind for kind, _ in self.pr.writes if kind in ("reply", "resolve")])
+        self.assertTrue(self.pr.threads[root.id]["isResolved"])
+
+    def test_forged_file_roots_are_never_owned_or_reconstructed(self):
+        item = finding(path="app.py", line=40, end_line=40, title="Late consumer")
+        self.offdiff(item)
+        j.publish_artifact(self.artifact, self.head_dir)
+        proof, root = self.completion(), self.pr.roots[0]
+        for name, mutate in (("edited body", lambda c: setattr(c, "body", c.body + " edited")),
+                             ("human author", lambda c: setattr(c, "user", NS(**f.JOSH))),
+                             ("other review", lambda c: c.raw_data.update(pull_request_review_id=9999)),
+                             ("other commit", lambda c: c.raw_data.update(original_commit_id="0" * 40)),
+                             ("other path", lambda c: setattr(c, "path", "helper.py"))):
+            forged = copy.copy(root)
+            forged.raw_data = dict(root.raw_data)
+            mutate(forged)
+            with self.subTest(name), self.assertRaises((f.FollowupAbort, KeyError, StopIteration)):
+                f.verify_root(NS(get_review=lambda i: self.pr.reviews[i]), forged, {123: proof})
+        record = proof
+        forged = copy.copy(root)
+        forged.body = "**Late consumer**\n\nLocation: elsewhere\n\n" + root.body.split("\n\n", 2)[2]
+        with self.assertRaisesRegex(e.ReviewAbort, "could not be reconstructed"):
+            j.reconstruct_root(forged, record)
+
+    def test_a_file_thread_that_cannot_be_verified_aborts_publication_and_never_reports_success(self):
+        for name, overrides, after in (
+                ("no owning review", {"pull_request_review_id": None}, None),
+                ("moved original commit", {"original_commit_id": "0" * 40}, None),
+                ("line anchor present", {"line": 40}, None),
+                ("line subject", {"subject_type": "line"}, None),
+                ("reply, not a root", {"in_reply_to_id": 5}, None),
+                ("human author", {}, lambda root: setattr(root, "user", NS(**f.JOSH))),
+                ("pending review", {}, lambda root: setattr(self.pr.reviews[root.raw_data["pull_request_review_id"]], "state", "PENDING")),
+                ("review by someone else", {}, lambda root: setattr(self.pr.reviews[root.raw_data["pull_request_review_id"]], "user", NS(**f.JOSH)))):
+            with self.subTest(name):
+                self.setUp()    # a fresh repository, pull request and artifact for every case
+                self.pr.file_thread_overrides, self.pr.after_file_thread = overrides, after
+                self.offdiff(finding(path="app.py", line=40, end_line=40))
+                with self.assertRaisesRegex(e.ReviewAbort, "Inline publication verification failed"):
+                    j.publish_artifact(self.artifact, self.head_dir)
+                self.assertFalse((self.root / "completion.json").exists())
+                self.assertFalse(any(f.RESULT.search(c.body) for c in self.pr.comments.values()))
+                self.assertEqual(1, len(self.file_threads()), "an ambiguous write is never repeated")
+
+    def test_partial_and_ambiguous_file_thread_failures_are_not_retried_and_leave_no_success(self):
+        lines = [f"line {i}\n" for i in range(60)]
+        self.restage("".join(lines), "".join(["changed first\n", *lines[1:]]))
+        self.pr.file_thread_failure = 2           # the second write fails after it may have persisted
+        self.build([finding(path="app.py", line=40, end_line=40, title="First", mechanism="m1"),
+                    finding(path="app.py", line=50, end_line=50, title="Second", mechanism="m2")])
+        with self.assertRaisesRegex(e.ReviewAbort, "Inline publication verification failed"):
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(2, len(self.file_threads()))
+        self.assertFalse((self.root / "completion.json").exists())
+        self.assertFalse(any(f.RESULT.search(c.body) for c in self.pr.comments.values()))
+        self.assertTrue(any("pending; no completed review yet" in c.body for c in self.pr.comments.values()))
+
+    def test_the_head_is_rechecked_before_each_separate_file_thread_write(self):
+        lines = [f"line {i}\n" for i in range(60)]
+        self.restage("".join(lines), "".join(["changed first\n", *lines[1:]]))
+        self.build([finding(path="app.py", line=40, end_line=40, title="First", mechanism="m1"),
+                    finding(path="app.py", line=50, end_line=50, title="Second", mechanism="m2")])
+        self.pr.after_file_thread = lambda root: setattr(self.pr.head, "sha", "f" * 40)
+        with self.assertRaisesRegex(e.ReviewAbort, "Inline publication verification failed"):
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual(1, len(self.file_threads()), "the second write must not start on a moved head")
+
+    def test_findings_without_a_changed_confirmed_file_never_get_an_anchor_and_say_why(self):
+        self.build([finding(path="removed.py", title="Gone", mechanism="m-gone"),
+                    finding(path="helper.py", title="Unchanged file", mechanism="m-helper"),
+                    finding(path="app.py", line=900, end_line=900, title="Past the end", mechanism="m-end")])
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertEqual([], self.file_threads())
+        self.assertEqual([], self.pr.roots)
+        text = self.summary().split("<details>")[0]
+        self.assertIn(j.NO_THREAD["unchanged"], text)
+        self.assertIn(j.NO_THREAD["unconfirmed"], text)
+        self.assertEqual(3, text.count("| below |"))
+        for title in ("Gone", "Unchanged file", "Past the end"):
+            self.assertIn(f"**{title}**", text)
+
+
+    def sectioned(self, *, turns=1000):
+        """A change too large for one request under a small fixture allowance, with room to finish it."""
+        self.config.write_text('[config]\nmax_model_tokens=40000\nmax_output_tokens=16000\nai_timeout=300\n' +
+            "\n".join(f'[review_depth.{d}]\nmodel="{POLICY["model"]}"\nreasoning_effort="medium"\n'
+                      f'max_turns={turns}\nmax_budget_usd=1000.0\n'
+                      for d in ("default", "deep", "codex", "codex-deep")))
+        self.restage("old\n", "".join(f"value {i} = compute({i})\n" for i in range(20000)))
+
+    def test_a_multi_section_review_reports_every_section_and_publishes_verified_coverage(self):
+        self.sectioned()
+        counter = []
+        def findings(strategy):
+            counter.append(strategy)
+            number = len(counter)
+            return [finding(path="helper.py", line=number, end_line=number, title=f"Candidate {number}",
+                            mechanism=f"Mechanism {number}")]
+        self.build(findings, single=False)
+        artifact = json.loads(self.artifact.read_text())
+        bundle = artifact["plan"]["bundle"]
+        sections = len(bundle["sections"])
+        self.assertGreater(sections, 3)
+        for strategy in ("bundle", "callers"):
+            kinds = [r["kind"] for r in artifact["result"]["invocations"][strategy]]
+            self.assertEqual(["section"] * sections + ["consolidation"], kinds)
+        # Every section is delivered to both independent strategies, not half of them to each.
+        self.assertEqual({r["section_sha256"] for r in artifact["result"]["invocations"]["bundle"][:-1]},
+                         {r["section_sha256"] for r in artifact["result"]["invocations"]["callers"][:-1]})
+        j.publish_artifact(self.artifact, self.head_dir)
+        record = self.completion()
+        self.assertEqual(2 * (sections + 1), len(counter))
+        self.assertEqual(2 * (sections + 1), len(record["findings"]))
+        invocations = [i for p in record["receipt"]["passes"] for i in p["invocations"]]
+        self.assertEqual(2 * (sections + 1), len(invocations))
+        self.assertTrue(all("output" not in i and "receipt" not in i for i in invocations))
+        summary = self.summary()
+        self.assertIn(f"every pass reviewed all {sections} sections", summary)
+        self.assertEqual(f.record_root(record), f.parse_record(
+            next(c for c in self.pr.comments.values() if c.body.startswith("<!-- agent-review-status:v1")), self.pr.comments))
+
+    def test_a_large_review_pages_summary_and_evidence_and_loses_nothing(self):
+        self.sectioned()
+        counter = []
+        def findings(strategy):
+            counter.append(strategy)
+            base = len(counter) * 10
+            return [finding(path="helper.py", line=base + i, end_line=base + i, title=f"Candidate {base + i}",
+                            mechanism=f"Mechanism {base + i}: " + "because of the shared state " * 70)
+                    for i in range(e.MAX_FINDINGS)]
+        self.build(findings, single=False)
+        j.publish_artifact(self.artifact, self.head_dir)
+        record = self.completion()
+        total = len(record["findings"])
+        self.assertGreater(total, 12, "the old twelve-findings ceiling is gone")
+        root = json.loads((self.root / "completion.json").read_text())
+        self.assertGreater(root["evidence"]["bytes"], f.MAX_DATA_BYTES)
+        self.assertGreater(root["evidence"]["pages"], 1)
+        self.assertLess(len(f.canonical(root).encode()), f.MAX_DATA_BYTES)
+        # Every comment the publisher wrote stays inside GitHub's and the profile reader's bound.
+        written = [c for c in self.pr.comments.values() if c.id != 9]
+        self.assertTrue(all(len(c.body.encode()) <= f.MAX_DATA_BYTES for c in written))
+        continuation = [c for c in written if c.body.startswith("<!-- agent-review-continuation:v1")]
+        self.assertGreaterEqual(len(continuation), 1)
+        self.assertEqual({c["id"] for c in record["continuations"]}, {c.id for c in continuation})
+        for entry in record["continuations"]:
+            self.assertEqual(f.digest(self.pr.comments[entry["id"]].body), entry["digest"])
+        text = "".join(c.body for c in written)
+        for number in range(total):
+            self.assertIn(f"**{record['findings'][number]['title']}**", text)
+        self.assertEqual(total, len({m for m in re.findall(r"\*\*(Candidate [0-9]+)\*\*", text)}))
+        # The first page links every continuation comment.
+        first = self.summary()
+        self.assertEqual(len(continuation), first.count("](https://github.com/"))
+        self.assertIn("Continued in separate comments", first)
+
+    def test_a_tampered_or_missing_page_or_continuation_never_supports_reuse(self):
+        self.sectioned()
+        counter = []
+        def findings(strategy):
+            counter.append(1)
+            return [finding(path="helper.py", line=1, end_line=1, title=f"T{len(counter)}",
+                            mechanism=f"{len(counter)}: " + "m " * 3000)]
+        self.build(findings, single=False)
+        j.publish_artifact(self.artifact, self.head_dir)
+        root = json.loads((self.root / "completion.json").read_text())
+        pages = [path.read_bytes() for path in sorted((self.root / "pages").glob("*.part"))]
+        self.assertEqual(len(pages), root["evidence"]["pages"])
+        flipped = bytearray(pages[0]); flipped[3] ^= 1
+        for bad in (pages[:-1], [bytes(flipped), *pages[1:]], [*pages, b"x"], list(reversed(pages)) if len(pages) > 1 else [b""]):
+            with self.assertRaises(f.FollowupAbort):
+                f.assemble(root, bad)
+        self.assertEqual(root, f.record_root(f.assemble(root, pages)))
+
+
+    def stopped_infer(self, stop_at):
+        """Run the inference step as the review job does, with the provider failing on call `stop_at`."""
+        import io
+        self.sectioned()
+        j.prepare(self.head_dir, self.plan)
+        calls = []
+        def run(policy, bundle, strategy, head, **kwargs):
+            calls.append(1)
+            if len(calls) == stop_at:
+                raise e.ReviewAbort("Provider timed out at config.ai_timeout; no paid retry")
+            r = receipt(strategy); r["files_opened"] = ["app.py"]
+            if kwargs.get("output_key") == "output":
+                return {"output": {"findings": [], "questions": []}, "receipt": r}
+            return {"findings": [], "receipt": r}
+        output = self.root / "github-output"
+        env = {"GITHUB_OUTPUT": str(output), "REVIEW_OUTCOME_PATH": str(self.root / "outcome" / "outcome.json")}
+        argv = ["review_jobs.py", "infer", "--head", str(self.head_dir), "--input", str(self.plan),
+                "--output", str(self.artifact)]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(e, "run_claude", side_effect=run))
+            stack.enter_context(patch.dict(os.environ, env))
+            stack.enter_context(patch("sys.argv", argv))
+            errors = stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
+            self.assertEqual(1, j.main())
+        return calls, output.read_text(), errors.getvalue(), json.loads((self.root / "outcome" / "outcome.json").read_text())
+
+    def test_a_pass_stopped_between_sections_publishes_nothing_and_reaches_the_notice_with_counters_only(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        calls, written, errors, outcome = self.stopped_infer(stop_at=3)
+        self.assertEqual(3, len(calls), "no section ran after the failed one")
+        self.assertFalse(self.artifact.exists(), "a partial pass leaves no artifact to publish")
+        self.assertEqual("failure_reason=sections_incomplete\n", written)
+        self.assertIn("Provider timed out at config.ai_timeout", errors)
+        sections = len(json.loads(self.plan.read_text())["bundle"]["sections"])
+        self.assertEqual({"strategy": "bundle", "completed": 2, "total": sections + 1}, outcome["failure"]["progress"])
+        self.assertEqual("sections_incomplete", outcome["failure"]["reason"])
+        bodies = self.run_notifier(workflow, written, source="inference")
+        self.assertEqual(1, len(bodies))
+        self.assertIn("stopped before every section of the change was reviewed", bodies[0])
+        self.assertIn("nothing from the partial pass was published", bodies[0])
+        self.assertNotIn("Provider timed out", bodies[0])
+        self.assertEqual([], self.pr.writes)
+
+    def test_a_failure_in_the_first_section_is_incomplete_without_any_later_launch(self):
+        calls, written, _, outcome = self.stopped_infer(stop_at=1)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0, outcome["failure"]["progress"]["completed"])
+
+    def codex_plan(self):
+        os.environ["REVIEW_DEPTH"] = "codex"
+        self.event["comment"]["body"] = "/review codex"
+        self.event_path.write_text(json.dumps(self.event))
+        self.pr.comments[9].body = "/review codex"
+        self.pr.comments[9].raw_data["body"] = "/review codex"
+        self.sectioned()
+        j.prepare(self.head_dir, self.plan)
+
+    def test_a_multi_invocation_codex_review_needs_the_isolated_launcher_and_fails_closed_without_it(self):
+        self.codex_plan()
+        with patch.object(e, "run_codex", side_effect=AssertionError("no session may start")), \
+                patch.dict(os.environ, {"REVIEW_CODEX_SESSION_USER": ""}):
+            with self.assertRaisesRegex(e.ReviewAbort, "no isolated session identity is configured"):
+                j.infer(self.plan, self.artifact, self.head_dir, "/action", "/home")
+        self.assertFalse(self.artifact.exists())
+
+    def test_codex_sessions_review_a_staged_head_and_the_publisher_still_validates_every_prompt(self):
+        self.codex_plan()
+        staged_to = self.root / "sessions"
+        staged_to.mkdir()
+        seen = []
+        class Launcher:
+            def stage_head(self, source, workspace):
+                import shutil
+                target = Path(workspace) / "head"
+                shutil.copytree(source, target, symlinks=True, ignore=lambda d, n: [".git"] if Path(d) == Path(source) else [])
+                shutil.copytree(Path(source) / ".git" / "agent-review", target / ".git" / "agent-review")
+                seen.append(("stage", str(target)))
+                return target
+        launcher = Launcher()
+        def run(policy, bundle, strategy, head, action, home, workspace, **kwargs):
+            seen.append(("run", str(head), kwargs["sessions"] is launcher, str(bundle.store.directory)))
+            r = receipt(strategy)
+            r.update(provider="codex", model=policy["model"], files_opened=["app.py"])
+            if kwargs["output_key"] == "output":
+                return {"output": {"findings": [], "questions": []}, "receipt": r}
+            return {"findings": [], "receipt": r}
+        with patch.object(j, "codex_sessions", return_value=(launcher, staged_to)), \
+                patch.object(e, "run_codex", side_effect=run):
+            j.infer(self.plan, self.artifact, self.head_dir, "/action", "/home")
+        staged = str(staged_to / "head")
+        runs = [item for item in seen if item[0] == "run"]
+        sections = len(json.loads(self.plan.read_text())["bundle"]["sections"])
+        self.assertEqual(sections + 1, len(runs), "one codex pass: every section, then the final stage")
+        self.assertEqual({staged}, {item[1] for item in runs})
+        self.assertTrue(all(item[2] for item in runs))
+        self.assertEqual({staged + "/.git/agent-review"}, {item[3] for item in runs})
+        # The ledger the sessions read lives in the staged tree; the original checkout's store is untouched.
+        self.assertTrue((staged_to / "head" / ".git" / "agent-review" / "ledger" / "callers.txt").is_file())
+        # Prompts name paths relative to the checkout, so the publisher recomputes them from its own rebuild.
+        with patch.object(j, "records", return_value={}):
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertTrue((self.root / "completion.json").is_file())
+
+    def test_a_continuation_comment_that_does_not_read_back_aborts_before_any_success(self):
+        self.sectioned()
+        counter = []
+        def findings(strategy):
+            counter.append(1)
+            return [finding(path="helper.py", line=1, end_line=1, title=f"Big {len(counter)}",
+                            mechanism=f"{len(counter)}: " + "m " * 3000)]
+        self.build(findings, single=False)
+        original = self.pr.get_issue_comment
+        def altered(id):
+            comment = original(id)
+            if comment.body.startswith("<!-- agent-review-continuation:v1"):
+                return NS(user=comment.user, id=comment.id, body=comment.body + " edited")
+            return comment
+        self.pr.get_issue_comment = altered
+        with self.assertRaisesRegex(e.ReviewAbort, "continuation could not be verified"):
+            j.publish_artifact(self.artifact, self.head_dir)
+        self.assertFalse((self.root / "completion.json").exists())
+        self.assertFalse(any(c.body.startswith("<!-- agent-review-status:v1") for c in self.pr.comments.values()))
 
 
 class WorkflowTests(unittest.TestCase):

@@ -299,6 +299,17 @@ jobs:
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
+    # Only a change reviewed in several Codex sessions uses the dedicated identity; a single
+    # session keeps the pinned launcher. These steps must not fail a small review, so a failed
+    # step only leaves the multi-session path unavailable, and that path then refuses to start.
+    - name: Provision the isolated Codex session identity
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
+      continue-on-error: true
+      run: python trusted-agent-review/scripts/codex_identity_setup.py provision --user agent-review-model
+    - name: Restrict privileged sockets for that identity with the pinned action
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
+      continue-on-error: true
+      run: python trusted-agent-review/scripts/codex_identity_setup.py restrict-sockets --user agent-review-model --action trusted-codex-action
     - name: Review the admitted diff
       id: inference
       env:
@@ -316,6 +327,7 @@ jobs:
         # It authenticates through the action's proxy, so it never receives this key.
         ANTHROPIC_API_KEY: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY || '' }}
         ANTHROPIC_API_KEY_2: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY_2 || '' }}
+        REVIEW_CODEX_SESSION_USER: ${{ startsWith(env.REVIEW_DEPTH, 'codex') && 'agent-review-model' || '' }}
       run: python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -834,7 +846,13 @@ jobs:
 
         # Wording for the reason codes scripts/review_reliability.py can emit, as notice text
         # and what to do next. The review job output only selects a row; it never supplies text.
-        REASONS = {"input_limit": (
+        REASONS = {"sections_incomplete": (
+            "The requested diff review didn't complete because a review pass stopped before every section of the change "
+            "was reviewed (an allowance, the deadline, a provider stop or an invalid result), so nothing from the partial "
+            "pass was published. Treat this run as incomplete.",
+            " The Actions step summary shows how many invocations the pass finished; allowances change only through "
+            "the operator policy, then request a fresh review."),
+            "input_limit": (
             "The requested diff review didn't complete because the change is larger than the configured review input limit "
             "(max_model_tokens for this depth), and a partial review would leave coverage incomplete. "
             "Treat this run as incomplete.",
@@ -1113,7 +1131,7 @@ jobs:
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: agent-review-completion
-        path: ${{ runner.temp }}/agent-review-completion/completion.json
+        path: ${{ runner.temp }}/agent-review-completion
         if-no-files-found: ignore
   publish-reply:
     name: Publish verified inline answer

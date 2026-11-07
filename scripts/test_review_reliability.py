@@ -355,6 +355,42 @@ class DiagnosticTests(unittest.TestCase):
             env["GITHUB_OUTPUT"] = directory
             reliability.report(review.InputLimitAbort(SECRET), env=env, stream=io.StringIO())
 
+    def test_an_incomplete_pass_names_a_reason_and_counters_and_never_text(self):
+        from scripts.review_errors import IncompleteReviewAbort
+        good = {"strategy": "callers", "completed": 2, "total": 9}
+        entry = reliability.diagnostic(IncompleteReviewAbort(f"private {SECRET}", good))
+        self.assertEqual(("review_abort", "sections_incomplete"), (entry["category"], entry["reason"]))
+        self.assertEqual(good, entry["progress"])
+        self.assertNotIn(SECRET, json.dumps(entry))
+        for bad in ({"strategy": SECRET, "completed": 1, "total": 2}, {"strategy": "bundle", "completed": -1, "total": 2},
+                    {"strategy": "bundle", "completed": True, "total": 2}, {"strategy": "bundle", "completed": 1},
+                    {"strategy": "bundle", "completed": 1, "total": 2, "extra": SECRET},
+                    {"strategy": "bundle", "completed": 1, "total": 10 ** 13}, SECRET, None):
+            with self.subTest(bad=bad):
+                forged = reliability.diagnostic(IncompleteReviewAbort("x", bad))
+                self.assertEqual("sections_incomplete", forged["reason"])
+                self.assertNotIn("progress", forged)
+                self.assertNotIn(SECRET, json.dumps(forged))
+        # Progress on any other exception is never read.
+        other = review.ReviewAbort("x")
+        other.progress = good
+        self.assertNotIn("progress", reliability.diagnostic(other))
+        lookalike = type("IncompleteReviewAbort", (Exception,), {"reason": "sections_incomplete", "progress": good})(SECRET)
+        self.assertNotIn("reason", reliability.diagnostic(lookalike))
+        self.assertNotIn("progress", reliability.diagnostic(lookalike))
+
+    def test_incomplete_pass_reaches_the_job_output_and_step_summary_as_fixed_words(self):
+        from scripts.review_errors import IncompleteReviewAbort
+        with tempfile.TemporaryDirectory() as directory:
+            output, summary = Path(directory) / "output", Path(directory) / "summary.md"
+            env = {"GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}
+            result = reliability.report(IncompleteReviewAbort(SECRET, {"strategy": "bundle", "completed": 3, "total": 8}),
+                                        env=env, stream=io.StringIO())
+            self.assertEqual("sections_incomplete", result["failure"]["reason"])
+            self.assertEqual("failure_reason=sections_incomplete\n", output.read_text())
+            self.assertIn("| Pass progress | bundle: 3 of 8 invocations |", summary.read_text())
+            self.assertNotIn(SECRET, summary.read_text())
+
     def test_a_model_providers_status_is_kept_apart_from_github_status(self):
         provider = type("APIStatusError", (Exception,), {})(SECRET)
         provider.status_code = 429

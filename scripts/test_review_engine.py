@@ -20,7 +20,12 @@ POLICY = {"model": "anthropic/claude-sonnet-5-5", "reasoning_effort": "medium",
           "max_turns": 10, "max_budget_usd": 5.0, "max_model_tokens": 90000,
           "max_output_tokens": 16000, "ai_timeout": 300,
           "provider": "claude", "passes": ["bundle", "callers"]}
-BUNDLE = {"files": [{"path": "src/app.py", "deleted": False}], "instructions": "Review correctness."}
+BUNDLE = {"files": [{"path": "src/app.py", "deleted": False, "content": "full"}], "instructions": "Review correctness.",
+          "sections": [{"id": 0, "segments": [], "sha256": "0" * 64}], "root": "1" * 64,
+          "learnings": {"bytes": 0}}
+
+
+EMPTY = dict(BUNDLE, files=[])
 
 
 def receipt(strategy="bundle"):
@@ -36,8 +41,16 @@ def finding(**kwargs):
             "confidence": "high", **kwargs}
 
 
-def result():
-    return {"findings": [], "receipt": {"passes": [receipt(), receipt("callers")]}}
+def record(strategy="bundle", findings=()):
+    """One engine-derived invocation record for the single-section BUNDLE."""
+    return {"kind": "section", "section": 0, "section_sha256": BUNDLE["sections"][0]["sha256"],
+            "manifest_root": BUNDLE["root"], "schema": "output", "prompt_sha256": "a" * 64, "prompt_bytes": 10,
+            "learnings_bytes": 0, "ledger": None, "questions_shown": 0, "questions_omitted": 0,
+            "receipt": receipt(strategy), "output": {"findings": list(findings), "questions": []}}
+
+
+def result(findings=()):
+    return e.combine_results(POLICY, [(strategy, [record(strategy, findings)]) for strategy in POLICY["passes"]])
 
 
 def transcript():
@@ -171,6 +184,9 @@ class BundleTests(unittest.TestCase):
     def bundle(self, settings=POLICY, **kwargs):
         return e.build_bundle(self.root, self.git("rev-parse", "HEAD"), self.base, settings, **kwargs)
 
+    def patch(self, bundle, index=0):
+        return bundle.store.patch(index).read_text()
+
     def test_merge_base_excludes_base_only_changes_and_includes_full_head_content(self):
         self.git("switch", "-qc", "head")
         (self.root / "app.py").write_text("changed\n")
@@ -182,7 +198,8 @@ class BundleTests(unittest.TestCase):
         bundle = e.build_bundle(self.root, head, base, POLICY)
         self.assertEqual(self.base, bundle["merge_base"])
         self.assertEqual(["app.py"], [f["path"] for f in bundle["files"]])
-        self.assertEqual("changed\n", bundle["files"][0]["content"])
+        self.assertEqual("full", bundle["files"][0]["content"])
+        self.assertEqual("changed\n", bundle.store.content(0).read_text())
 
     def test_large_file_keeps_all_changed_regions_with_git_context(self):
         lines = [f"line {i}" for i in range(5000)]
@@ -192,11 +209,12 @@ class BundleTests(unittest.TestCase):
         (self.root / "app.py").write_text("\n".join(lines) + "\n")
         self.commit()
         limited = dict(POLICY, max_model_tokens=8000, max_output_tokens=1000)  # fixture operator budget
-        file = self.bundle(limited)["files"][0]
-        self.assertIsNone(file["content"])
-        self.assertEqual(2, len(file["regions"]))
-        self.assertIn("new first", file["regions"][0]["content"])
-        self.assertIn("new last", file["regions"][1]["content"])
+        bundle = self.bundle(limited)
+        self.assertEqual("regions", bundle["files"][0]["content"])
+        patch = self.patch(bundle)
+        self.assertEqual(2, patch.count("\n@@ "))
+        self.assertIn("+new first", patch)
+        self.assertIn("+new last", patch)
 
     def test_operator_instructions_count_toward_the_bundle_allowance(self):
         lines = [f"line {i}" for i in range(3000)]
@@ -206,12 +224,12 @@ class BundleTests(unittest.TestCase):
         (self.root / "app.py").write_text("\n".join(lines) + "\n")
         self.commit()
         limited = dict(POLICY, max_model_tokens=40000, max_output_tokens=1000)  # fixture operator budget
-        self.assertIsNotNone(self.bundle(limited)["files"][0]["content"])
+        self.assertEqual("full", self.bundle(limited)["files"][0]["content"])
         instructions = "Check every guard. " * 500
         bundle = self.bundle(limited, instructions=instructions)
         # Instructions that no longer leave room for the whole file demote it to regions,
         # and every prompt the passes send then fits instead of failing at launch.
-        self.assertIsNone(bundle["files"][0]["content"])
+        self.assertEqual("regions", bundle["files"][0]["content"])
         available = limited["max_model_tokens"] - limited["max_output_tokens"]
         for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
             self.assertLessEqual(e.token_bound(prompt + json.dumps(e.OUTPUT_SCHEMA)), available)
@@ -245,7 +263,7 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(1, prompt.count("UNIQUE-OPERATOR-CRITERIA"))
             self.assertIn("Operator review criteria:", prompt)
 
-    def test_diff_cannot_fit_is_incomplete_not_clean(self):
+    def test_framing_that_alone_exceeds_the_allowance_is_incomplete_not_clean(self):
         (self.root / "app.py").write_text("new content " * 1000)
         self.commit()
         with self.assertRaisesRegex(e.ReviewAbort, "incomplete"):
@@ -258,11 +276,11 @@ class BundleTests(unittest.TestCase):
         limited = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
         bundle = self.bundle(limited)
         file = bundle["files"][0]
-        self.assertIsNone(file["content"])
-        self.assertTrue(file["regions"])
+        self.assertEqual("regions", file["content"])
         expected = e.git(self.root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
                          "--unified=3", self.base, bundle["head"], "--", "app.py")
-        self.assertEqual(expected, file["patch"])
+        self.assertEqual(expected, self.patch(bundle))
+        self.assertEqual(1, len(bundle["sections"]))
         for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
             self.assertEqual(1, prompt.count(expected))
             self.assertEqual(700, prompt.count('+changed = "source"\n'))
@@ -271,17 +289,16 @@ class BundleTests(unittest.TestCase):
 
     def test_source_blocks_preserve_utf8_and_cannot_close_their_fence(self):
         """CommonMark fences remain open across source-supplied fence lines."""
-        source = 'start\n```\n````text\n"quoted"\\path\t雪\nno final newline'
+        source = 'start\n```\n````text\n"quoted"\\path\t\u96ea\nno final newline'
         (self.root / "app.py").write_text(source)
         self.commit()
         bundle = self.bundle(instructions="UNIQUE-CRITERIA")
         prompt = e.claude_prompt(bundle, "bundle")
-        file = bundle["files"][0]
-        self.assertIn('`````diff\n' + file["patch"] + '`````\n', prompt)
+        self.assertIn('`````diff\n' + self.patch(bundle) + '`````\n', prompt)
         self.assertIn('`````text\n' + source + '\n`````\n', prompt)
         self.assertIn(f'Full head content ({len(source.encode("utf-8"))} UTF-8 bytes)', prompt)
         self.assertEqual(1, prompt.count("UNIQUE-CRITERIA"))
-        self.assertEqual(source, file["content"])
+        self.assertEqual(source, bundle.store.content(0).read_text())
 
     def test_exclusions_and_deleted_file_are_explicit(self):
         (self.root / "app.py").unlink()
@@ -309,35 +326,32 @@ class BundleTests(unittest.TestCase):
             self.assertFalse(e.safe_path(path), path)
         self.assertTrue(e.safe_path("src/app.py"))
 
-    def test_change_over_the_depth_allowance_is_refused_as_incomplete(self):
+    def test_a_change_over_the_depth_allowance_is_reviewed_in_bounded_sections(self):
         small = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)  # 24,000 available
-        # A diff larger than the allowance stops at the Git byte bound.
+        # A diff larger than the allowance used to be refused at the Git byte bound.
         (self.root / "app.py").write_text("changed line of source\n" * 2_000)
         head = self.commit()
-        with self.assertRaisesRegex(e.ReviewAbort, "^Source or diff exceeds the review depth's max_model_tokens"):
-            e.build_bundle(self.root, head, self.base, small)
-        # A diff under the byte bound can still exceed it with required criteria and framing.
-        (self.root / "app.py").write_text("changed line of source\n" * 700)
-        head = self.commit()
-        with self.assertRaisesRegex(e.ReviewAbort, "^Diff and changed regions exceed the review depth's max_model_tokens"):
-            e.build_bundle(self.root, head, self.base, small, instructions="Required criteria. " * 500)
-        # The same change fits the shipped Claude allowance.
-        self.assertEqual(["app.py"], [f["path"] for f in e.build_bundle(self.root, head, self.base, e.policy("default"))["files"]])
+        bundle = e.build_bundle(self.root, head, self.base, small)
+        self.assertGreater(len(bundle["sections"]), 1)
+        available = small["max_model_tokens"] - small["max_output_tokens"]
+        for section in range(len(bundle["sections"])):
+            for provider, strategy in e.PROMPT_KINDS:
+                prompt = e.section_prompt(bundle, provider, strategy, section)
+                self.assertLessEqual(e.token_bound(prompt) + e.token_bound(json.dumps(e.SECTION_SCHEMA)), available)
+        # The same change is one section under the shipped Claude allowance.
+        shipped = e.build_bundle(self.root, head, self.base, e.policy("default"))
+        self.assertEqual(1, len(shipped["sections"]))
+        self.assertEqual(["app.py"], [f["path"] for f in shipped["files"]])
 
     def test_input_planning_refusals_carry_the_input_limit_reason(self):
         from scripts import review_reliability as reliability
         small = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
-        (self.root / "app.py").write_text("changed line of source\n" * 2_000)
-        head = self.commit()
-        with self.assertRaises(e.InputLimitAbort) as git_bound:
-            e.build_bundle(self.root, head, self.base, small)
         (self.root / "app.py").write_text("changed line of source\n" * 700)
         head = self.commit()
         with self.assertRaises(e.InputLimitAbort) as planned:
-            e.build_bundle(self.root, head, self.base, small, instructions="Required criteria. " * 500)
-        for refusal in (git_bound.exception, planned.exception):
-            self.assertIsInstance(refusal, e.ReviewAbort)
-            self.assertEqual("input_limit", reliability.reason(refusal))
+            e.build_bundle(self.root, head, self.base, small, instructions="Required criteria. " * 5_000)
+        self.assertIsInstance(planned.exception, e.ReviewAbort)
+        self.assertEqual("input_limit", reliability.reason(planned.exception))
         # Other refusals under the same job say nothing about the input limit.
         with self.assertRaises(e.ReviewAbort) as other:
             e.build_bundle(self.root, "f" * 40, self.base, POLICY)
@@ -346,22 +360,31 @@ class BundleTests(unittest.TestCase):
 
 
 class ResultTests(unittest.TestCase):
+    def tampered(self, mutate):
+        """A result whose recorded outputs and merged findings agree, so only a guard can refuse it."""
+        data = result()
+        mutate(data)
+        data["receipt"]["passes"] = [e.pass_receipt(POLICY, s, data["invocations"][s]) for s in POLICY["passes"]]
+        return data
+
     def test_invalid_finding_schema_is_rejected(self):
         for item in ({"path": "src/app.py"}, finding(line=True), finding(end_line=0),
                      finding(confidence="certain"), finding(path="../key"), finding(extra="unknown")):
+            data = self.tampered(lambda d, item=item: d["invocations"]["bundle"][0]["output"].update(findings=[item]))
+            data["findings"] = []
             with self.subTest(item=item), self.assertRaises(e.ReviewAbort):
-                e.validate_result({**result(), "findings": [item]}, POLICY, BUNDLE)
+                e.validate_result(data, POLICY, BUNDLE)
 
     def test_receipt_check_rejects_unsafe_opened_path(self):
-        data = result()
-        data["receipt"]["passes"][0]["files_opened"] = ["../key"]
+        data = self.tampered(lambda d: d["invocations"]["bundle"][0]["receipt"].update(files_opened=["../key"]))
         with self.assertRaisesRegex(e.ReviewAbort, "receipt is invalid"):
             e.validate_result(data, POLICY, BUNDLE)
 
     def test_missing_invalid_limit_and_failed_receipts_never_mean_clean(self):
-        for bad in (None, {}, {"passes": []}, {"passes": [receipt()]}):
+        good = result()
+        for bad in (None, {}, {"passes": []}, {"passes": [good["receipt"]["passes"][0]]}):
             with self.subTest(bad=bad), self.assertRaises(e.ReviewAbort):
-                e.validate_result({"findings": [], "receipt": bad}, POLICY, BUNDLE)
+                e.validate_result({**good, "receipt": bad}, POLICY, BUNDLE)
         for key, value in (("status", "budget_stop"), ("turns", POLICY["max_turns"] + 1), ("turns", True),
                            ("cost_usd", POLICY["max_budget_usd"] + 1), ("cost_usd", None), ("cost_usd", float("nan")),
                            ("usage", {}), ("usage", {"input_tokens": True, "output_tokens": 2}),
@@ -378,16 +401,46 @@ class ResultTests(unittest.TestCase):
             with self.subTest(raw=bad), self.assertRaises(e.ReviewAbort):
                 e.strict_json(bad)
         with self.assertRaisesRegex(e.ReviewAbort, "Missing expected"):
-            e.validate_result(e.strict_json((fixtures / "empty-receipt.json").read_text()), POLICY, BUNDLE)
+            e.validate_result(dict(e.strict_json((fixtures / "empty-receipt.json").read_text()), invocations={}),
+                              POLICY, BUNDLE)
 
     def test_merge_by_location_and_mechanism_preserves_distinct_defects(self):
-        first = {"findings": [finding(confidence="low")], "receipt": receipt()}
-        second = {"findings": [finding(mechanism="  RESOLVED state  is not copied "),
-                               finding(mechanism="Cancellation interrupts the transfer")], "receipt": receipt("callers")}
-        merged = e.merge_results([first, second])
-        self.assertEqual(2, len(merged["findings"]))
-        self.assertTrue(all(f["confidence"] == "high" for f in merged["findings"]))
-        e.validate_result(merged, POLICY, BUNDLE)
+        merged = e.merge_findings([[finding(confidence="low")],
+                                   [finding(mechanism="  RESOLVED state  is not copied "),
+                                    finding(mechanism="Cancellation interrupts the transfer")]])
+        self.assertEqual(2, len(merged))
+        self.assertTrue(all(f["confidence"] == "high" for f in merged))
+        e.validate_result(e.combine_results(POLICY, [("bundle", [record("bundle", [finding(confidence="low")])]),
+                                                     ("callers", [record("callers", [
+                                                         finding(mechanism="  RESOLVED state  is not copied "),
+                                                         finding(mechanism="Cancellation interrupts the transfer")])])]),
+                          POLICY, BUNDLE)
+
+    def test_aggregate_findings_follow_the_validated_invocations_not_a_fixed_twelve(self):
+        many = [finding(path=f"src/f{i}.py") for i in range(e.MAX_FINDINGS)]
+        outputs = [[finding(path=f"src/f{section}_{i}.py") for i in range(e.MAX_FINDINGS)] for section in range(5)]
+        merged = e.merge_findings(outputs)
+        self.assertEqual(5 * e.MAX_FINDINGS, len(merged))
+        self.assertGreater(len(merged), len(POLICY["passes"]) * e.MAX_FINDINGS)
+        self.assertEqual(e.MAX_FINDINGS, len(e.merge_findings([many])))
+        with self.assertRaises(e.ReviewAbort):
+            e.merge_findings([many + [finding(path="src/extra.py")]])
+
+    def test_forged_merged_findings_and_foreign_invocations_never_validate(self):
+        data = result([finding()])
+        data["findings"] = [finding(title="Injected defect")]
+        with self.assertRaisesRegex(e.ReviewAbort, "Merged findings differ"):
+            e.validate_result(data, POLICY, BUNDLE)
+        for mutate in (lambda d: d["invocations"]["bundle"][0].update(manifest_root="2" * 64),
+                       lambda d: d["invocations"]["bundle"][0].update(section_sha256="3" * 64),
+                       lambda d: d["invocations"]["bundle"][0].update(section=1),
+                       lambda d: d["invocations"]["bundle"][0].update(kind="consolidation"),
+                       lambda d: d["invocations"]["bundle"].append(record()),
+                       lambda d: d["invocations"].update(bundle=[]),
+                       lambda d: d["invocations"].update(other=[record()])):
+            data = self.tampered(mutate)
+            with self.subTest(mutate=mutate), self.assertRaises(e.ReviewAbort):
+                e.validate_result(data, POLICY, BUNDLE)
 
 
 class ClaudeTests(unittest.TestCase):
@@ -412,7 +465,8 @@ class ClaudeTests(unittest.TestCase):
             parsed = e.claude_result(events, POLICY, BUNDLE, "bundle", Path(tmp))
         # A failed or missing read is not counted, and the summary reports the file.
         self.assertEqual([], parsed["receipt"]["files_opened"])
-        self.assertEqual(["src/app.py"], e.unopened_regions(BUNDLE, [parsed["receipt"]]))
+        regions = dict(BUNDLE, files=[dict(BUNDLE["files"][0], content="regions")])
+        self.assertEqual(["src/app.py"], e.unopened_regions(regions, [parsed["receipt"]]))
 
     def test_text_message_events_are_tolerated_without_crediting_reads(self):
         events = transcript()
@@ -697,9 +751,9 @@ class ClaudeTests(unittest.TestCase):
 
 class CoverageTests(unittest.TestCase):
     def test_unopened_region_files_are_reported_not_refused(self):
-        bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "x = 1\n"},
-                            {"path": "src/big.py", "deleted": False, "content": None},
-                            {"path": "src/gone.py", "deleted": True, "content": None}]}
+        bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "full"},
+                            {"path": "src/big.py", "deleted": False, "content": "regions"},
+                            {"path": "src/gone.py", "deleted": True, "content": "none"}]}
         r = receipt("bundle")
         r["files_opened"] = []
         # Every changed line is in the bundle, so the pass stands.
@@ -836,19 +890,19 @@ class CodexTests(unittest.TestCase):
             with patch.object(e, "configure_codex"):
                 with patch.object(e, "codex_command", return_value=failing), \
                         self.assertRaisesRegex(e.ReviewAbort, "^Codex action failed; inspect provider account"):
-                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
+                    e.run_codex(settings, EMPTY, "callers", Path(tmp), "/action", home, workspace)
                 launcher_failure = [python, "-c", "import sys; "
                     "sys.stderr.write('Error: Could not restrict access to /private/provider-text.\\n'); sys.exit(1)"]
                 with patch.object(e, "codex_command", return_value=launcher_failure), \
                         self.assertRaisesRegex(e.ReviewAbort, "codex_action_error=privilege_removal") as caught:
-                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
+                    e.run_codex(settings, EMPTY, "callers", Path(tmp), "/action", home, workspace)
                 self.assertNotIn("private", str(caught.exception))
                 self.assertNotIn("provider-text", str(caught.exception))
                 with patch.object(e, "codex_command", side_effect=writes_then_fails), \
                         self.assertRaisesRegex(e.ReviewAbort,
                                                r"^OpenAI response stream disconnected; request the review again "
                                                r"\(codex_error_info=response_stream_disconnected\); no paid retry$"):
-                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace)
+                    e.run_codex(settings, EMPTY, "callers", Path(tmp), "/action", home, workspace)
             self.assertEqual([], list(workspace.iterdir()), "failed pass retained runtime files")
 
     def test_single_request_above_the_allowance_aborts(self):
@@ -1094,7 +1148,7 @@ class CodexTests(unittest.TestCase):
                     settings = {**POLICY, "provider": "codex", "model": "gpt-6.1-sol"}
                     reported = {**receipt("callers"), "provider": "codex",
                                 "model": settings["model"], "files_opened": opened}
-                    bundle = {"files": [{"path": "target.py", "deleted": False, "content": None}]}
+                    bundle = {"files": [{"path": "target.py", "deleted": False, "content": "regions"}]}
                     # The pass stands either way; an uncredited read is reported, not counted.
                     e.validate_receipt(reported, settings, bundle, "callers")
                     self.assertEqual([] if expected else ["target.py"],
@@ -1113,9 +1167,9 @@ class CodexTests(unittest.TestCase):
             self.assertEqual([], e.codex_progress(home, Path("/head"))[2])
 
     def test_prompts_name_region_only_files(self):
-        bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "x\n"},
-                            {"path": "src/big.py", "deleted": False, "content": None},
-                            {"path": "src/gone.py", "deleted": True, "content": None}]}
+        bundle = {"files": [{"path": "src/full.py", "deleted": False, "content": "full"},
+                            {"path": "src/big.py", "deleted": False, "content": "regions"},
+                            {"path": "src/gone.py", "deleted": True, "content": "none"}]}
         text = e.region_guidance(bundle, "with ranged reads")
         self.assertIn("src/big.py", text)
         self.assertNotIn("src/full.py", text)
@@ -1192,7 +1246,7 @@ class CodexTests(unittest.TestCase):
                     str(output), json.dumps(value), str(home / f"sessions/{index}.jsonl"), "\n".join(map(json.dumps, events))]
             for strategy in ("first", "verify-threads"):
                 with patch.object(e, "codex_command", side_effect=command):
-                    result = e.run_codex(settings, {"files": []}, strategy, Path(tmp), "/action", home,
+                    result = e.run_codex(settings, EMPTY, strategy, Path(tmp), "/action", home,
                         workspace / strategy, prompt="Read the head checkout.", schema=jobs.VERIFICATION_SCHEMA,
                         validate_output=jobs.validate_verification, output_key="output")
                 self.assertEqual(value, result["output"])
@@ -1206,7 +1260,7 @@ class CodexTests(unittest.TestCase):
             raise RuntimeError("stop before inference")
         with tempfile.TemporaryDirectory() as tmp,                 patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fixture-not-forwarded"}),                 patch.object(e, "configure_codex"), patch.object(e.subprocess, "Popen", side_effect=capture),                 self.assertRaises(RuntimeError):
             home = Path(tmp) / "home"; home.mkdir()
-            e.run_codex(dict(POLICY, model="gpt-6-luna", provider="codex"), {"files": []}, "callers",
+            e.run_codex(dict(POLICY, model="gpt-6-luna", provider="codex"), EMPTY, "callers",
                         Path(tmp), Path(tmp), home, Path(tmp) / "work")
         self.assertIn("CODEX_HOME", seen)
         self.assertNotIn("ANTHROPIC_API_KEY", seen)
@@ -1269,10 +1323,10 @@ class AllowanceGuardTests(unittest.TestCase):
             workspace.mkdir()
             with patch.object(e, "configure_codex"),                     patch.object(e, "codex_command", side_effect=AssertionError("provider launched")):
                 with self.assertRaisesRegex(e.InputLimitAbort, "Codex prompt exceeds the review depth's max_model_tokens"):
-                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace,
+                    e.run_codex(settings, EMPTY, "callers", Path(tmp), "/action", home, workspace,
                                 prompt="x" * (self.LIMIT - schema + 1))
                 with self.assertRaisesRegex(AssertionError, "provider launched"):
-                    e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace,
+                    e.run_codex(settings, EMPTY, "callers", Path(tmp), "/action", home, workspace,
                                 prompt="x" * (self.LIMIT - schema))
 
 

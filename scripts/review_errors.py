@@ -23,7 +23,7 @@ class InputLimitAbort(ReviewAbort, reliability.Reasoned):
     reason = "input_limit"
 
 
-class IncompleteReview(ReviewAbort, reliability.Reasoned):
+class IncompleteReviewAbort(ReviewAbort, reliability.Reasoned):
     """A logical pass stopped before every required section completed.
 
     `progress` carries only counters (completed, total sections and the strategy name

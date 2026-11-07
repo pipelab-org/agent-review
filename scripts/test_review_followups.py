@@ -181,6 +181,136 @@ class RecordTests(unittest.TestCase):
             f.download_record(artifact(data), "fixture-token", 300)
 
 
+def evidence3(head=HEAD, run=123, findings=(), roots=(), parent=None, start=None):
+    """A v3 record: the bounded root with its comment digest, and the pages that carry the lists."""
+    base = evidence(head, run, parent=parent, start=start)
+    full = {k: v for k, v in base.items() if k != "digest"}
+    full.update(findings=list(findings), roots=list(roots), receipt={"passes": []}, continuations=[])
+    root, pages = f.paged(full)
+    record = dict(root)
+    record["digest"] = f.digest("summary\n<!-- agent-review-result:v1 " + base64.b64encode(f.canonical(root).encode()).decode() + " -->")
+    return record, pages
+
+
+def finding(index, size=900):
+    return {"path": "src/file.py", "line": index + 1, "end_line": index + 1, "title": f"Finding {index}",
+            "body": f"Mechanism {index}: " + "evidence " * (size // 9)}
+
+
+class PagedEvidenceTests(unittest.TestCase):
+    def test_a_v3_root_is_bounded_validated_and_never_carries_the_lists(self):
+        record, pages = evidence3(findings=[finding(i) for i in range(5)])
+        status, cs = comments(record)
+        self.assertEqual(record, f.parse_record(status, cs))
+        self.assertLess(len(f.canonical(record).encode()), f.MAX_DATA_BYTES)
+        for key in f.BULK:
+            with self.subTest(key=key):
+                broken = dict(record, **{key: []})
+                c, all_comments = comments(broken)
+                self.assertIsNone(f.parse_record(c, all_comments))
+        for mutate in (lambda e: e.update(pages=0), lambda e: e.update(bytes=0), lambda e: e.update(pages=e["pages"] + 1),
+                       lambda e: e.update(chain="g" * 64), lambda e: e.update(chain="a" * 63),
+                       lambda e: e.update(extra=1), lambda e: e.pop("chain"), lambda e: e.update(bytes=True)):
+            broken = copy.deepcopy(record)
+            mutate(broken["evidence"])
+            c, all_comments = comments(broken)
+            with self.subTest(mutate=mutate):
+                self.assertIsNone(f.parse_record(c, all_comments))
+        legacy = dict(record, version=2)
+        c, all_comments = comments(legacy)
+        self.assertIsNone(f.parse_record(c, all_comments), "v2 must carry its lists inline")
+
+    def test_evidence_beyond_the_shared_data_bound_pages_and_reassembles_exactly(self):
+        items = [finding(i, 1100) for i in range(160)]
+        record, pages = evidence3(findings=items)
+        self.assertGreater(record["evidence"]["bytes"], f.MAX_DATA_BYTES)
+        self.assertGreater(len(pages), 2)
+        self.assertEqual(record["evidence"]["pages"], len(pages))
+        self.assertTrue(all(len(p) == f.MAX_DATA_BYTES for p in pages[:-1]) and 0 < len(pages[-1]) <= f.MAX_DATA_BYTES)
+        full = f.assemble(record, pages)
+        self.assertEqual(items, full["findings"])
+        self.assertEqual(record, f.record_root(full))
+
+    def test_missing_extra_reordered_altered_and_resized_pages_never_assemble(self):
+        record, pages = evidence3(findings=[finding(i, 1100) for i in range(160)])
+        flipped = bytearray(pages[1]); flipped[7] ^= 1
+        cases = {"dropped last": pages[:-1], "extra": pages + [b"{}"], "reordered": [pages[1], pages[0], *pages[2:]],
+                 "altered": [pages[0], bytes(flipped), *pages[2:]], "short middle": [pages[0], pages[1][:-1], *pages[2:]],
+                 "short last": pages[:-1] + [pages[-1][:-1]], "empty": [], "not bytes": ["x"] * len(pages)}
+        for name, bad in cases.items():
+            with self.subTest(name), self.assertRaises(f.FollowupAbort):
+                f.assemble(record, bad)
+        for mutate in (lambda e: e.update(chain="0" * 64), lambda e: e.update(bytes=e["bytes"] + 1)):
+            broken = copy.deepcopy(record)
+            mutate(broken["evidence"])
+            with self.assertRaises(f.FollowupAbort):
+                f.assemble(broken, pages)
+        with self.assertRaises(f.FollowupAbort):
+            f.assemble(dict(record, version=2), pages)
+        # A consistent re-paging of tampered content still fails: the lists must be well formed.
+        for bulk in ({"findings": [None], "roots": [], "receipt": {}, "continuations": []},
+                     {"findings": [], "roots": [{"id": 1}], "receipt": {}, "continuations": []},
+                     {"findings": [], "roots": [], "receipt": {}}):
+            raw = f.canonical(bulk).encode()
+            chunks = [raw[i:i + f.MAX_DATA_BYTES] for i in range(0, len(raw), f.MAX_DATA_BYTES)]
+            forged = dict(record, evidence={"pages": len(chunks), "bytes": len(raw), "chain": f.page_chain(chunks)})
+            with self.assertRaises(f.FollowupAbort):
+                f.assemble(forged, chunks)
+
+    def test_the_artifact_holds_exactly_the_root_and_its_pages(self):
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is exercised in the pinned runtime")
+        record, pages = evidence3(findings=[finding(i, 1100) for i in range(160)])
+        def archive(extra=None, drop=None, rename=None, root=None):
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w") as bundle:
+                bundle.writestr("completion.json", f.canonical(root or record))
+                for number, page in enumerate(pages, 1):
+                    name = f.PAGE_NAME.format(number)
+                    if name != drop:
+                        bundle.writestr((rename or {}).get(name, name), page)
+                for name, data in (extra or {}).items():
+                    bundle.writestr(name, data)
+            return stream.getvalue()
+        def load(data):
+            artifact = NS(archive_download_url="https://api.github.com/repos/example/project/actions/artifacts/9/zip",
+                          raw_data={"digest": "sha256:" + hashlib.sha256(data).hexdigest()})
+            with patch.object(requests, "get", side_effect=[NS(status_code=302, headers={"Location": "https://storage.example/a"}),
+                                                            NS(content=data, raise_for_status=lambda: None)]):
+                return f.download_record(artifact, "fixture-token", 300)
+        self.assertEqual(160, len(load(archive())["findings"]))
+        bad = {"extra file": archive(extra={"notes.txt": b"x"}), "missing page": archive(drop=f.PAGE_NAME.format(2)),
+               "traversal": archive(rename={f.PAGE_NAME.format(1): "../pages/000001.part"}),
+               "wrong number": archive(rename={f.PAGE_NAME.format(1): "pages/000009.part"}),
+               "oversized page": archive(rename={}, extra={f.PAGE_NAME.format(len(pages) + 1): b"x" * (f.MAX_DATA_BYTES + 1)}),
+               "duplicate entry": archive(extra={"completion.json": f.canonical(record)})}
+        for name, data in bad.items():
+            with self.subTest(name), self.assertRaises((f.FollowupAbort, ValueError, KeyError)):
+                load(data)
+
+    def test_v3_verification_needs_the_assembled_lists_and_v2_keeps_its_own_contract(self):
+        def proven(record, loader):
+            _, cs = comments(record)
+            repo, pr = MagicMock(), MagicMock()
+            pr.get_issue_comments.return_value = list(cs.values())
+            run = NS(raw_data=run_data(record), get_artifacts=lambda: [NS(name="agent-review-completion", expired=False)])
+            repo.get_workflow_run.return_value = run
+            return f.verified_records(repo, pr, binding(), loader)
+
+        old = evidence()
+        self.assertEqual({123: old}, proven(old, lambda a: old))
+        new, pages = evidence3(findings=[finding(0)])
+        full = f.assemble({k: v for k, v in new.items() if k != "digest"}, pages)
+        self.assertEqual({123: dict(full, digest=new["digest"])}, proven(new, lambda a: dict(full, digest=new["digest"])))
+        # The root alone, or a v2 loader result for a v3 comment (and the reverse), is never proof.
+        self.assertEqual({}, proven(new, lambda a: new))
+        self.assertEqual({}, proven(new, lambda a: old))
+        self.assertEqual({}, proven(old, lambda a: dict(full, digest=new["digest"])))
+        self.assertEqual({}, proven(new, lambda a: "not a record"))
+
+
 class ScopeTests(unittest.TestCase):
     def setUp(self):
         self.repo = MagicMock()

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 
 try:
@@ -270,6 +271,44 @@ def prepare_reply(repo, pr, ctx, policy, output, head_dir=None, learning_data=No
                          "prompt": prompt, "reused": reused, "resolve_command": command})
 
 
+def bound_bundle(bundle, head_dir):
+    """Attach the checkout's exact-byte store after proving the plan was not altered."""
+    bundle = engine.attach_store(bundle, engine.sections.Store.for_checkout(head_dir))
+    if bundle.get("root") != engine.manifest_root(bundle) or bundle.get("version") != engine.BUNDLE_VERSION:
+        raise ReviewAbort("Inference plan differs from its recorded root")
+    return bundle
+
+
+def codex_sessions(policy, bundle, default_workspace):
+    """The isolated multi-session launcher, needed only when one pass makes several Codex launches.
+
+    The pinned action's launcher drops sudo irreversibly, so a second launch in the same
+    job is refused; without the dedicated-identity launcher a multi-invocation Codex plan
+    stops before any model request instead of weakening isolation.
+    """
+    if policy["provider"] != "codex" or len(engine.expected_plan(bundle)) == 1:
+        return None, default_workspace
+    user = os.environ.get("REVIEW_CODEX_SESSION_USER")
+    if not user:
+        raise ReviewAbort("This change needs several Codex sessions but no isolated session identity is "
+                          "configured; review incomplete, no paid retry")
+    try:
+        from . import review_codex_sessions as launcher
+        from .codex_identity_setup import SESSIONS_DIR
+    except ImportError:
+        import review_codex_sessions as launcher
+        from codex_identity_setup import SESSIONS_DIR
+    codex, node = shutil.which("codex"), shutil.which("node")
+    if not codex or not node:
+        raise ReviewAbort("Codex or its runtime was not found for the isolated session launcher")
+    # The model account gets only the directories its launcher needs, each of which the launcher
+    # then requires to be closed to the account, never the job's whole PATH.
+    trusted_path = ":".join(dict.fromkeys([os.path.dirname(codex), os.path.dirname(node), "/usr/bin", "/bin"]))
+    sessions = launcher.CodexSessions(launcher.resolve_identity(user), codex=codex, trusted_path=trusted_path)
+    sessions.verify()
+    return sessions, Path(SESSIONS_DIR)
+
+
 def strip_learning_text(plan):
     if plan["kind"] == "review":
         plan["bundle"].pop("learnings_text", None)
@@ -297,15 +336,26 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
     elif plan["scope"]["kind"] == "unchanged":
         result = None
     else:
-        results = []
+        bundle = bound_bundle(plan["bundle"], head_dir)
+        sessions, workspace = codex_sessions(policy, bundle, Path(output).parent)
+        # Codex sessions run as another account that must not reach the runner's home, so they
+        # read a staged copy of the head (and of the exact patch store) under the sessions directory.
+        review_dir = head_dir
+        if sessions is not None:
+            review_dir = sessions.stage_head(head_dir, workspace)
+            bundle = engine.attach_store(plan["bundle"], engine.sections.Store.for_checkout(review_dir))
+        passes = []
         for strategy in policy["passes"]:
-            if policy["provider"] == "claude":
-                results.append(engine.run_claude(policy, plan["bundle"], strategy, head_dir, credentials=credentials))
-            else:
-                results.append(engine.run_codex(policy, plan["bundle"], strategy, head_dir, action,
-                                                codex_home, Path(output).parent))
-        result = engine.merge_results(results)
-        engine.validate_result(result, policy, plan["bundle"])
+            def invoke(current, prompt, schema, validator, key, strategy=strategy):
+                if policy["provider"] == "claude":
+                    return engine.run_claude(current, bundle, strategy, review_dir, prompt=prompt, schema=schema,
+                                             validate_output=validator, output_key=key, credentials=credentials)
+                return engine.run_codex(current, bundle, strategy, review_dir, action, codex_home,
+                                        workspace, prompt=prompt, schema=schema,
+                                        validate_output=validator, output_key=key, sessions=sessions)
+            passes.append((strategy, engine.run_pass(policy, bundle, strategy, review_dir, invoke)))
+        result = engine.combine_results(policy, passes)
+        engine.validate_result(result, policy, bundle, prompts=True)
         validate_locations(result, head_dir, ctx["head"])
     strip_learning_text(plan)
     verification = None
@@ -453,30 +503,56 @@ def finish_resolution(pr, posted, root, succeeded, expected_body):
         raise ReviewAbort("Inline reply publication could not be verified")
 
 
-def anchor_lines(patch):
-    # GitHub accepts RIGHT-side additions and unchanged context lines.
-    # https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request
+def visible_lines(lines):
+    """RIGHT-side line numbers a patch shows: additions and unchanged context lines.
+
+    GitHub accepts both as anchors:
+    https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request
+    Hunk body lines start with a space, `+`, `-` or a backslash, so inside a hunk every
+    `+` line is an addition, including content such as `++i;` whose patch line begins
+    `+++`; only lines before the first hunk header are file headers.
+    """
     line, result = None, set()
-    for text in patch.splitlines():
+    for text in lines:
         match = re.match(r"@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)", text)
         if match:
             line = int(match[1])
-        elif line is not None:
-            if text.startswith("+") and not text.startswith("+++"):
-                result.add(line)
-                line += 1
-            elif text.startswith(" "):
-                result.add(line)
-                line += 1
+        elif line is not None and text.startswith(("+", " ")):
+            result.add(line)
+            line += 1
     return result
 
 
-def anchor_range(patch, first, last):
+def anchor_lines(patch):
+    # Split at newlines only: str.splitlines also breaks at form feeds and Unicode separators.
+    return visible_lines(patch.split("\n"))
+
+
+def patch_visible(store, index, file):
+    """Visible lines of a stored patch, proving the bytes still match the plan."""
+    digest = hashlib.sha256()
+
+    def lines():
+        with open(store.patch(index), "rb") as handle:
+            for raw in handle:
+                digest.update(raw)
+                yield (raw[:-1] if raw.endswith(b"\n") else raw).decode("utf-8")
+
+    result = visible_lines(lines())
+    if digest.hexdigest() != file["patch"]["sha256"]:
+        raise ReviewAbort("Review store differs from the plan; nothing published")
+    return result
+
+
+def range_visible(lines, first, last):
     """Require the entire range to be visible on the diff's RIGHT side."""
-    lines = anchor_lines(patch)
     return (engine.positive_int(first) and engine.positive_int(last) and first <= last
             and last - first + 1 <= len(lines)
             and all(line in lines for line in range(first, last + 1)))
+
+
+def anchor_range(patch, first, last):
+    return range_visible(anchor_lines(patch), first, last)
 
 
 def public_finding(item):
@@ -484,6 +560,43 @@ def public_finding(item):
             "body": "\n\n".join(f"{label}: {item[key]}" for label, key in
                         (("Mechanism", "mechanism"), ("Trigger", "trigger"), ("Consequence", "consequence"),
                          ("Repair", "repair"), ("Confidence", "confidence")))}
+
+
+# Why a finding has no new thread of its own; fixed wording, never model or exception text.
+NO_THREAD = {"prior": "an identical finding was already published with this text",
+             "unconfirmed": "its location could not be confirmed at the reviewed head",
+             "unchanged": "its file is not among this review's changed files"}
+
+
+def place_findings(plan, result, findings, previous, store):
+    """Decide each finding's discussion: a line thread, a file-level thread, or the summary.
+
+    A line thread needs the whole range visible in the diff. A confirmed location in a
+    changed file that the visible diff does not show gets a file-level thread, with its
+    real location in the text. Nothing gets a fabricated anchor.
+    """
+    files = {f["path"]: (index, f) for index, f in enumerate(plan["bundle"]["files"])}
+    visible = {}
+    placement, reasons = [], []
+    for item, finding in zip(result["findings"], findings):
+        entry = files.get(finding["path"])
+        reason = None
+        if followups.canonical(finding) in previous:
+            reason = "prior"
+        elif entry is None or entry[1]["deleted"]:
+            reason = "unchanged"
+        elif engine.UNVERIFIED_LOCATION_NOTE in item["consequence"]:
+            reason = "unconfirmed"
+        if reason:
+            placement.append("summary")
+            reasons.append(reason)
+            continue
+        index, file = entry
+        if index not in visible:
+            visible[index] = patch_visible(store, index, file)
+        placement.append("inline" if range_visible(visible[index], finding["line"], finding["end_line"]) else "file")
+        reasons.append(None)
+    return placement, reasons
 
 
 def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_dir=None):
@@ -504,30 +617,37 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
             or plan["bundle"]["from"] != (scope["from"] if scope["kind"] == "incremental" else plan["bundle"]["merge_base"])):
         raise ReviewAbort("Findings bundle is not bound to admitted commits")
     findings = [public_finding(f) for f in result["findings"]]
-    files = {f["path"]: f for f in plan["bundle"]["files"]}
     previous = {followups.canonical(f) for record in proof.values() for f in record["findings"]}
-    placement, anchored = [], []
-    for index, finding in enumerate(findings):
-        file = files.get(finding["path"])
-        # Locations outside the visible diff remain in the summary, never a fabricated anchor.
-        # Exact prior findings keep their full text here instead of opening an identical
-        # thread: GitHub moves a live comment's commit_id to the new head and outdates it
-        # when its line is rewritten, so an old thread is no proof the text is still visible.
-        if (not (file and anchor_range(file["patch"], finding["line"], finding["end_line"]))
-                or followups.canonical(finding) in previous):
-            placement.append("summary")
-        else:
-            placement.append("inline")
-            anchored.append(index)
+    store = engine.sections.Store.for_checkout(head_dir)
+    # Exact prior findings keep their full text in the summary instead of opening an identical
+    # thread: GitHub moves a live comment's commit_id to the new head and outdates it
+    # when its line is rewritten, so an old thread is no proof the text is still visible.
+    placement, reasons = place_findings(plan, result, findings, previous, store)
+    anchored = [i for i, where in enumerate(placement) if where == "inline"]
+    filed = [i for i, where in enumerate(placement) if where == "file"]
     comments = [inline_comment([findings[i] for i in group]) for group in overlap_groups(findings, anchored)]
     key = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
     roots = []
     def fresh():
         check_pr(repo, ctx)
     status = pr.create_issue_comment(notice + "\nReview publication pending; no completed review yet.")
+    inline = publish.InlinePublisher(pr, ctx["head"], fresh, roots)
     if comments:
-        publish.InlinePublisher(pr, ctx["head"], fresh, roots)(commit=repo.get_commit(ctx["head"]), event="COMMENT", comments=comments)
-    text = summary_text(ctx, scope, plan["bundle"], result, findings, placement)
+        inline(commit=repo.get_commit(ctx["head"]), event="COMMENT", comments=comments)
+    for index in filed:
+        request = file_comment(findings[index])
+        inline.file_thread(request["path"], request["body"])
+    first, pages = summary_pages(ctx, scope, plan["bundle"], result, findings, placement, reasons, run)
+    continuations = []
+    for body in pages:
+        fresh()
+        extra = pr.create_issue_comment(body)
+        actual = pr.get_issue_comment(extra.id)
+        if (not followups.identity(extra.user, followups.BOT) or not followups.positive(extra.id)
+                or not followups.identity(actual.user, followups.BOT) or actual.body != body):
+            raise ReviewAbort("Summary continuation could not be verified")
+        continuations.append({"id": extra.id, "digest": followups.digest(body), "url": extra.html_url})
+    text = first(continuations)
     if plan.get("threads") and verification is None:
         text += "\n\n" + FOLLOWUP_NOTE
     # Check sizes before any success transition; a partial publication is never reusable.
@@ -539,12 +659,14 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
         raise ReviewAbort("Summary identity could not be verified")
     evidence = {"repository": ctx["repository"], "number": ctx["number"], "base": ctx["base"], "head": ctx["head"],
                 "depth": ctx["depth"], "key": key, "summary": summary.id, "findings": findings,
-                "version": 2, "context": ctx, "scope": scope, "run_id": int(run), "roots": roots,
-                "receipt": result["receipt"]}
-    manifest = publish.result_comment(publish.result_manifest(evidence))
+                "context": ctx, "scope": scope, "run_id": int(run), "roots": roots,
+                "receipt": result["receipt"],
+                "continuations": [{"id": c["id"], "digest": c["digest"]} for c in continuations]}
+    root, _ = followups.paged(evidence)
+    manifest = publish.result_comment(publish.result_manifest(root))
     bound = text + "\n" + manifest
     if (len(bound.encode()) > followups.MAX_DATA_BYTES or
-            len(followups.canonical(dict(evidence, digest="0" * 64)).encode()) > followups.MAX_DATA_BYTES):
+            len(followups.canonical(dict(root, digest="0" * 64)).encode()) > followups.MAX_DATA_BYTES):
         raise ReviewAbort("Completion exceeds the existing data budget")
     summary.edit(bound)
     actual = pr.get_issue_comment(summary.id)
@@ -602,7 +724,8 @@ def reconstruct_root(root, record):
     resolution. Delimiters inside finding bodies are data, not split points.
     """
     candidates = [f for f in record["findings"] if f["path"] == root.path and f["line"] is not None]
-    singles = [f for f in candidates if inline_comment([f])["body"] == root.body]
+    singles = [f for f in candidates
+               if root.body in (inline_comment([f])["body"], file_comment(f)["body"])]
     heading = re.match(r"\*\*([1-9][0-9]*) findings on these lines\*\*\n\n", root.body)
     if len(singles) == 1 and not heading:
         return singles
@@ -906,38 +1029,171 @@ def cell(text):
     return html.escape(" ".join(text.split()), quote=False).replace("\\", "\\\\").replace("|", "\\|")
 
 
-WHERE = {"inline": "inline thread", "summary": "below"}
+WHERE = {"inline": "inline thread", "file": "file thread", "summary": "below"}
+CONTINUATION = "<!-- agent-review-continuation:v1 run={run} page={page} -->"
 
 
-def summary_text(ctx, scope, bundle, result, findings, placement):
-    """Short headline and table first; full text only for findings with no thread."""
-    if not findings:
-        text = "**AI review:** No findings reported by the completed passes."
-    else:
-        counts = {}
-        for item in result["findings"]:
-            counts[item["confidence"]] = counts.get(item["confidence"], 0) + 1
-        tally = ", ".join(f"{counts[c]} {c}" for c in ("high", "medium", "low") if c in counts)
-        noun = "finding" if len(findings) == 1 else "findings"
-        rows = [f"| {item['confidence']} | {cell(f['title'])} | {location(f).replace('|', chr(92) + '|')} | {WHERE[where]} |"
-                for item, f, where in zip(result["findings"], findings, placement)]
-        text = (f"**AI review:** {len(findings)} {noun} ({tally}).\n\n"
-                "| Confidence | Finding | Location | Discussion |\n|---|---|---|---|\n" + "\n".join(rows))
-        loose = [f for f, where in zip(findings, placement) if where == "summary"]
-        if loose:
-            text += "\n\n**Findings without a new thread**\n\n" + "\n\n".join(
-                f"**{f['title']}** ({location(f)})\n\n{f['body']}" for f in loose)
-    details = (f"Reviewed base `{ctx['base']}` and head `{ctx['head']}`."
-               f"\n\nReviewer source `{ctx['reviewer']}`; policy `{ctx['profile_sha']}`."
-               f"\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
-               + "\n\n" + engine.learnings.summary(bundle["learnings"]) + "."
-               + "\n\nEarlier findings and threads remain for the maintainer's sweep."
-               f"\n\nDeclared exclusions: `{json.dumps(bundle['exclusions']).replace(chr(96), chr(92)+'u0060')}`.")
+def split_utf8(text, room):
+    """Cut text into pieces of at most `room` bytes without breaking a character."""
+    data, pieces = text.encode("utf-8"), []
+    while data:
+        cut = min(len(data), room)
+        while cut < len(data) and data[cut] & 0xC0 == 0x80:
+            cut -= 1
+        pieces.append(data[:cut].decode("utf-8"))
+        data = data[cut:]
+    return pieces
+
+
+def summary_items(result, findings, placement, reasons):
+    """Table rows and full-text blocks, in the order they are read."""
+    rows = [f"| {item['confidence']} | {cell(f['title'])} | {location(f).replace('|', chr(92) + '|')} | {WHERE[where]} |"
+            for item, f, where in zip(result["findings"], findings, placement)]
+    loose = [f"**{f['title']}** ({location(f)})\n\n{f['body']}"
+             + (f"\n\n_Not threaded: {NO_THREAD[reason]}._" if reason else "")
+             for f, where, reason in zip(findings, placement, reasons) if where == "summary"]
+    return rows, loose
+
+
+def table_head(result, findings):
+    counts = {}
+    for item in result["findings"]:
+        counts[item["confidence"]] = counts.get(item["confidence"], 0) + 1
+    tally = ", ".join(f"{counts[c]} {c}" for c in ("high", "medium", "low") if c in counts)
+    noun = "finding" if len(findings) == 1 else "findings"
+    return (f"**AI review:** {len(findings)} {noun} ({tally}).\n\n"
+            "| Confidence | Finding | Location | Discussion |\n|---|---|---|---|\n")
+
+
+def details_parts(ctx, scope, bundle, result):
+    """The collapsed details: a fixed core, plus lists that may be long enough to continue."""
+    core = (f"Reviewed base `{ctx['base']}` and head `{ctx['head']}`."
+            f"\n\nReviewer source `{ctx['reviewer']}`; policy `{ctx['profile_sha']}`."
+            f"\n\nScope: `{json.dumps(scope, sort_keys=True)}`."
+            + "\n\n" + engine.learnings.summary(bundle["learnings"]) + "."
+            + "\n\nEarlier findings and threads remain for the maintainer's sweep.")
+    sections = len(bundle["sections"])
+    if sections > 1:
+        omitted = sum(r["questions_omitted"] for p in result["receipt"]["passes"] for r in p["invocations"])
+        core += (f"\n\nCoverage: every pass reviewed all {sections} sections of this change and then a "
+                 "cross-section stage, within one cumulative allowance per pass."
+                 + (f" {omitted} cross-section questions did not fit that stage's input allowance and stay in the "
+                    "pass ledger." if omitted else ""))
+    lists = [f"Declared exclusions: `{json.dumps(bundle['exclusions']).replace(chr(96), chr(92)+'u0060')}`."]
     unopened = engine.unopened_regions(bundle, result["receipt"]["passes"])
     if unopened:
-        details += ("\n\nSent as changed regions only and not opened by any pass: "
-                    f"`{json.dumps(unopened).replace(chr(96), chr(92)+'u0060')}`.")
-    return text + "\n\n<details><summary>Review details</summary>\n\n" + details + "\n\n</details>"
+        lists.append("Sent as changed regions only and not opened by any pass: "
+                     f"`{json.dumps(unopened).replace(chr(96), chr(92)+'u0060')}`.")
+    return core, lists
+
+
+def render_page(first, head, rows, loose, lists, core="", pointer=""):
+    text = head + "\n".join(rows) if rows else head
+    if loose:
+        text += "\n\n**Findings without a new thread**\n\n" + "\n\n".join(loose)
+    text += pointer
+    if first:
+        text += ("\n\n<details><summary>Review details</summary>\n\n" + "\n\n".join([core, *lists])
+                 + "\n\n</details>")
+    elif lists:
+        text += "\n\n**Review details (continued)**\n\n" + "\n\n".join(lists)
+    return text
+
+
+CONTINUED_TABLE = "| Confidence | Finding | Location | Discussion |\n|---|---|---|---|\n"
+CONTINUED_HEAD = "\n**AI review (continued):**\n\n"
+
+
+def group(items):
+    return ([t for k, t in items if k == "row"], [t for k, t in items if k == "loose"],
+            [t for k, t in items if k == "list"])
+
+
+def summary_pages(ctx, scope, bundle, result, findings, placement, reasons, run):
+    """The summary's first page and any continuation comments, each within the data budget.
+
+    Nothing is dropped: whatever does not fit the first page, in reading order, goes to
+    continuation comments, and the first page links them. Returns (render, bodies) where
+    `render(continuations)` yields the first page given the created comments.
+    """
+    limit = followups.MAX_DATA_BYTES
+    rows, loose = summary_items(result, findings, placement, reasons)
+    core, lists = details_parts(ctx, scope, bundle, result)
+    first_head = table_head(result, findings) if findings else "**AI review:** No findings reported by the completed passes."
+    items = [("row", r) for r in rows] + [("loose", b) for b in loose] + [("list", t) for t in lists]
+    # Reserve the completion manifest and the optional follow-up note, written after this text.
+    root = {"repository": ctx["repository"], "number": ctx["number"], "base": ctx["base"], "head": ctx["head"],
+            "depth": ctx["depth"], "key": "0" * 64, "summary": 10 ** 19, "context": ctx, "scope": scope,
+            "run_id": 10 ** 19, "version": 3, "evidence": {"pages": 10 ** 19, "bytes": 10 ** 19, "chain": "0" * 64}}
+    reserve = (len(publish.result_comment(publish.result_manifest(root)).encode()) + 1
+               + len(("\n\n" + FOLLOWUP_NOTE).encode()))
+    link = f"[{10 ** 19}](https://github.com/{ctx['repository']}/pull/{ctx['number']}#issuecomment-{10 ** 19})"
+    marker = CONTINUATION.format(run=run, page=10 ** 19) + CONTINUED_HEAD
+
+    def text(first, taken, pointer=""):
+        r, lo, li = group(taken)
+        return render_page(first, first_head if first else (CONTINUED_TABLE if r else ""), r, lo, li, core, pointer)
+
+    def fill(first, pending, room, pointer=""):
+        taken = []
+        while pending and len(text(first, taken + [pending[0]], pointer).encode()) <= room:
+            taken.append(pending[0])
+            pending = pending[1:]
+        return taken, pending
+
+    def continuation_pages(rest):
+        pages, room = [], limit - len(marker.encode())
+        while rest:
+            taken, after = fill(False, rest, room)
+            if not taken:
+                # One piece larger than an empty page: split it at character boundaries, never drop it.
+                kind, piece = rest[0]
+                spare = room - len(text(False, [("loose", "")]).encode())
+                rest = [("loose", part) for part in split_utf8(piece, max(spare, 1))] + rest[1:]
+                continue
+            pages.append(taken)
+            rest = after
+        return pages
+
+    links = 0
+    while True:
+        pointer = "\n\n**Continued in separate comments:** " + ", ".join([link] * links) if links else ""
+        page_items, rest = fill(True, list(items), limit - reserve - len(pointer.encode()), pointer)
+        pages = continuation_pages(rest)
+        if len(pages) <= links:
+            break
+        links = len(pages)
+    bodies = [CONTINUATION.format(run=run, page=number) + CONTINUED_HEAD + text(False, taken)
+              for number, taken in enumerate(pages, 1)]
+
+    def render(continuations):
+        pointer = ""
+        if continuations:
+            pointer = ("\n\n**Continued in separate comments:** "
+                       + ", ".join(f"[{i}]({c['url']})" for i, c in enumerate(continuations, 1)))
+        return text(True, page_items, pointer)
+
+    return render, bodies
+
+
+def file_comment(finding):
+    """A file-level thread for a confirmed location the visible diff does not show."""
+    return {"path": finding["path"],
+            "body": (f"**{finding['title']}**\n\nLocation: {location(finding)} at the reviewed head, "
+                     f"outside the diff lines GitHub shows for this file.\n\n{finding['body']}")}
+
+
+def summary_text(ctx, scope, bundle, result, findings, placement, reasons=None):
+    """The whole summary as one text; tests and small reviews use it directly."""
+    render, pages = summary_pages(ctx, scope, bundle, result, findings, placement,
+                                  reasons or [None] * len(findings), "0")
+    return render([])
+
+
+def record_proof(proof, record):
+    """The bounded root of the verified record for this run, for comparison with a parsed comment."""
+    known = proof.get(record["run_id"])
+    return followups.record_root(known) if known is not None else None
 
 
 def collapse_earlier(pr, status_id, summary_id, proof):
@@ -958,7 +1214,7 @@ def collapse_earlier(pr, status_id, summary_id, proof):
         eligible = set()
         for comment in comments.values():
             record = followups.parse_record(comment, comments)
-            if record is None or proof.get(record["run_id"]) != record:
+            if record is None or record_proof(proof, record) != record:
                 continue
             eligible.add(comment.id)
         for comment in comments.values():
@@ -975,7 +1231,7 @@ def collapse_earlier(pr, status_id, summary_id, proof):
         print(f"Earlier review comments were left visible ({type(error).__name__})")
 
 
-UNVERIFIED_LOCATION_NOTE = "_Location could not be confirmed at the reviewed head; listed in the summary only._"
+UNVERIFIED_LOCATION_NOTE = engine.UNVERIFIED_LOCATION_NOTE
 
 
 def validate_locations(result, repo, head):
@@ -1021,7 +1277,8 @@ def validate_artifact(artifact, head_dir, policy, ctx, profile):
         if expected != plan["bundle"]:
             raise ReviewAbort("Artifact bundle differs from immutable source")
         if result is not None:
-            engine.validate_result(result, policy, plan["bundle"])
+            # Rebuilt from immutable Git, so prompts and ledgers are recomputed, not trusted.
+            engine.validate_result(result, policy, expected, prompts=True)
     elif plan["kind"] != "reply":
         raise ReviewAbort("Unknown review artifact kind")
 
