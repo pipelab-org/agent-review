@@ -15,9 +15,11 @@ name: Reusable agentic review
       AGENT_REVIEW_LEARNINGS_APP_KEY:
         required: false
 permissions: {}
-# Hold the existing per-PR queue through verification and publication too.
+# Hold the existing per-PR queue through verification and publication too. The caller admits
+# any human inline reply, so only commands the reply job itself accepts share the PR's queue
+# (at most 100 pending); plain conversation gets a unique group and never takes a slot.
 concurrency:
-  group: agent-review-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  group: agent-review-${{ github.repository }}-${{ (github.event_name == 'issue_comment' || startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')) && (github.event.issue.number || github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: false
   queue: max
 jobs:

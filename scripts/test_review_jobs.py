@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from types import SimpleNamespace as NS
@@ -1721,11 +1722,24 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("Anthropic connectivity passed", output.getvalue())
 
     def test_per_pr_queue_covers_verification_and_publication(self):
-        self.assertEqual({
-            "group": "agent-review-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}",
-            "cancel-in-progress": False, "queue": "max",
-        }, self.workflow["concurrency"])
+        concurrency = self.workflow["concurrency"]
+        self.assertEqual({"cancel-in-progress": False, "queue": "max"},
+                         {k: v for k, v in concurrency.items() if k != "group"})
+        self.assertEqual(
+            "agent-review-${{ github.repository }}-${{ (github.event_name == 'issue_comment' || "
+            "startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')) "
+            "&& (github.event.issue.number || github.event.pull_request.number) || github.run_id }}",
+            concurrency["group"])
         self.assertTrue(all("concurrency" not in job for job in self.workflow["jobs"].values()))
+
+    def test_queue_membership_matches_reply_admission_prefixes(self):
+        # The caller admits any human inline reply; plain conversation must not take a
+        # slot in the 100-pending per-PR queue, so the group names the reply job's prefixes.
+        prefixes = lambda text: set(re.findall(r"startsWith\(github\.event\.comment\.body, '(/[a-z]+)'\)", text))
+        reply = prefixes(self.workflow["jobs"]["reply"]["if"])
+        self.assertEqual({"/ask", "/resolve"}, reply)
+        self.assertEqual(reply, prefixes(self.workflow["concurrency"]["group"]))
+        self.assertIn("|| github.run_id }}", self.workflow["concurrency"]["group"])
 
     def test_publication_preserves_main_review_when_optional_verification_skips_or_fails(self):
         job = self.workflow["jobs"]["publish"]
