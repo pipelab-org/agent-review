@@ -313,6 +313,48 @@ class DiagnosticTests(unittest.TestCase):
         foreign_abort = type("ProviderAbort", (Exception,), {})(SECRET)
         self.assertNotIn(SECRET, json.dumps(reliability.diagnostic(foreign_abort)))
 
+    def test_only_a_trusted_input_limit_refusal_names_a_reason(self):
+        refusal = review.InputLimitAbort(f"private {SECRET}")
+        entry = reliability.diagnostic(refusal)
+        self.assertEqual(("review_abort", "input_limit", "InputLimitAbort"),
+                         (entry["category"], entry["reason"], entry["exception"]))
+        self.assertNotIn(SECRET, json.dumps(entry))
+        # A look-alike never counts: not a marked class, a forged value, or a wrapped refusal.
+        forged_value = review.ReviewAbort("x")
+        forged_value.reason = "input_limit"
+        marked_unknown = review.InputLimitAbort("x")
+        marked_unknown.reason = f"input_limit {SECRET}"
+        named_like = type("InputLimitAbort", (Exception,), {"reason": "input_limit"})(SECRET)
+        try:
+            try:
+                raise refusal
+            except review.InputLimitAbort:
+                raise RuntimeError(SECRET)
+        except RuntimeError as error:
+            wrapped = error
+        for error in (forged_value, marked_unknown, named_like, wrapped, ValueError(SECRET)):
+            with self.subTest(error=type(error).__name__):
+                self.assertIsNone(reliability.reason(error))
+                self.assertNotIn("reason", reliability.diagnostic(error))
+
+    def test_reason_reaches_the_job_output_file_as_one_fixed_line_and_never_otherwise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            summary = Path(directory) / "summary.md"
+            env = {"GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}
+            for error in (ValueError(SECRET), review.ReviewAbort(SECRET), None):
+                reliability.report(error, env=env, stream=io.StringIO())
+            self.assertFalse(output.exists())
+            stream = io.StringIO()
+            result = reliability.report(review.InputLimitAbort(SECRET), env=env, stream=stream)
+            self.assertEqual("input_limit", result["failure"]["reason"])
+            self.assertEqual("failure_reason=input_limit\n", output.read_text())
+            self.assertIn("| Reason | input_limit |", summary.read_text())
+            self.assertNotIn(SECRET, stream.getvalue() + summary.read_text())
+            # An unwritable output file never changes how the run ends.
+            env["GITHUB_OUTPUT"] = directory
+            reliability.report(review.InputLimitAbort(SECRET), env=env, stream=io.StringIO())
+
     def test_a_model_providers_status_is_kept_apart_from_github_status(self):
         provider = type("APIStatusError", (Exception,), {})(SECRET)
         provider.status_code = 429

@@ -56,6 +56,11 @@ CATEGORIES = ("rate_limit_primary", "rate_limit_secondary", "rate_limit_unknown"
               "authentication", "forbidden", "not_found", "validation", "client_error",
               "server_error", "network", "review_abort", "interrupted", "unexpected")
 RATE_CATEGORIES = frozenset(c for c in CATEGORIES if c.startswith("rate_limit"))
+# Why a review stopped, when trusted code can say so. The host-only notifier maps each
+# code to fixed wording and ignores anything else, so a code is a choice among
+# sentences, never text. input_limit: the change does not fit the depth's configured
+# max_model_tokens allowance, so complete coverage is refused.
+REASONS = ("input_limit",)
 DECISIONS = ("wait", "exceeds_budget", "unbounded")
 EVENTS = ("issue_comment", "pull_request_review_comment")
 # Names PyGithub's retry and Requester see; anything else in a URL is dropped.
@@ -369,10 +374,29 @@ def _name(error):
     return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
 
 
+class Reasoned:
+    """Marks a trusted exception class whose `reason` is one of REASONS."""
+
+    reason = None
+
+
+def reason(error):
+    """The fixed reason this exact exception carries, else None.
+
+    Only a marked class counts, and only the exception itself: a look-alike name, an
+    instance attribute holding another value, or a refusal wrapped by another error
+    names nothing.
+    """
+    value = getattr(error, "reason", None) if isinstance(error, Reasoned) else None
+    return value if type(value) is str and value in REASONS else None
+
+
 def diagnostic(error, failed_phase=None):
     """The allowlisted description of one failure."""
     phase_name = failed_phase if failed_phase in PHASES else failing_phase(error) or OBSERVER.phase
     entry = {"phase": phase_name if phase_name in PHASES else "configuration"}
+    if reason(error):
+        entry["reason"] = reason(error)
     found = None
     # Only the model call runs in the inference phase, so a numeric status on anything
     # it raised belongs to the model provider (litellm wraps aiohttp errors that carry
@@ -440,6 +464,7 @@ def summary(result):
     rate = failure.get("rate_limit", {})
     rows = [("Result", result["result"])]
     for label, value in (("Phase", failure.get("phase")), ("Category", failure.get("category")),
+                         ("Reason", failure.get("reason")),
                          ("HTTP status", failure.get("status")),
                          ("Exception class", failure.get("exception")),
                          ("Rate-limit resource", rate.get("resource")),
@@ -490,6 +515,15 @@ def report(error=None, env=None, stream=None):
         try:
             with open(sink, "a", encoding="utf-8") as handle:
                 handle.write(summary(result) + "\n")
+        except OSError:
+            pass
+    code, outputs = result.get("failure", {}).get("reason"), env.get("GITHUB_OUTPUT")
+    if code in REASONS and outputs:
+        # One fixed word for the review job's failure_reason output; nothing else about
+        # the failure leaves the step.
+        try:
+            with open(outputs, "a", encoding="utf-8") as handle:
+                handle.write(f"failure_reason={code}\n")
         except OSError:
             pass
     if error is not None:

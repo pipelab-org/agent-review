@@ -85,6 +85,8 @@ jobs:
       learnings_identity: ${{ steps.plan.outputs.learnings_identity }}
       run_verification: ${{ steps.inference.outputs.run_verification }}
       learnings_revoke_failed: ${{ steps.learnings-revoke.outcome == 'failure' }}
+      # A fixed word the engine writes when it refuses an oversized change; the notifier maps it to text.
+      failure_reason: ${{ steps.plan.outputs.failure_reason || steps.inference.outputs.failure_reason }}
     steps:
     - name: Check out trusted base at workspace root
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -816,6 +818,7 @@ jobs:
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         ADMISSION_RESULT: ${{ needs.admit.result }}
         LEARNINGS_REVOKE_FAILED: ${{ needs.review.outputs.learnings_revoke_failed == 'true' || needs.reply.outputs.learnings_revoke_failed == 'true' }}
+        REVIEW_FAILURE_REASON: ${{ needs.review.outputs.failure_reason }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-notifier/outcome.json
       shell: bash
       run: |
@@ -828,6 +831,15 @@ jobs:
 
         # The operation in progress, from a fixed vocabulary, for the failure record.
         where = ["start"]
+
+        # Wording for the reason codes scripts/review_reliability.py can emit, as notice text
+        # and what to do next. The review job output only selects a row; it never supplies text.
+        REASONS = {"input_limit": (
+            "The requested diff review didn't complete because the change is larger than the configured review input limit "
+            "(max_model_tokens for this depth), and a partial review would leave coverage incomplete. "
+            "Treat this run as incomplete.",
+            " Shrink the change or have the configured limit changed before requesting another review; "
+            "repeating the command on this snapshot fails the same way.")}
 
 
         def record(error):
@@ -906,6 +918,8 @@ jobs:
             user = comment.get("user", {})
             issue = event.get("issue", {})
             revoke_failed = os.environ.get("LEARNINGS_REVOKE_FAILED") == "true"
+            # An exact match against the fixed table; any other value is ignored, never echoed.
+            reason = REASONS.get(os.environ.get("REVIEW_FAILURE_REASON", ""))
             command = (os.environ["GITHUB_EVENT_NAME"] == "issue_comment"
                     and os.environ["GITHUB_ACTOR"] == "luckyPipewrench"
                     and os.environ["GITHUB_ACTOR_ID"] == "142104046"
@@ -948,6 +962,7 @@ jobs:
                 return
             head, base = os.environ.get("REVIEW_HEAD", ""), os.environ.get("REVIEW_BASE", "")
             captured = bool(re.fullmatch(r"[0-9a-f]{40}", head) and re.fullmatch(r"[0-9a-f]{40}", base))
+            advice = None
             marker = f"<!-- agent-review-notice:v1 run={run_id} -->"
             if revoke_failed:
                 message = ("The requested review didn't complete because learnings-token revocation couldn't be confirmed. "
@@ -956,12 +971,16 @@ jobs:
                 message = "The requested diff review didn't complete because the commits changed."
             elif os.environ["ADMISSION_RESULT"] != "success" or not captured:
                 message = "The requested diff review never started. Treat this run as incomplete."
+            elif reason and not inline:
+                message, advice = reason
             else:
                 message = "The requested diff review didn't complete. Treat this run as incomplete."
             # An inline question is answered again by a new thread reply; review commands
             # are maintainer-only and start a whole-PR review instead.
             if inline:
                 message += " Inspect and fix the diagnosed cause before a new /ask in the review thread; Actions reruns are refused."
+            elif advice:
+                message += advice
             else:
                 message += " Inspect and fix the diagnosed cause before a fresh review command on the current snapshot; Actions reruns are refused."
             body = marker + "\n" + message

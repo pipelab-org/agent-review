@@ -292,6 +292,26 @@ class BundleTests(unittest.TestCase):
         # The same change fits the shipped Claude allowance.
         self.assertEqual(["app.py"], [f["path"] for f in e.build_bundle(self.root, head, self.base, e.policy("default"))["files"]])
 
+    def test_input_planning_refusals_carry_the_input_limit_reason(self):
+        from scripts import review_reliability as reliability
+        small = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
+        (self.root / "app.py").write_text("changed line of source\n" * 2_000)
+        head = self.commit()
+        with self.assertRaises(e.InputLimitAbort) as git_bound:
+            e.build_bundle(self.root, head, self.base, small)
+        (self.root / "app.py").write_text("changed line of source\n" * 700)
+        head = self.commit()
+        with self.assertRaises(e.InputLimitAbort) as planned:
+            e.build_bundle(self.root, head, self.base, small)
+        for refusal in (git_bound.exception, planned.exception):
+            self.assertIsInstance(refusal, e.ReviewAbort)
+            self.assertEqual("input_limit", reliability.reason(refusal))
+        # Other refusals under the same job say nothing about the input limit.
+        with self.assertRaises(e.ReviewAbort) as other:
+            e.build_bundle(self.root, "f" * 40, self.base, POLICY)
+        self.assertNotIsInstance(other.exception, e.InputLimitAbort)
+        self.assertIsNone(reliability.reason(other.exception))
+
 
 class ResultTests(unittest.TestCase):
     def test_invalid_finding_schema_is_rejected(self):
@@ -1203,7 +1223,7 @@ class AllowanceGuardTests(unittest.TestCase):
     def test_claude_prompt_over_the_depth_allowance_aborts_before_launch(self):
         schema = len(json.dumps(e.OUTPUT_SCHEMA))
         with patch.object(e.subprocess, "run", side_effect=AssertionError("provider launched")):
-            with self.assertRaisesRegex(e.ReviewAbort, "Complete prompt exceeds the review depth's max_model_tokens"):
+            with self.assertRaisesRegex(e.InputLimitAbort, "Complete prompt exceeds the review depth's max_model_tokens"):
                 e.run_claude(self.DEPTH, BUNDLE, "bundle", Path("/head"), prompt="x" * (self.LIMIT - schema + 1))
             with self.assertRaisesRegex(AssertionError, "provider launched"):
                 e.run_claude(self.DEPTH, BUNDLE, "bundle", Path("/head"), prompt="x" * (self.LIMIT - schema))
@@ -1216,7 +1236,7 @@ class AllowanceGuardTests(unittest.TestCase):
             home.mkdir()
             workspace.mkdir()
             with patch.object(e, "configure_codex"),                     patch.object(e, "codex_command", side_effect=AssertionError("provider launched")):
-                with self.assertRaisesRegex(e.ReviewAbort, "Codex prompt exceeds the review depth's max_model_tokens"):
+                with self.assertRaisesRegex(e.InputLimitAbort, "Codex prompt exceeds the review depth's max_model_tokens"):
                     e.run_codex(settings, {"files": []}, "callers", Path(tmp), "/action", home, workspace,
                                 prompt="x" * (self.LIMIT - schema + 1))
                 with self.assertRaisesRegex(AssertionError, "provider launched"):

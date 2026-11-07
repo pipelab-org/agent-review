@@ -1,6 +1,7 @@
 # Copyright 2026 Pipelock contributors
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the read/infer/write boundary with real validation and a fake GitHub API."""
+import contextlib
 import copy
 import io
 import json
@@ -573,6 +574,90 @@ class JobTests(unittest.TestCase):
             exec(compile(script, "<trusted-notifier>", "exec"), {})
         self.assertIn("Treat this run as incomplete", status.body)
         self.assertNotIn(str(status.id), hidden)
+
+    def failed_prepare(self, error=None):
+        """Run the prepare step as the review job does and return what it left for the job outputs."""
+        import io
+        output = self.root / "github-output"
+        output.unlink(missing_ok=True)
+        env = {"GITHUB_OUTPUT": str(output), "REVIEW_OUTCOME_PATH": str(self.root / "outcome" / "outcome.json")}
+        argv = ["review_jobs.py", "prepare", "--head", str(self.head_dir), "--output", str(self.plan)]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, env))
+            stack.enter_context(patch("sys.argv", argv))
+            errors = stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
+            if error:
+                stack.enter_context(patch.object(j, "prepare", side_effect=error))
+            self.assertEqual(1, j.main())
+        written = output.read_text() if output.exists() else ""
+        return written, errors.getvalue(), (self.root / "outcome" / "outcome.json").read_text()
+
+    def run_notifier(self, workflow, written):
+        """Resolve the review job's output expression for the prepare step, then run the shipped notifier."""
+        import io
+        outputs = dict(line.split("=", 1) for line in written.splitlines())
+        expression = workflow["jobs"]["review"]["outputs"]["failure_reason"]
+        # Only the two steps that run the engine may feed the job output, by their output file.
+        reads = re.findall(r"steps\.(\w+)\.outputs\.failure_reason", expression)
+        self.assertEqual("${{ " + " || ".join(f"steps.{step}.outputs.failure_reason" for step in reads) + " }}", expression)
+        runs = {step["id"]: step["run"] for step in workflow["jobs"]["review"]["steps"] if "id" in step and "run" in step}
+        self.assertEqual(["plan", "inference"], reads)
+        self.assertIn("review_jobs.py prepare", runs["plan"])
+        self.assertIn("review_jobs.py infer", runs["inference"])
+        # This run's output file belongs to the prepare step; the other step wrote nothing.
+        reason = next((value for value in (outputs.get("failure_reason", "") if step == "plan" else "" for step in reads) if value), "")
+        notifier = workflow["jobs"]["notify-failure"]["steps"][0]
+        self.assertEqual("${{ needs.review.outputs.failure_reason }}", notifier["env"]["REVIEW_FAILURE_REASON"])
+        script = notifier["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        bodies = []
+        def request(req):
+            if req.full_url.endswith("/pulls/1"):
+                value = {"state": "open", "head": {"sha": self.pr.head.sha, "repo": {"full_name": self.repo.full_name, "fork": False}},
+                         "base": {"sha": self.pr.base.sha, "repo": {"full_name": self.repo.full_name}}}
+            elif req.method == "GET":
+                value = []
+            else:
+                bodies.append(json.loads(req.data)["body"])
+                value = {"id": 7}
+            return io.BytesIO(json.dumps(value).encode())
+        with patch.dict(os.environ, {"GH_TOKEN": "fixture", "ADMISSION_RESULT": "success",
+                                     "REVIEW_FAILURE_REASON": reason}), \
+                patch("urllib.request.urlopen", side_effect=request):
+            exec(compile(script, "<trusted-notifier>", "exec"), {})
+        return bodies
+
+    def test_oversized_change_reaches_the_pr_notice_through_the_job_output_contract(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        # A real prepare: a 1,000-byte input allowance is below even the fixed prompt text (about 3.5 KB).
+        self.config.write_text(self.config.read_text().replace("max_model_tokens=90000", "max_model_tokens=17000"))
+        written, errors, outcome = self.failed_prepare()
+        self.assertEqual("failure_reason=input_limit\n", written)
+        self.assertIn("Review incomplete: Diff and changed regions exceed the review depth's max_model_tokens", errors)
+        self.assertEqual("input_limit", json.loads(outcome)["failure"]["reason"])
+        self.assertFalse(self.plan.exists(), "a refused bundle must not leave a plan to infer from")
+        bodies = self.run_notifier(workflow, written)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("larger than the configured review input limit", bodies[0])
+        self.assertNotIn("diagnosed cause", bodies[0])
+
+    def test_unrelated_and_secret_bearing_failures_publish_only_the_generic_notice(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        secret = "SENTINEL_secret_value"
+        # A limit refusal's text is fixed, but nothing about its message may travel with the code.
+        written, _, outcome = self.failed_prepare(e.InputLimitAbort(secret))
+        self.assertEqual("failure_reason=input_limit\n", written)
+        self.assertNotIn(secret, written + outcome)
+        self.assertNotIn(secret, self.run_notifier(workflow, written)[0])
+        for error in (e.ReviewAbort(secret), RuntimeError(secret), e.ReviewAbort("Changed binary file is outside source review coverage; declare an exclusion")):
+            with self.subTest(error=type(error).__name__):
+                written, _, outcome = self.failed_prepare(error)
+                self.assertEqual("", written)
+                self.assertNotIn(secret, outcome)
+                body = self.run_notifier(workflow, written)[0]
+                self.assertIn("didn't complete. Treat this run as incomplete.", body)
+                self.assertNotIn(secret, body)
 
 
     def prior_threads(self, grouped=False, outdated=True):

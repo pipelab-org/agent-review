@@ -20,8 +20,10 @@ from urllib.parse import unquote
 
 try:
     from . import review_learnings as learnings
+    from . import review_reliability as reliability
 except ImportError:
     import review_learnings as learnings
+    import review_reliability as reliability
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,6 +91,16 @@ OUTPUT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["
 
 class ReviewAbort(Exception):
     """Fixed, operator-safe failure message."""
+
+
+class InputLimitAbort(ReviewAbort, reliability.Reasoned):
+    """The input is larger than the depth's max_model_tokens allowance, so coverage would be incomplete.
+
+    Raised only where the engine sizes input before a pass launches. A request that
+    exceeds the allowance after a pass ran is a different failure and stays a ReviewAbort.
+    """
+
+    reason = "input_limit"
 
 
 def strict_json(raw):
@@ -162,7 +174,7 @@ def git(repo, *args, binary=False, limit=None):
             if len(raw) > limit:
                 process.kill()
                 process.wait()
-                raise ReviewAbort("Source or diff exceeds the review depth's max_model_tokens; review coverage is incomplete")
+                raise InputLimitAbort("Source or diff exceeds the review depth's max_model_tokens; review coverage is incomplete")
             code = process.wait()
     if code:
         raise ReviewAbort("Immutable Git source unavailable; check admitted refs and fetch depth")
@@ -279,7 +291,7 @@ def build_bundle(repo, head, base, settings, exclusions=(), start=None, instruct
         bundle["learnings"] = learnings.without_context(meta, "prompt allowance exceeded")
         fit()
     if size() > available:
-        raise ReviewAbort("Diff and changed regions exceed the review depth's max_model_tokens; review coverage is incomplete")
+        raise InputLimitAbort("Diff and changed regions exceed the review depth's max_model_tokens; review coverage is incomplete")
     return bundle
 
 
@@ -673,7 +685,7 @@ def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHE
                validate_output=validate_schema, output_key="findings", credentials=None):
     text = prompt or claude_prompt(bundle, strategy)
     if token_bound(text + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
-        raise ReviewAbort("Complete prompt exceeds the review depth's max_model_tokens")
+        raise InputLimitAbort("Complete prompt exceeds the review depth's max_model_tokens")
     credentials = credentials or ClaudeCredentials()
     deadline = time.monotonic() + settings["ai_timeout"]
     while True:
@@ -1099,7 +1111,7 @@ def _run_codex(settings, bundle, strategy, head, action, home, workspace, *, pro
     save(schema_path, schema)
     prompt = codex_prompt(bundle) if prompt is None else prompt
     if token_bound(prompt + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
-        raise ReviewAbort("Codex prompt exceeds the review depth's max_model_tokens")
+        raise InputLimitAbort("Codex prompt exceeds the review depth's max_model_tokens")
     output.with_suffix(".prompt").write_text(prompt)
     command = codex_command(settings, head, home, schema_path, output, action)
     earlier = frozenset(Path(home).glob("sessions/**/*.jsonl"))

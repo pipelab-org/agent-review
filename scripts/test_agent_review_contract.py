@@ -500,6 +500,48 @@ class ReporterTests(unittest.TestCase):
         self.execute()
         self.assertEqual([], self.calls)
 
+    def test_input_limit_reason_gets_fixed_text_and_loses_to_the_earlier_branches(self):
+        env = WORKFLOW['jobs']['notify-failure']['steps'][0]['env']
+        self.assertEqual("${{ needs.review.outputs.failure_reason }}", env['REVIEW_FAILURE_REASON'])
+        self.env['REVIEW_FAILURE_REASON'] = 'input_limit'
+        self.execute()
+        body = self.calls[-1][2]['body']
+        self.assertIn('larger than the configured review input limit', body)
+        self.assertIn('fails the same way', body)
+        self.assertIn('/actions/runs/123', body)
+        # An unchanged retry is not offered as the remedy.
+        self.assertNotIn('diagnosed cause', body)
+        self.assertNotIn('fresh review command', body)
+        for overrides, expected in ((dict(LEARNINGS_REVOKE_FAILED='true'), "revocation couldn't be confirmed"),
+                                    (dict(REVIEW_HEAD='c' * 40), 'commits changed'),
+                                    (dict(ADMISSION_RESULT='failure'), 'never started')):
+            with self.subTest(expected=expected):
+                previous = {key: self.env[key] for key in overrides}
+                self.env.update(overrides)
+                self.execute()
+                self.assertIn(expected, self.calls[-1][2]['body'])
+                self.assertNotIn('input limit', self.calls[-1][2]['body'])
+                self.env.update(previous)
+
+    def test_unknown_or_forged_reasons_keep_the_generic_notice_and_are_never_echoed(self):
+        sentinel = 'SENTINEL_private_value'
+        for value in ('', 'INPUT_LIMIT', 'input_limit ', ' input_limit', 'input_limit\n::error::forged',
+                      'input_limit,input_limit', 'input-limit', 'unknown', sentinel, 'x' * 5000,
+                      '<!-- agent-review-notice:v1 run=1 -->', 'true'):
+            with self.subTest(value=value[:20]):
+                self.env['REVIEW_FAILURE_REASON'] = value
+                self.execute()
+                body = self.calls[-1][2]['body']
+                self.assertIn("didn't complete. Treat this run as incomplete.", body)
+                self.assertIn('Inspect and fix the diagnosed cause before a fresh review command', body)
+                self.assertNotIn('input limit', body)
+                for echoed in (value.strip(), sentinel):
+                    if echoed:
+                        self.assertNotIn(echoed, body)
+        del self.env['REVIEW_FAILURE_REASON']
+        self.execute()
+        self.assertIn("didn't complete. Treat this run as incomplete.", self.calls[-1][2]['body'])
+
     def test_admission_and_stale_snapshot_have_fixed_messages(self):
         self.env.update(REVIEW_HEAD='', REVIEW_BASE='', ADMISSION_RESULT='failure')
         self.execute()
