@@ -69,7 +69,10 @@ jobs:
       group: agent-review-${{ github.repository }}-${{ github.event.issue.number }}
       cancel-in-progress: false
       queue: max
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04's Rust test/sudo implementations break the pinned action's
+    # ACL verification and environment preservation. Keep its safeguards intact.
+    # https://github.com/openai/codex-action/issues/188
+    runs-on: ubuntu-24.04
     timeout-minutes: 65
     permissions:
       actions: read
@@ -77,6 +80,7 @@ jobs:
       pull-requests: read
     outputs:
       learnings_identity: ${{ steps.plan.outputs.learnings_identity }}
+      run_verification: ${{ steps.inference.outputs.run_verification }}
       learnings_revoke_failed: ${{ steps.learnings-revoke.outcome == 'failure' }}
     steps:
     - name: Check out trusted base at workspace root
@@ -291,6 +295,7 @@ jobs:
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     - name: Review the admitted diff
+      id: inference
       env:
         REVIEW_LEARNINGS_IDENTITY: ${{ steps.plan.outputs.learnings_identity }}
         GITHUB_REPOSITORY: ${{ github.repository }}
@@ -305,6 +310,7 @@ jobs:
         # A Codex pass can run read-only shell commands and read process environments.
         # It authenticates through the action's proxy, so it never receives this key.
         ANTHROPIC_API_KEY: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY || '' }}
+        ANTHROPIC_API_KEY_2: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY_2 || '' }}
       run: python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -345,6 +351,109 @@ jobs:
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     env:
       REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || github.event.comment.body == '/review codex' && 'codex' || github.event.comment.body == '/review deep' && 'deep' || 'default' }}
+  codex-verification:
+    name: Verify outdated threads in a fresh Codex job
+    needs:
+    - source
+    - admit
+    - review
+    if: needs.review.result == 'success' && needs.review.outputs.run_verification == 'true'
+    # drop-sudo is irreversible for a job; each inference needs a fresh runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    env:
+      REVIEW_LEARNINGS_IDENTITY: ${{ needs.review.outputs.learnings_identity }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      REVIEW_SOURCE_SHA: ${{ needs.source.outputs.reviewer_sha }}
+      REVIEW_PROFILE_SHA: ${{ github.workflow_sha }}
+      REVIEW_PROFILE_PATH: trusted-agent-profile/.github/agent-review.toml
+      REVIEW_DEPTH: ${{ github.event.comment.body == '/review codex deep' && 'codex-deep' || 'codex' }}
+      REVIEW_HEAD: ${{ needs.admit.outputs.head }}
+      REVIEW_BASE: ${{ needs.admit.outputs.base }}
+      CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+    steps:
+    - name: Check out trusted base at workspace root
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: ${{ github.repository }}
+        ref: ${{ github.workflow_sha }}
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Check out immutable agent-review source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: pipelab-org/agent-review
+        ref: ${{ needs.source.outputs.reviewer_sha }}
+        path: trusted-agent-review
+        persist-credentials: 'false'
+    - name: Check out caller policy as data from its loaded default-branch revision
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: ${{ github.repository }}
+        ref: ${{ github.workflow_sha }}
+        path: trusted-agent-profile
+        persist-credentials: 'false'
+        sparse-checkout: |
+          .github/agent-review.toml
+          .github/workflows/agent-review.yaml
+        sparse-checkout-cone-mode: 'false'
+    - name: Validate the trusted caller and restricted profile before inference
+      run: python trusted-agent-review/scripts/agent_review_contract.py --root trusted-agent-profile --source-sha "$REVIEW_SOURCE_SHA"
+    - name: Set up the Python version the pinned dependencies were hashed for
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Install pinned engine dependencies
+      run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
+    - name: Check out immutable head as read-only data
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: ${{ github.repository }}
+        ref: ${{ needs.admit.outputs.head }}
+        path: pr-head
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Check out pinned Codex action runner
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: openai/codex-action
+        ref: c05cfd74ad95c626cdf05c6685e62becc3bf7813
+        path: trusted-codex-action
+        persist-credentials: false
+    - name: Prepare trusted Codex home
+      run: |-
+        mkdir -p "$RUNNER_TEMP/agent-review-codex-home"
+        cp trusted-agent-review/.github/codex-config.toml "$RUNNER_TEMP/agent-review-codex-home/config.toml"
+    - name: Set up pinned read-only Codex runtime
+      uses: openai/codex-action@c05cfd74ad95c626cdf05c6685e62becc3bf7813
+      with:
+        openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+        permission-profile: :read-only
+        codex-version: 0.165.0
+        codex-home: ${{ runner.temp }}/agent-review-codex-home
+        output-schema-file: trusted-agent-review/.github/review-output.schema.json
+        # Setup-only must keep sudo. The engine's run-codex-exec drop-sudo removes it
+        # at launch and starts Codex under setpriv with no_new_privs and no capabilities;
+        # a setup-time drop makes that launch refuse to start.
+        safety-strategy: read-only
+    - name: Download this run's inference artifact
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        name: agent-review-findings
+        path: ${{ runner.temp }}/agent-review
+    - name: Verify recorded threads against the admitted head
+      run: python trusted-agent-review/scripts/review_jobs.py verify --head pr-head --input "$RUNNER_TEMP/agent-review/findings.json" --output "$RUNNER_TEMP/agent-review-verification/verification.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
+    - name: Preserve bound thread verification
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: agent-review-verification
+        path: ${{ runner.temp }}/agent-review-verification/verification.json
+        if-no-files-found: error
   reply:
     name: Answer an inline review question
     needs: source
@@ -353,7 +462,7 @@ jobs:
       group: agent-review-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: false
       queue: max
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
       actions: read
@@ -640,6 +749,7 @@ jobs:
         REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        ANTHROPIC_API_KEY_2: ${{ secrets.ANTHROPIC_API_KEY_2 }}
       run: python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -851,9 +961,9 @@ jobs:
             # An inline question is answered again by a new thread reply; review commands
             # are maintainer-only and start a whole-PR review instead.
             if inline:
-                message += " Reply /ask in the review thread to retry; Actions reruns are refused."
+                message += " Inspect and fix the diagnosed cause before a new /ask in the review thread; Actions reruns are refused."
             else:
-                message += " Post a fresh review command on the current snapshot; Actions reruns are refused."
+                message += " Inspect and fix the diagnosed cause before a fresh review command on the current snapshot; Actions reruns are refused."
             body = marker + "\n" + message
             if captured:
                 body += f"\n\nCaptured base `{base}` and head `{head}`."
@@ -898,7 +1008,8 @@ jobs:
     - source
     - admit
     - review
-    if: needs.review.result == 'success'
+    - codex-verification
+    if: always() && needs.review.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -960,6 +1071,13 @@ jobs:
       with:
         name: agent-review-findings
         path: ${{ runner.temp }}/agent-review
+    - name: Download optional thread verification
+      if: needs.codex-verification.result == 'success'
+      continue-on-error: true
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        name: agent-review-verification
+        path: ${{ runner.temp }}/agent-review-verification
     - name: Validate and publish immutable findings
       env:
         REVIEW_LEARNINGS_IDENTITY: ${{ needs.review.outputs.learnings_identity }}
@@ -974,7 +1092,7 @@ jobs:
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
         REVIEW_COMPLETION_PATH: ${{ runner.temp }}/agent-review-completion/completion.json
-      run: python trusted-agent-review/scripts/review_jobs.py publish --input "$RUNNER_TEMP/agent-review/findings.json" --head pr-head
+      run: python trusted-agent-review/scripts/review_jobs.py publish --input "$RUNNER_TEMP/agent-review/findings.json" --head pr-head --verification "$RUNNER_TEMP/agent-review-verification/verification.json"
     - name: Preserve immutable completion proof
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:

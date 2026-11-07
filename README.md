@@ -40,12 +40,14 @@ The USD allowance applies **per pass**. A review's configured allowance is its r
 1. Install [.github/workflows/agent-review.yaml](.github/workflows/agent-review.yaml), using the exact maintained caller template. External callers must pin the reusable workflow to a full merged commit SHA with the `# main` tracking comment. [The example caller](examples/pipelock/agent-review.yaml) provides that form.
 2. Add `.github/agent-review.toml` with only `[review] instructions` and `[ignore] glob`. Profiles cannot change models, tools, budgets, admission, credentials, or publication.
 3. Configure the centrally approved per-depth limits before adopting the engine.
-4. Map `ANTHROPIC_API_KEY` for Claude and/or `OPENAI_API_KEY` for Codex as named secrets. The existing second Anthropic secret mapping remains accepted for caller compatibility, but the engine never silently retries or changes provider. Optional `ORG_MEMBERS_TOKEN` supplies Members:read for private organization membership checks on replies.
+4. Map `ANTHROPIC_API_KEY` for Claude and/or `OPENAI_API_KEY` for Codex as named secrets. Optional `ANTHROPIC_API_KEY_2` permits one fallback after an initial HTTP 400 billing refusal with a complete zero-token, zero-cost CLI receipt and no successful model response. Later passes retain the selected key. Other failures stop without switching accounts or providers. Optional `ORG_MEMBERS_TOKEN` supplies Members:read for private organization membership checks on replies.
 5. Merge the caller and profile to the default branch, then post a command.
 
 Only the designated maintainer's original, unedited command is admitted. Fork and closed PRs are explicitly refused before provider work. Reruns, bots, edited events, and unsupported command arguments are ineligible. Models and repository text have no authority over publication.
 
 ## Development
+
+To diagnose configured provider credentials without choosing a pull request, manually run **Provider connectivity check** from Actions on `main`. It makes a small live request through each selected provider's normal restricted runner and can incur API charges under the existing central limits. Anthropic uses the same bounded billing fallback as reviews. The check prints fixed success or failure diagnostics, never keys or provider response text. It checks access, not the remaining credit balance or review quality. It does not run automatically or retry failed workflows.
 
 CI uses Python 3.12 on Linux x86_64 with hash-pinned dependencies:
 

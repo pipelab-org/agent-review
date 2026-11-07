@@ -29,6 +29,30 @@ jobs:
         claude --version
 
         python scripts/test_provider_dry_run.py --claude "$(command -v claude)"'
+  native-codex:
+    # The pinned launcher depends on GNU test ACL checks and sudo -E.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: openai/codex-action
+        ref: c05cfd74ad95c626cdf05c6685e62becc3bf7813
+        path: trusted-codex-action
+        persist-credentials: false
+    - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+      with:
+        node-version: '24'
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Native Codex launcher with fixture executable and no provider credentials
+      run: python scripts/test_provider_dry_run.py --codex-action trusted-codex-action
 'on':
   pull_request:
     branches:

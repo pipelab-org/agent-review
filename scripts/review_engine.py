@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import tomllib
 from urllib.parse import unquote
 
@@ -479,6 +480,74 @@ def lenient_events(stdout):
     return events
 
 
+def initial_billing_refusal(events):
+    """Require the pinned CLI's complete, zero-work HTTP 400 billing refusal.
+
+    Source: SDK assistant/result fields documented above, exercised against
+    Claude Code 2.1.312 by test_provider_dry_run.py. Missing evidence never
+    authorizes another credential or another model request.
+    """
+    if not events or any(not isinstance(event, dict) for event in events):
+        return False
+    if any(event.get("type") not in ("system", "assistant", "result") for event in events):
+        return False
+    if any(event.get("type") == "system" and event.get("subtype") != "init" for event in events):
+        return False
+    assistants = [event for event in events if event.get("type") == "assistant"]
+    results = [event for event in events if event.get("type") == "result"]
+    if len(assistants) != 1 or len(results) != 1 or events[-1] != results[0]:
+        return False
+    assistant, final = assistants[0], results[0]
+    content = event_message(assistant).get("content")
+    if (assistant.get("error") != "billing_error" or assistant.get("is_api_error_message") is not True
+            or type(assistant.get("api_error_status")) is not int or assistant["api_error_status"] != 400
+            or not isinstance(content, list) or not content
+            or any(not isinstance(block, dict) or block.get("type") != "text" for block in content)
+            or final.get("is_error") is not True or final.get("terminal_reason") != "api_error"
+            or type(final.get("api_error_status")) is not int or final["api_error_status"] != 400
+            or type(final.get("num_turns")) is not int
+            or final["num_turns"] != 1 or final.get("modelUsage") != {}
+            or not finite_number(final.get("total_cost_usd")) or final["total_cost_usd"] != 0):
+        return False
+    counters = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    for usage in (event_message(assistant).get("usage"), final.get("usage")):
+        if not isinstance(usage, dict) or any(type(usage.get(key)) is not int or usage[key] != 0 for key in counters):
+            return False
+    return True
+
+
+class ClaudeCredentials:
+    """One credential choice for all passes in a job; never serialized or given to tools."""
+
+    def __init__(self):
+        self.primary = os.environ.get("ANTHROPIC_API_KEY", "")
+        self.secondary = os.environ.get("ANTHROPIC_API_KEY_2", "")
+        self.using_secondary = not self.primary and bool(self.secondary)
+        self.started = False
+
+    def environment(self, settings):
+        env = clean_env(settings)
+        key = self.secondary if self.using_secondary else self.primary
+        if key:
+            env["ANTHROPIC_API_KEY"] = key
+        else:
+            env.pop("ANTHROPIC_API_KEY", None)
+        return env
+
+    def fallback(self, stdout):
+        if self.started or self.using_secondary or not self.secondary or self.secondary == self.primary:
+            return False
+        try:
+            events = [strict_json(line) for line in stdout.splitlines() if line.strip()]
+        except (ReviewAbort, ValueError, RecursionError):
+            return False
+        if not initial_billing_refusal(events):
+            return False
+        self.using_secondary = True
+        print("Anthropic primary credential refused billing before model output; trying secondary once")
+        return True
+
+
 def claude_result(events, settings, bundle, strategy, head, *, validate_output=validate_schema,
                   output_key="findings"):
     results = [e for e in events if e.get("type") == "result"]
@@ -598,16 +667,26 @@ def codex_prompt(bundle):
 
 
 def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHEMA, *,
-               validate_output=validate_schema, output_key="findings"):
+               validate_output=validate_schema, output_key="findings", credentials=None):
     text = prompt or claude_prompt(bundle, strategy)
     if token_bound(text + json.dumps(schema)) > settings["max_model_tokens"] - settings["max_output_tokens"]:
         raise ReviewAbort("Complete prompt exceeds the review depth's max_model_tokens")
-    try:
-        result = subprocess.run(claude_args(settings, schema), input=text,
-                                cwd=head, env=clean_env(settings), capture_output=True, text=True,
-                                timeout=settings["ai_timeout"], check=False)
-    except subprocess.TimeoutExpired:
-        raise ReviewAbort("Provider timed out at config.ai_timeout; no paid retry") from None
+    credentials = credentials or ClaudeCredentials()
+    deadline = time.monotonic() + settings["ai_timeout"]
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewAbort("Provider timed out at config.ai_timeout; no paid retry")
+        try:
+            result = subprocess.run(claude_args(settings, schema), input=text,
+                                    cwd=head, env=credentials.environment(settings), capture_output=True, text=True,
+                                    timeout=remaining, check=False)
+        except subprocess.TimeoutExpired:
+            raise ReviewAbort("Provider timed out at config.ai_timeout; no paid retry") from None
+        if result.returncode and credentials.fallback(result.stdout):
+            continue
+        break
+    credentials.started = True
     if result.returncode:
         raise ReviewAbort(claude_failure_cause(lenient_events(result.stdout))
                           or "Claude API/turn/budget/output failure; inspect approved limits and provider account")
@@ -805,6 +884,26 @@ def codex_failure_cause(home, ignore=frozenset()):
             cause = codex_error_cause(error)
             if cause:
                 return cause
+    return None
+
+
+def codex_launcher_cause(output):
+    """Fixed diagnostics from the pinned action, never its paths or model text.
+
+    Source: openai/codex-action@c05cfd74ad95c626cdf05c6685e62becc3bf7813
+    src/dropSudo.ts and src/runCodexExec.ts. These messages are advisory;
+    only the existing receipts and validators establish a completed review.
+    """
+    if (b"Error: Could not restrict access to " in output
+            or b"Error: Could not verify access to a privileged service socket." in output):
+        return ("Codex launcher could not revoke privileged socket access; use the workflow's Ubuntu 24.04 "
+                "inference runner (codex_action_error=privilege_removal); no paid retry")
+    if b"Error: Linux drop-sudo requires passwordless sudo before Codex starts." in output:
+        return ("Codex launcher requires a fresh job before removing sudo; it cannot remove sudo twice "
+                "(codex_action_error=sudo_unavailable); no paid retry")
+    if b"Error: Linux drop-sudo requires /usr/bin/setfacl (the acl package)." in output:
+        return ("Codex launcher requires the acl package on the inference runner "
+                "(codex_action_error=missing_acl); no paid retry")
     return None
 
 
@@ -1007,10 +1106,11 @@ def _run_codex(settings, bundle, strategy, head, action, home, workspace, *, pro
     env.pop("ANTHROPIC_API_KEY", None)
     env["CODEX_HOME"] = str(home)
     proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+                            stderr=subprocess.STDOUT, start_new_session=True)
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ)
     deadline = time.monotonic() + settings["ai_timeout"]
+    diagnostic = b""
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
@@ -1020,6 +1120,8 @@ def _run_codex(settings, bundle, strategy, head, action, home, workspace, *, pro
                 raise ReviewAbort("Codex exceeded config.ai_timeout; no paid retry")
             # Drain without interpreting or logging model text or workflow commands.
             chunk = os.read(proc.stdout.fileno(), 65536)  # existing MAX_DATA_BYTES I/O buffer
+            # Reuse the existing 64 KiB I/O bound; raw output is never logged or retained.
+            diagnostic = (diagnostic + chunk)[-65536:]
             turns, _, _, cost = codex_progress(home, head, model=settings["model"], request_limit=limit, ignore=earlier)
             if turns > settings["max_turns"]:
                 raise ReviewAbort("Codex reached the review_depth max_turns; pass incomplete")
@@ -1029,6 +1131,7 @@ def _run_codex(settings, bundle, strategy, head, action, home, workspace, *, pro
                 selector.unregister(proc.stdout)
         if proc.wait(timeout=max(deadline - time.monotonic(), 0)) != 0:
             raise ReviewAbort(codex_failure_cause(home, earlier)
+                              or codex_launcher_cause(diagnostic)
                               or "Codex action failed; inspect provider account, read-only sandbox and schema")
     except BaseException:
         if proc.poll() is None:

@@ -1,0 +1,114 @@
+name: Provider connectivity check
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Check configured credentials with a small live model request
+        type: choice
+        options: [all, claude, codex]
+        default: all
+
+permissions: {}
+
+jobs:
+  claude:
+    if: >-
+      github.ref == 'refs/heads/main' && github.run_attempt == '1' &&
+      github.actor == 'luckyPipewrench' && github.actor_id == '142104046' &&
+      (inputs.provider == 'all' || inputs.provider == 'claude')
+    runs-on: ubuntu-24.04
+    # Reuse the one-call inference job's setup and timeout allowance.
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.workflow_sha }}
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Install the same pinned client as review jobs
+      run: |
+        npm install --global @anthropic-ai/claude-code@2.1.312
+        claude --version
+    - name: Check the configured Anthropic route, including bounded billing fallback
+      env:
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        ANTHROPIC_API_KEY_2: ${{ secrets.ANTHROPIC_API_KEY_2 }}
+      run: |
+        python - <<'PY'
+        import tempfile
+        from pathlib import Path
+        from scripts import review_engine as engine
+
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                result = engine.run_claude(engine.policy('default'), {'files': []}, 'connectivity', Path(work),
+                    prompt='This is a connectivity check. Return an empty findings array using the output schema. Do not read files or run commands.')
+            if result['findings']:
+                raise engine.ReviewAbort('Connectivity check returned unexpected findings')
+        except engine.ReviewAbort as error:
+            raise SystemExit(f'Anthropic connectivity incomplete: {error}') from None
+        except Exception:
+            raise SystemExit('Anthropic connectivity failed before a classified result; inspect setup steps') from None
+        print('Anthropic connectivity passed; this does not measure remaining credits or review quality')
+        PY
+  codex:
+    if: >-
+      github.ref == 'refs/heads/main' && github.run_attempt == '1' &&
+      github.actor == 'luckyPipewrench' && github.actor_id == '142104046' &&
+      (inputs.provider == 'all' || inputs.provider == 'codex')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.workflow_sha }}
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: openai/codex-action
+        ref: c05cfd74ad95c626cdf05c6685e62becc3bf7813
+        path: trusted-codex-action
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Prepare trusted Codex home
+      run: |
+        mkdir -p "$RUNNER_TEMP/provider-health-home"
+        cp .github/codex-config.toml "$RUNNER_TEMP/provider-health-home/config.toml"
+    - uses: openai/codex-action@c05cfd74ad95c626cdf05c6685e62becc3bf7813
+      with:
+        openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+        permission-profile: :read-only
+        codex-version: 0.165.0
+        codex-home: ${{ runner.temp }}/provider-health-home
+        output-schema-file: .github/review-output.schema.json
+        safety-strategy: read-only
+    - name: Check the configured OpenAI route under normal review restrictions
+      run: |
+        python - <<'PY'
+        import os
+        import tempfile
+        from pathlib import Path
+        from scripts import review_engine as engine
+
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                result = engine.run_codex(engine.policy('codex'), {'files': []}, 'connectivity', Path(work),
+                    Path('trusted-codex-action'), Path(os.environ['RUNNER_TEMP']) / 'provider-health-home',
+                    Path(work) / 'output', prompt='This is a connectivity check. Return an empty findings array using the output schema. Do not read files or run commands.')
+            if result['findings']:
+                raise engine.ReviewAbort('Connectivity check returned unexpected findings')
+        except engine.ReviewAbort as error:
+            raise SystemExit(f'OpenAI connectivity incomplete: {error}') from None
+        except Exception:
+            raise SystemExit('OpenAI connectivity failed before a classified result; inspect setup steps') from None
+        print('OpenAI connectivity passed; this does not measure remaining credits or review quality')
+        PY
