@@ -299,12 +299,12 @@ def native_proof(user, codex):
         import native_codex_fixture as native
     from types import SimpleNamespace
 
-    native.require_version(codex)
     settings = native.engine.policy("codex-deep")
     identity = sessions.resolve_identity(user)
     node = shutil.which("node")
     check(node is not None, "the trusted Node runtime is available")
-    path = ":".join(dict.fromkeys([str(codex.parent), str(Path(node).parent), "/usr/bin", "/bin"]))
+    path = native.runtime_path(codex)
+    native.require_version(codex, path)
     launcher = sessions.CodexSessions(identity, codex=str(codex), trusted_path=path)
     launcher.verify()
     with tempfile.TemporaryDirectory(prefix="native-proof-", dir=ROOT) as directory:

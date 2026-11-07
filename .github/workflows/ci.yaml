@@ -99,9 +99,11 @@ jobs:
     - name: Launcher identity, isolation and cleanup proof
       run: python scripts/hosted_codex_sandbox_proof.py identity --user "$REVIEW_PROOF_USER" --head "$GITHUB_WORKSPACE"
     - name: Install the pinned native CLI
-      run: npm install --global @openai/codex@0.165.0
+      run: |
+        npm install --global @openai/codex@0.165.0
+        "$(npm prefix --global)/bin/codex" --version
     - name: Real native Codex sessions with offline Responses and no provider credentials
-      run: python scripts/hosted_codex_sandbox_proof.py native --user "$REVIEW_PROOF_USER" --codex "$(command -v codex)"
+      run: python scripts/hosted_codex_sandbox_proof.py native --user "$REVIEW_PROOF_USER" --codex "$(npm prefix --global)/bin/codex"
 'on':
   pull_request:
     branches:

@@ -44,10 +44,18 @@ class FixtureFailure(Exception):
     """Only fixed diagnostic strings leave this fixture."""
 
 
-def require_version(codex):
+def runtime_path(codex):
+    """Keep only the selected CLI, its Node runtime and the system tools on PATH."""
+    node = shutil.which("node")
+    return ":".join(dict.fromkeys([str(codex.parent),
+        *([str(Path(node).parent)] if node else []), "/usr/bin", "/bin"]))
+
+
+def require_version(codex, path=None):
     # Even --version receives no account environment or persisted home.
     with tempfile.TemporaryDirectory(prefix="native-version-") as directory:
-        env = {"HOME": directory, "CODEX_HOME": directory, "PATH": "/usr/bin:/bin"}
+        env = {"HOME": directory, "CODEX_HOME": directory,
+               "PATH": runtime_path(codex) if path is None else path}
         result = subprocess.run([str(codex), "--version"], env=env, cwd=directory,
                                 capture_output=True, text=True, timeout=10, check=False)
     if result.returncode or result.stdout.strip() != PINNED_VERSION:
@@ -357,7 +365,8 @@ class NativeCodexFixture:
 
 def local_proof(codex):
     """Current-UID evidence only. No account, privilege or host configuration changes."""
-    require_version(codex)
+    path = runtime_path(codex)
+    require_version(codex, path)
     settings = engine.policy("codex-deep")
     with tempfile.TemporaryDirectory(prefix="native-codex-fixture-") as directory:
         root = Path(directory)
@@ -378,7 +387,7 @@ def local_proof(codex):
                     schema.write_text(json.dumps(engine.OUTPUT_SCHEMA))
                     prompt = fixture.begin_session(head=head, home=home, codex_home=chome, tmp=tmp,
                         sentinel_file=sentinel, previous_parent=previous, require_parent_denial=False)
-                    env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "CODEX_HOME": str(chome), "TMPDIR": str(tmp)}
+                    env = {"PATH": path, "HOME": str(home), "CODEX_HOME": str(chome), "TMPDIR": str(tmp)}
                     command = [str(codex), "exec", "--skip-git-repo-check", "--cd", str(head),
                         "--output-schema", str(schema), "--output-last-message", str(output),
                         "--model", settings["model"], "--config", 'default_permissions=":read-only"', "--json", "-"]

@@ -257,6 +257,24 @@ class RepositoryPlanTests(unittest.TestCase):
         public.pop("learnings_text")
         self.assertEqual(public, e.build_bundle(self.root, head, self.base, small, learning_metadata=rich["learnings"]))
 
+    def test_single_section_fallback_replans_when_its_path_guidance_overflows(self):
+        """The patches fit one compact section, but its full path guidance does not."""
+        for index in range(80):
+            (self.root / (f"{index:03d}-" + "a" * 120 + ".py")).write_text("value = 1\n")
+        head = self.head()
+        # Fixture-only geometry: the unchanged renderer produces a 71,165-byte
+        # single prompt against this 65,000-byte input allowance.
+        small = dict(POLICY, max_model_tokens=81_000, max_output_tokens=16_000)
+        bundle = e.build_bundle(self.root, head, self.base, small)
+        self.assertGreater(len(bundle["sections"]), 1)
+        self.check_exact(bundle)
+        for section in range(len(bundle["sections"])):
+            for provider, strategy in e.PROMPT_KINDS:
+                size = e.token_bound(e.section_prompt(bundle, provider, strategy, section)
+                                     + json.dumps(e.SECTION_SCHEMA))
+                self.assertLessEqual(size, 65_000)
+        self.assertEqual(bundle, e.build_bundle(self.root, head, self.base, small))
+
     def test_excluded_paths_stay_complete_without_filling_the_prompt(self):
         (self.root / "keep.txt").write_text("changed\n")
         ignored = self.root / "ignored"

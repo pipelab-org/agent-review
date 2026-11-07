@@ -113,6 +113,21 @@ class NativeFixtureTests(unittest.TestCase):
         self.assertEqual(env["HOME"], env["CODEX_HOME"])
         self.assertNotEqual(env["HOME"], str(Path.home()))
 
+    def test_npm_launcher_can_find_node_outside_system_path(self):
+        """Execute an env-based launcher; a real system Node cannot run this fixture."""
+        runtime = self.root / "node-runtime"
+        runtime.mkdir()
+        node = runtime / "node"
+        node.write_text("#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.165.0'\n")
+        node.chmod(0o700)
+        codex = self.root / "codex"
+        codex.write_text("#!/usr/bin/env node\nThis fixture requires its selected runtime.\n")
+        codex.chmod(0o700)
+        with patch.object(fixture.shutil, "which", return_value=str(node)):
+            self.assertEqual(fixture.require_version(codex), fixture.PINNED_VERSION)
+            self.assertEqual(fixture.runtime_path(codex),
+                             f"{self.root}:{runtime}:/usr/bin:/bin")
+
     def test_canary_positive_control_is_connectable_without_native_sandbox(self):
         # The sandbox denial test must not pass merely because no service is listening.
         with socket.create_connection(("127.0.0.1", self.api.api.server_port), timeout=2):

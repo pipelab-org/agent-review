@@ -335,8 +335,21 @@ def plan_layout(repo, files, fields, instructions, settings, store, reserved):
                    for provider, strategy in PROMPT_KINDS) + schema + reserved)
     if framing >= available or closing >= available:
         raise InputLimitAbort("Diff and changed regions exceed the review depth's max_model_tokens; review coverage is incomplete")
-    planned = sections.plan_sections(files, available - framing)
-    return {"files": [content_entry(file, "none" if file["deleted"] else "regions") for file in files],
+    capacity = available - framing
+    planned = sections.plan_sections(files, capacity)
+    entries = [content_entry(file, "none" if file["deleted"] else "regions") for file in files]
+    if len(planned) == 1:
+        probe = frame_bundle(fields, instructions, entries)
+        probe["sections"] = [sections.section_entry(0, planned[0])]
+        blocks = token_bound(sections.render_section(probe, store, 0))
+        whole = (framing_cost(probe, lambda provider, strategy: region_guidance(probe, how_to_read(provider)))
+                 + blocks + schema + reserved)
+        if whole > available:
+            # One section uses full path guidance. Force a second section by
+            # packing below the exact current block size, retaining the compact
+            # section-note allowance instead of reserving that unbounded list.
+            planned = sections.plan_sections(files, min(capacity, blocks - 1))
+    return {"files": entries,
             "sections": [sections.section_entry(i, segments) for i, segments in enumerate(planned)]}
 
 
