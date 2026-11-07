@@ -500,6 +500,61 @@ class ClaudeTests(unittest.TestCase):
             self.assertEqual(1, run.call_count)
             self.assertEqual("fixture-secondary", run.call_args.kwargs["env"]["ANTHROPIC_API_KEY"])
 
+    def test_each_zero_work_billing_field_is_required_for_fallback(self):
+        self.assertTrue(e.initial_billing_refusal(self.billing_refusal()))
+        text_block = {"type": "text", "text": "x"}
+        mutations = {
+            "assistant error": lambda v: v[0].update(error="server_error"),
+            "assistant api flag": lambda v: v[0].update(is_api_error_message=False),
+            "assistant status": lambda v: v[0].update(api_error_status=401),
+            "assistant status bool": lambda v: v[0].update(api_error_status=True),
+            "assistant content empty": lambda v: v[0]["message"].update(content=[]),
+            "assistant content tool use": lambda v: v[0]["message"].update(
+                content=[{"type": "tool_use", "id": "t", "name": "Read", "input": {}}]),
+            "assistant mixed content": lambda v: v[0]["message"].update(
+                content=[text_block, {"type": "tool_use", "id": "t", "name": "Read", "input": {}}]),
+            "assistant output tokens": lambda v: v[0]["message"]["usage"].update(output_tokens=1),
+            "result is_error": lambda v: v[1].update(is_error=False),
+            "result terminal reason": lambda v: v[1].update(terminal_reason="completed"),
+            "result status": lambda v: v[1].update(api_error_status=500),
+            "result turns": lambda v: v[1].update(num_turns=2),
+            "result model usage": lambda v: v[1].update(modelUsage={"claude-sonnet-5-5": {}}),
+            "result cost": lambda v: v[1].update(total_cost_usd=0.01),
+            "result cost not finite": lambda v: v[1].update(total_cost_usd=float("nan")),
+            "result cache read": lambda v: v[1]["usage"].update(cache_read_input_tokens=1),
+            "result cache write": lambda v: v[1]["usage"].update(cache_creation_input_tokens=1),
+            "result usage bool": lambda v: v[1]["usage"].update(input_tokens=False),
+            "stray user event": lambda v: v.insert(1, {"type": "user", "message": {}}),
+            "stray system event": lambda v: v.insert(0, {"type": "system", "subtype": "api_retry"}),
+            "second result": lambda v: v.append(dict(v[1])),
+        }
+        for name, mutate in mutations.items():
+            events = self.billing_refusal()
+            mutate(events)
+            with self.subTest(name):
+                self.assertFalse(e.initial_billing_refusal(events))
+        accepted = self.billing_refusal()
+        accepted.insert(0, {"type": "system", "subtype": "init"})
+        self.assertTrue(e.initial_billing_refusal(accepted))
+
+    def test_fallback_attempt_gets_only_the_remaining_pass_deadline(self):
+        from types import SimpleNamespace as NS
+        refusal = NS(returncode=1, stdout="\n".join(map(json.dumps, self.billing_refusal())))
+        success = NS(returncode=0, stdout="\n".join(map(json.dumps, transcript())))
+        deadline = POLICY["ai_timeout"]
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fixture-primary",
+                                    "ANTHROPIC_API_KEY_2": "fixture-secondary"}), \
+                patch.object(e.time, "monotonic", side_effect=[0, 0, deadline - 100]), \
+                patch.object(e.subprocess, "run", side_effect=[refusal, success]) as run:
+            e.run_claude(POLICY, BUNDLE, "bundle", Path("/head"))
+        self.assertEqual([deadline, 100], [call.kwargs["timeout"] for call in run.call_args_list])
+
+    def test_credential_hints_name_both_anthropic_secrets(self):
+        # The failing key can be the fallback one, so a hint naming only the primary is inert.
+        self.assertIn("ANTHROPIC_API_KEY ", e.CLAUDE_ERROR_CAUSES["authentication_failed"])
+        self.assertIn("ANTHROPIC_API_KEY_2", e.CLAUDE_ERROR_CAUSES["authentication_failed"])
+        self.assertIn("each configured Anthropic key", e.CLAUDE_ERROR_CAUSES["billing_error"])
+
     def test_both_billing_refusals_stop_and_later_pass_cannot_switch(self):
         from types import SimpleNamespace as NS
         refusal = NS(returncode=1, stdout="\n".join(map(json.dumps, self.billing_refusal())))

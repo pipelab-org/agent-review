@@ -403,10 +403,13 @@ def event_message(event):
 # terminal_reason and subtype in https://code.claude.com/docs/en/agent-sdk/typescript.
 # The pinned CLI 2.1.312 labels HTTP 529 server_error, so the status is reported too.
 CLAUDE_ERROR_CAUSES = {
-    "authentication_failed": "Anthropic rejected the API key; check the ANTHROPIC_API_KEY secret",
+    # The failing key can be the fallback one, so name both secrets.
+    "authentication_failed": ("Anthropic rejected the API key; check the ANTHROPIC_API_KEY and "
+                              "ANTHROPIC_API_KEY_2 secrets"),
     "oauth_org_not_allowed": "Anthropic refused this organization for the credential",
     "account_on_hold": "Anthropic account is on hold; check the provider account",
-    "billing_error": "Anthropic billing error, such as a low credit balance; check the provider account",
+    "billing_error": ("Anthropic billing error, such as a low credit balance; check the provider account "
+                      "behind each configured Anthropic key"),
     "rate_limit": "Anthropic rate limit; request the review again after it resets",
     "overloaded": "Anthropic API overloaded; request the review again later",
     "invalid_request": "Anthropic rejected the request",

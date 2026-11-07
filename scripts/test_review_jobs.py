@@ -1021,7 +1021,31 @@ class JobTests(unittest.TestCase):
                 summaries = [text for kind, text in self.pr.writes if kind == "issue" and "Reviewed base" in text]
                 self.assertTrue(any(j.FOLLOWUP_NOTE in text for text in summaries))
 
-    def test_codex_followup_original_plan_digest_is_checked_by_publisher(self):
+    def test_codex_followup_digest_binds_otherwise_valid_changes_to_the_main_artifact(self):
+        # Only the digest can notice this edit: the receipt stays valid and nothing live disagrees.
+        proof, root, artifact = self.codex_followup()
+        output = self.root / "verification.json"
+        self.run_codex_followup(artifact, output)
+        receipt = artifact["result"]["receipt"]["passes"][0]
+        receipt["cost_usd"] = 0.0 if receipt["cost_usd"] else 0.001
+        self.artifact.write_text(json.dumps(artifact))
+        with patch.object(j, "records", return_value={123: proof}), \
+                patch("sys.stdout", new_callable=io.StringIO) as log:
+            j.publish_artifact(self.artifact, self.head_dir, output)
+        self.assertIn(j.FOLLOWUP_NOTE, log.getvalue())
+        self.assertFalse(self.pr.threads[root.id]["isResolved"])
+        self.assertFalse(any(kind == "resolve" for kind, _ in self.pr.writes))
+        self.assertTrue((self.root / "completion.json").is_file())
+
+    def test_codex_followup_runs_once_per_artifact(self):
+        _, _, artifact = self.codex_followup()
+        artifact["verification"] = self.verified(artifact["plan"])
+        self.artifact.write_text(json.dumps(artifact))
+        with patch.object(e, "run_codex") as provider, self.assertRaises(e.ReviewAbort):
+            j.verify_artifact(self.artifact, self.root / "verification.json", self.head_dir, "/action", "/home")
+        provider.assert_not_called()
+
+    def test_codex_followup_changed_thread_plan_fails_the_live_thread_check(self):
         proof, root, artifact = self.codex_followup()
         output = self.root / "verification.json"
         self.run_codex_followup(artifact, output)
