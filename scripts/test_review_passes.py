@@ -8,11 +8,12 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 from scripts import review_engine as e, review_sections as s
-from scripts.test_review_engine import POLICY, finding, receipt
+from scripts.test_review_engine import EMPTY as EMPTY_BUNDLE, POLICY, finding, receipt
 
 SMALL = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
 
@@ -337,6 +338,18 @@ class ValidationTests(Repo):
         with self.assertRaises(e.ReviewAbort):
             e.validate_result(result, dict(policy, max_turns=turns - 1), bundle, prompts=True)
 
+    def test_a_pass_receipt_must_equal_the_sum_of_its_invocations(self):
+        bundle, policy, result = self.passes()
+        for name, mutate in (("turns", lambda r: r.update(turns=r["turns"] - 1)),
+                             ("files", lambda r: r.update(files_opened=[])),
+                             ("usage", lambda r: r["usage"].update(input_tokens=r["usage"]["input_tokens"] + 1)),
+                             ("cost", lambda r: r.update(cost_usd=r["cost_usd"] / 2)),
+                             ("summaries", lambda r: r["invocations"][0].update(turns=r["invocations"][0]["turns"] + 1))):
+            data = copy.deepcopy(result)
+            mutate(data["receipt"]["passes"][0])
+            with self.subTest(name), self.assertRaisesRegex(e.ReviewAbort, "does not match its invocations"):
+                e.validate_result(data, policy, bundle)
+
     def test_more_than_twelve_aggregate_candidates_stay_visible(self):
         bundle = self.bundle()
         policy = dict(SMALL, max_turns=100, max_budget_usd=50.0, passes=["bundle"])
@@ -438,6 +451,173 @@ class CredentialTests(Repo):
         self.assertEqual(["primary", "primary"], keys, "the secondary key is never tried after a completed invocation")
         self.assertEqual(1, stopped.exception.progress["completed"])
         self.assertFalse(credentials.using_secondary)
+
+
+class FakeProcess:
+    """The launcher process: a real pipe so the monitor's selector behaves, scripted exit status."""
+
+    created = []
+
+    def __init__(self, code=0, runs=0, emit=b""):
+        read, self.write = os.pipe()
+        self.stdout = os.fdopen(read, "rb", buffering=0)
+        FakeProcess.created.append(self)
+        self.code, self.runs, self.killed = code, runs, False
+        if emit:
+            os.write(self.write, emit)
+
+    def poll(self):
+        if self.killed:
+            return self.code
+        if self.runs > 0:
+            self.runs -= 1
+            return None
+        return self.code
+
+    def wait(self, timeout=None):
+        self.release()
+        return self.code
+
+    def kill(self):
+        self.killed, self.code = True, -9
+        self.release()
+
+    def release(self):
+        if self.write is not None:
+            os.close(self.write)
+            self.write = None
+
+
+class FakeSessions:
+    def __init__(self, process, texts, output):
+        self.process, self.texts, self.output = process, texts, output
+        self.entered = self.closed = 0
+        self.kwargs = self.started = None
+
+    def session(self, workspace, **kwargs):
+        owner = self
+        import contextlib
+
+        @contextlib.contextmanager
+        def manager():
+            owner.entered, owner.kwargs = owner.entered + 1, kwargs
+            try:
+                yield owner
+            finally:
+                owner.closed += 1
+        return manager()
+
+    home = Path("/session/home")
+
+    def start(self, prompt, *, head, model, effort):
+        self.started = (prompt, str(head), model, effort)
+        return self.process
+
+    def rollout_texts(self):
+        return self.texts
+
+    def read_output(self):
+        return self.output
+
+
+CODEX = dict(POLICY, model="gpt-6.1-terra", provider="codex", passes=["callers"], max_model_tokens=90000)
+
+
+def rollout(turns=1, error=None):
+    events = [{"type": "turn_context", "payload": {"model": "gpt-6.1-terra"}}]
+    for turn in range(1, turns + 1):
+        events += [{"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": f"r{turn}",
+                    "arguments": json.dumps({"cmd": "cat -- src/app.py", "workdir": "/head"})}},
+                   {"type": "response_item", "payload": {"type": "function_call_output", "call_id": f"r{turn}",
+                    "output": "Process exited with code 0\nOutput:\nsource"}},
+                   {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                       "last_token_usage": {"input_tokens": 100, "output_tokens": 20},
+                       "total_token_usage": {"input_tokens": 100 * turn, "output_tokens": 20 * turn,
+                                             "total_tokens": 120 * turn}}}}]
+    if error:
+        events.append({"type": "event_msg", "payload": {"type": "task_complete", "error": error}})
+    return "\n".join(json.dumps(v) for v in events)
+
+
+class IsolatedRunTests(unittest.TestCase):
+    """The engine's seam for sessions that run under another account (no sudo here, only the interface)."""
+
+    def tearDown(self):
+        for process in FakeProcess.created:
+            process.release()
+            process.stdout.close()
+        FakeProcess.created.clear()
+
+    def run_session(self, sessions, **overrides):
+        settings = dict(CODEX, **overrides.pop("settings", {}))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(e, "configure_codex") as configured:
+            result = e.run_codex(settings, EMPTY_BUNDLE, "callers", Path("/head"), "/action", Path(tmp) / "home", Path(tmp),
+                                 prompt="review this", sessions=sessions, **overrides)
+            self.configured = configured
+        return result
+
+    def test_a_session_yields_a_receipt_from_its_own_rollout_and_always_closes(self):
+        sessions = FakeSessions(FakeProcess(), [("sessions/r.jsonl", rollout())], '{"findings": []}')
+        result = self.run_session(sessions)
+        self.assertEqual([], result["findings"])
+        self.assertEqual(("codex", 1, ["src/app.py"]), (result["receipt"]["provider"], result["receipt"]["turns"],
+                                                       result["receipt"]["files_opened"]))
+        self.assertGreater(result["receipt"]["cost_usd"], 0)
+        self.assertEqual(("review this", "/head", "gpt-6.1-terra", "medium"), sessions.started)
+        self.assertEqual((1, 1), (sessions.entered, sessions.closed))
+        self.assertEqual(json.dumps(e.OUTPUT_SCHEMA, sort_keys=True), sessions.kwargs["schema_text"])
+        self.assertGreater(sessions.kwargs["max_bytes"], 0)
+        with patch.object(e, "configure_codex") as configure:
+            sessions.kwargs["configure"](Path("/staged"))
+        configure.assert_called_once_with(Path("/staged"), dict(CODEX))
+
+    def test_a_descendant_holding_the_pipe_open_does_not_delay_a_finished_session(self):
+        process = FakeProcess()
+        sessions = FakeSessions(process, [("sessions/r.jsonl", rollout())], '{"findings": []}')
+        self.addCleanup(process.release)
+        started = time.monotonic()
+        self.run_session(sessions, settings={"ai_timeout": 5})
+        self.assertLess(time.monotonic() - started, 4, "waited for pipe EOF that a descendant still holds")
+
+    def test_failures_name_only_fixed_causes_and_still_close_the_session(self):
+        recorded = {"message": "private", "codex_error_info": {"response_stream_disconnected": {"http_status_code": None}}}
+        cases = (("recorded error", FakeProcess(code=1), [("sessions/r.jsonl", rollout(error=recorded))], '{"findings": []}',
+                  r"^OpenAI response stream disconnected; request the review again"),
+                 ("launcher text", FakeProcess(code=1, emit=b"Error: Could not restrict access to /private/path"),
+                  [], None, "codex_action_error=privilege_removal"),
+                 ("unknown", FakeProcess(code=1), [], None, "^Codex session failed; inspect provider account"),
+                 ("no output", FakeProcess(), [("sessions/r.jsonl", rollout())], None, "output file is missing"),
+                 ("bad json", FakeProcess(), [("sessions/r.jsonl", rollout())], "{not json", "Invalid or truncated JSON"),
+                 ("two rollouts", FakeProcess(), [("a.jsonl", rollout()), ("b.jsonl", "")], '{"findings": []}',
+                  "does not attest one fresh pass"))
+        for name, process, texts, output, message in cases:
+            sessions = FakeSessions(process, texts, output)
+            with self.subTest(name), self.assertRaisesRegex(e.ReviewAbort, message) as caught:
+                self.run_session(sessions)
+            self.assertEqual(1, sessions.closed)
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_a_session_that_never_ends_is_killed_at_the_deadline_and_a_turn_overrun_stops_it(self):
+        process = FakeProcess(runs=10 ** 9)
+        sessions = FakeSessions(process, [("sessions/r.jsonl", rollout())], None)
+        with self.assertRaisesRegex(e.ReviewAbort, "exceeded config.ai_timeout"):
+            self.run_session(sessions, settings={"ai_timeout": 0.3})
+        self.assertTrue(process.killed)
+        self.assertEqual(1, sessions.closed)
+        process = FakeProcess(runs=10 ** 9)
+        sessions = FakeSessions(process, [("sessions/r.jsonl", rollout(turns=3))], None)
+        with self.assertRaisesRegex(e.ReviewAbort, "max_turns"):
+            self.run_session(sessions, settings={"max_turns": 2})
+        self.assertTrue(process.killed)
+        self.assertEqual(1, sessions.closed)
+
+    def test_an_oversized_prompt_stops_before_any_session_is_created(self):
+        sessions = FakeSessions(FakeProcess(), [], None)
+        settings = dict(CODEX, max_model_tokens=20000, max_output_tokens=16000)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(e.InputLimitAbort, "Codex prompt exceeds"):
+            e.run_codex(settings, EMPTY_BUNDLE, "callers", Path("/head"), "/action", Path(tmp), Path(tmp),
+                        prompt="x" * 5000, sessions=sessions)
+        self.assertEqual(0, sessions.entered)
 
 
 if __name__ == "__main__":

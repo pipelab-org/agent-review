@@ -1927,7 +1927,9 @@ class JobTests(unittest.TestCase):
 
     def test_a_file_thread_that_cannot_be_verified_aborts_publication_and_never_reports_success(self):
         for name, overrides, after in (
-                ("no owning review", {"pull_request_review_id": None}, None),
+                ("no owning review", {"pull_request_review_id": None},
+                 lambda root: setattr(self.pr, "get_review", lambda i: NS(id=i, user=NS(**f.BOT), commit_id=self.pr.head.sha,
+                                                                         state="COMMENTED"))),
                 ("moved original commit", {"original_commit_id": "0" * 40}, None),
                 ("line anchor present", {"line": 40}, None),
                 ("line subject", {"subject_type": "line"}, None),

@@ -1653,6 +1653,13 @@ def _run_isolated(settings, bundle, strategy, head, home, workspace, sessions, *
                     raise ReviewAbort("Codex reached the review_depth max_turns; pass incomplete")
                 if cost is not None and cost > settings["max_budget_usd"]:
                     raise ReviewAbort("Codex reached the review_depth max_budget_usd; pass incomplete")
+            # Output the launcher wrote just before exiting is still in the pipe; read what is ready
+            # without waiting for an EOF that a model descendant might hold off.
+            while selector.select(0):
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                diagnostic = (diagnostic + chunk)[-65536:]
+                if not chunk:
+                    break
             if proc.wait(timeout=max(deadline - time.monotonic(), 0)) != 0:
                 raise ReviewAbort(codex_failure_cause(session.home, texts=[t for _, t in session.rollout_texts()])
                                   or codex_launcher_cause(diagnostic)

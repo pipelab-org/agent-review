@@ -272,8 +272,11 @@ class RepositoryPlanTests(unittest.TestCase):
 
 class VisibleLineTests(unittest.TestCase):
     def test_form_feed_unicode_separators_and_plus_plus_content_do_not_shift_anchors(self):
-        patch_text = ("@@ -1,5 +1,6 @@\n ctx\x0cmore\n+++i;\n+two still two\n ctx\r\n-removed\n+last\n")
+        patch_text = "@@ -1,5 +1,6 @@\n ctx\x0cmore\n+++i;\n+two\u2028still two\n ctx\r\n-removed\n+last\n"
         self.assertEqual({1, 2, 3, 4, 5}, jobs.anchor_lines(patch_text))
+        # A separator followed by `+` or a space would look like extra added or context lines.
+        self.assertEqual({1, 2}, jobs.anchor_lines("@@ -1,2 +1,2 @@\n+one\x0c+two\n ctx\n"))
+        self.assertEqual({1, 2}, jobs.anchor_lines("@@ -1,2 +1,2 @@\n+one\u2028 two\n ctx\n"))
         header_first = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n+x\n"
         self.assertEqual({1}, jobs.anchor_lines(header_first))
 

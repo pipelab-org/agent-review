@@ -203,21 +203,27 @@ class PagedEvidenceTests(unittest.TestCase):
         status, cs = comments(record)
         self.assertEqual(record, f.parse_record(status, cs))
         self.assertLess(len(f.canonical(record).encode()), f.MAX_DATA_BYTES)
+        def consistent(broken):
+            # Recompute the comment digest so that only the record's own shape can reject it.
+            payload = {k: v for k, v in broken.items() if k != "digest"}
+            manifest = "<!-- agent-review-result:v1 " + base64.b64encode(f.canonical(payload).encode()).decode() + " -->"
+            return comments(dict(broken, digest=f.digest("summary\n" + manifest)))
+        c, all_comments = consistent(record)
+        self.assertIsNotNone(f.parse_record(c, all_comments), "the consistent rebuild of a good root is accepted")
         for key in f.BULK:
             with self.subTest(key=key):
-                broken = dict(record, **{key: []})
-                c, all_comments = comments(broken)
+                c, all_comments = consistent(dict(record, **{key: []}))
                 self.assertIsNone(f.parse_record(c, all_comments))
         for mutate in (lambda e: e.update(pages=0), lambda e: e.update(bytes=0), lambda e: e.update(pages=e["pages"] + 1),
                        lambda e: e.update(chain="g" * 64), lambda e: e.update(chain="a" * 63),
                        lambda e: e.update(extra=1), lambda e: e.pop("chain"), lambda e: e.update(bytes=True)):
             broken = copy.deepcopy(record)
             mutate(broken["evidence"])
-            c, all_comments = comments(broken)
+            c, all_comments = consistent(broken)
             with self.subTest(mutate=mutate):
                 self.assertIsNone(f.parse_record(c, all_comments))
         legacy = dict(record, version=2)
-        c, all_comments = comments(legacy)
+        c, all_comments = consistent(legacy)
         self.assertIsNone(f.parse_record(c, all_comments), "v2 must carry its lists inline")
 
     def test_evidence_beyond_the_shared_data_bound_pages_and_reassembles_exactly(self):
