@@ -15,6 +15,11 @@ name: Reusable agentic review
       AGENT_REVIEW_LEARNINGS_APP_KEY:
         required: false
 permissions: {}
+# Hold the existing per-PR queue through verification and publication too.
+concurrency:
+  group: agent-review-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+  queue: max
 jobs:
   source:
     if: (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')))
@@ -65,10 +70,6 @@ jobs:
     - source
     - admit
     if: needs.admit.outputs.admitted == 'true'
-    concurrency:
-      group: agent-review-${{ github.repository }}-${{ github.event.issue.number }}
-      cancel-in-progress: false
-      queue: max
     # Ubuntu 26.04's Rust test/sudo implementations break the pinned action's
     # ACL verification and environment preservation. Keep its safeguards intact.
     # https://github.com/openai/codex-action/issues/188
@@ -458,10 +459,6 @@ jobs:
     name: Answer an inline review question
     needs: source
     if: github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve'))
-    concurrency:
-      group: agent-review-${{ github.repository }}-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
-      queue: max
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
@@ -796,12 +793,13 @@ jobs:
     - source
     - admit
     - review
+    - codex-verification
     - publish
     - reply
     if: |-
       always() && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
-          needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled') ||
+          needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || cancelled()) ||
           (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve'))) && needs.reply.outputs.learnings_revoke_failed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1009,7 +1007,8 @@ jobs:
     - admit
     - review
     - codex-verification
-    if: always() && needs.review.result == 'success'
+    if: >-
+      !cancelled() && needs.review.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -1017,10 +1016,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    concurrency:
-      group: agent-review-${{ github.repository }}-${{ github.event.issue.number }}-publication
-      cancel-in-progress: false
-      queue: max
     steps:
     - name: Check out trusted base at workspace root
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -1112,10 +1107,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    concurrency:
-      group: agent-review-${{ github.repository }}-${{ github.event.pull_request.number }}-publication
-      cancel-in-progress: false
-      queue: max
     steps:
     - name: Resolve trusted shared source before checkout
       id: reply-source

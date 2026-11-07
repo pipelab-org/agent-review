@@ -13,6 +13,7 @@ permissions: {}
 
 jobs:
   claude:
+    name: Anthropic ${{ matrix.credential }} connectivity
     if: >-
       github.ref == 'refs/heads/main' && github.run_attempt == '1' &&
       github.actor == 'luckyPipewrench' && github.actor_id == '142104046' &&
@@ -20,6 +21,14 @@ jobs:
     runs-on: ubuntu-24.04
     # Reuse the one-call inference job's setup and timeout allowance.
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - credential: primary
+          secret: ANTHROPIC_API_KEY
+        - credential: secondary
+          secret: ANTHROPIC_API_KEY_2
     permissions:
       contents: read
     steps:
@@ -34,10 +43,10 @@ jobs:
       run: |
         npm install --global @anthropic-ai/claude-code@2.1.312
         claude --version
-    - name: Check the configured Anthropic route, including bounded billing fallback
+    - name: Check this Anthropic credential independently
       env:
-        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        ANTHROPIC_API_KEY_2: ${{ secrets.ANTHROPIC_API_KEY_2 }}
+        ANTHROPIC_API_KEY: ${{ secrets[matrix.secret] }}
+        ANTHROPIC_API_KEY_2: ''
       run: |
         python - <<'PY'
         import tempfile

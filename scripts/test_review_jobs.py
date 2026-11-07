@@ -1696,10 +1696,44 @@ class WorkflowTests(unittest.TestCase):
         review = self.workflow["jobs"]["review"]
         self.assertEqual("${{ steps.inference.outputs.run_verification }}", review["outputs"]["run_verification"])
 
+    def test_provider_health_probes_both_anthropic_slots_without_cross_account_fallback(self):
+        workflow = yaml.safe_load((e.ROOT / ".github/workflows/provider-health.yaml").read_text())
+        job = workflow["jobs"]["claude"]
+        self.assertFalse(job["strategy"]["fail-fast"])
+        self.assertEqual([
+            {"credential": "primary", "secret": "ANTHROPIC_API_KEY"},
+            {"credential": "secondary", "secret": "ANTHROPIC_API_KEY_2"},
+        ], job["strategy"]["matrix"]["include"])
+        self.assertIn("matrix.credential", job["name"])
+        probe = next(step for step in job["steps"] if "ANTHROPIC_API_KEY" in step.get("env", {}))
+        self.assertEqual({"ANTHROPIC_API_KEY": "${{ secrets[matrix.secret] }}",
+                          "ANTHROPIC_API_KEY_2": ""}, probe["env"])
+        script = probe["run"].split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        for findings in ([], [{"unexpected": "finding"}]):
+            with self.subTest(findings=findings), \
+                    patch.object(e, "run_claude", return_value={"findings": findings}), \
+                    patch("sys.stdout", new_callable=io.StringIO) as output:
+                if findings:
+                    with self.assertRaises(SystemExit):
+                        exec(compile(script, "<health-probe>", "exec"), {})
+                else:
+                    exec(compile(script, "<health-probe>", "exec"), {})
+                    self.assertIn("Anthropic connectivity passed", output.getvalue())
+
+    def test_per_pr_queue_covers_verification_and_publication(self):
+        self.assertEqual({
+            "group": "agent-review-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}",
+            "cancel-in-progress": False, "queue": "max",
+        }, self.workflow["concurrency"])
+        self.assertTrue(all("concurrency" not in job for job in self.workflow["jobs"].values()))
+
     def test_publication_preserves_main_review_when_optional_verification_skips_or_fails(self):
         job = self.workflow["jobs"]["publish"]
         self.assertIn("codex-verification", job["needs"])
-        self.assertEqual("always() && needs.review.result == 'success'", job["if"])
+        self.assertEqual("!cancelled() && needs.review.result == 'success'", job["if"])
+        notifier = self.workflow["jobs"]["notify-failure"]
+        self.assertIn("codex-verification", notifier["needs"])
+        self.assertIn("|| cancelled()", notifier["if"])
         download = next(s for s in job["steps"] if s["name"] == "Download optional thread verification")
         self.assertEqual("needs.codex-verification.result == 'success'", download["if"])
         self.assertTrue(download["continue-on-error"])

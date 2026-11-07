@@ -47,7 +47,7 @@ Only the designated maintainer's original, unedited command is admitted. Fork an
 
 ## Development
 
-To diagnose configured provider credentials without choosing a pull request, manually run **Provider connectivity check** from Actions on `main`. It makes a small live request through each selected provider's normal restricted runner and can incur API charges under the existing central limits. Anthropic uses the same bounded billing fallback as reviews. The check prints fixed success or failure diagnostics, never keys or provider response text. It checks access, not the remaining credit balance or review quality. It does not run automatically or retry failed workflows.
+To diagnose configured provider credentials without choosing a pull request, manually run **Provider connectivity check** from Actions on `main`. It makes a small live request through each selected provider's normal restricted runner and can incur API charges under the existing central limits. Anthropic tests the primary and secondary keys in separate jobs, with fallback disabled, so one working account can't hide a failure on the other. The check prints fixed success or failure diagnostics, never keys or provider response text. It checks access, not the remaining credit balance or review quality. It does not run automatically or retry failed workflows.
 
 CI uses Python 3.12 on Linux x86_64 with hash-pinned dependencies:
 
