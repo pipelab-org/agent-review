@@ -296,6 +296,15 @@ class PagedEvidenceTests(unittest.TestCase):
         for name, data in bad.items():
             with self.subTest(name), self.assertRaises((f.FollowupAbort, ValueError, KeyError)):
                 load(data)
+        # Reject a forged page count before enumerating its names. The sentinel prevents
+        # a neutralized guard from allocating an attacker-sized list during the test.
+        forged = dict(record, evidence=dict(record["evidence"], pages=10 ** 12, bytes=f.MAX_DATA_BYTES * 10 ** 12))
+        data = archive(root=forged)
+        with patch.object(f, "PAGE_NAME") as names:
+            names.format.side_effect = AssertionError("untrusted page count was enumerated")
+            with self.assertRaises(f.FollowupAbort):
+                load(data)
+            names.format.assert_not_called()
 
     def test_v3_verification_needs_the_assembled_lists_and_v2_keeps_its_own_contract(self):
         def proven(record, loader):

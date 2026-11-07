@@ -397,7 +397,7 @@ def download_record(artifact, token, timeout):
                 raise FollowupAbort("Invalid completion artifact contents")
             return root
         info = root.get("evidence")
-        if not valid_evidence(info):
+        if not valid_evidence(info) or info["pages"] != len(files) - 1:
             raise FollowupAbort("Invalid completion artifact contents")
         names = ["completion.json"] + [PAGE_NAME.format(i + 1) for i in range(info["pages"])]
         if set(files) != set(names) or any(files[name].file_size > MAX_DATA_BYTES for name in names):
