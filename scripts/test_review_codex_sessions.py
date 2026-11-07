@@ -687,6 +687,7 @@ class SetupTests(unittest.TestCase):
             setup.main(["--print-plan", "share", "--user", "agent-review-model", "--path", "/tmp"])
 
     def test_invalid_names_directories_and_unhosted_execution_are_refused(self):
+        from unittest.mock import patch
         from scripts import codex_identity_setup as setup
         for bad in ("Root", "a b", "", "x;y"):
             with self.subTest(bad), self.assertRaises(SystemExit):
@@ -694,18 +695,42 @@ class SetupTests(unittest.TestCase):
         for bad in ("/etc/x", "/var/lib/../etc", "relative", "/var/lib/a\nb"):
             with self.subTest(bad), self.assertRaises(SystemExit):
                 setup.provision_plan("ok", bad, 1, 1)
-        with self.assertRaises(SystemExit) as caught:
-            setup.main(["provision", "--user", "agent-review-model"])
-        self.assertIn("GitHub-hosted", str(caught.exception))
         from scripts import hosted_codex_sandbox_proof as proof
-        with self.assertRaises(SystemExit) as caught:
-            proof.main(["identity", "--user", "x", "--head", "/tmp"])
-        self.assertIn("disposable GitHub-hosted", str(caught.exception))
+        # This negative state must remain unhosted when the suite itself runs in Actions.
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(setup, "execute", side_effect=AssertionError("privileged execution")):
+            with self.assertRaises(SystemExit) as caught:
+                setup.main(["provision", "--user", "agent-review-model"])
+            self.assertIn("GitHub-hosted", str(caught.exception))
+            with self.assertRaises(SystemExit) as caught:
+                proof.main(["identity", "--user", "x", "--head", "/tmp"])
+            self.assertIn("disposable GitHub-hosted", str(caught.exception))
 
     def test_the_probe_source_is_valid_python_and_prints_no_secret_values(self):
         from scripts import hosted_codex_sandbox_proof as proof
         compile(proof.PROBE, "probe", "exec")
         self.assertNotIn("sentinel_value", proof.PROBE)
+
+    def test_probe_reports_exec_permission_denial_and_preserves_command_status(self):
+        import json
+        from unittest.mock import patch
+        from scripts import hosted_codex_sandbox_proof as proof
+        with tempfile.TemporaryDirectory() as temp:
+            scenario = dict(suid="/fixture/id", capcat="/fixture/cat", canary="/fixture/socket",
+                            controller_pid=os.getpid(), sentinel_env="FIXTURE_ABSENT_ENV",
+                            sentinel_file=temp + "/absent", head=temp, runner_home=temp, source=temp)
+            for status in ("exec-denied", 0, 1):
+                def command(argv, **kwargs):
+                    if argv[0] == scenario["capcat"] and status == "exec-denied":
+                        raise PermissionError("fixture capability execution denied")
+                    return NS(returncode=status if argv[0] == scenario["capcat"] else 1, stdout="{}")
+                out = io.StringIO()
+                with self.subTest(status=status), patch("subprocess.run", side_effect=command), \
+                        patch("socket.socket") as sock, patch("sys.stdin", io.StringIO(json.dumps(scenario))), \
+                        contextlib.redirect_stdout(out):
+                    sock.return_value.connect.side_effect = PermissionError("fixture socket denied")
+                    exec(compile(proof.PROBE, "probe", "exec"), {"__name__": "__main__"})
+                self.assertEqual(status, json.loads(out.getvalue())["capability_read_status"])
 
 
 if __name__ == "__main__":

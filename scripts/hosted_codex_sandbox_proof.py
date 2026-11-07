@@ -59,7 +59,12 @@ result["child"] = json.loads(subprocess.run([sys.executable, "-c",
     capture_output=True, text=True).stdout)
 result["sudo_status"] = subprocess.run(["/usr/bin/sudo", "-n", "true"], capture_output=True).returncode
 result["setuid_euid"] = subprocess.run([scenario["suid"], "-u"], capture_output=True, text=True).stdout.strip()
-result["capability_read_status"] = subprocess.run([scenario["capcat"], "/etc/shadow"], capture_output=True).returncode
+# capabilities(7): a capability-dumb executable may be denied at execve itself
+# when its file-permitted capabilities cannot be obtained from the bounding set.
+try:
+    result["capability_read_status"] = subprocess.run([scenario["capcat"], "/etc/shadow"], capture_output=True).returncode
+except PermissionError:
+    result["capability_read_status"] = "exec-denied"
 def connect():
     sock = socket.socket(socket.AF_UNIX)
     try:
@@ -194,7 +199,14 @@ def run_probe(launcher, head, suid, capcat, sentinel, workspace, **extra):
         out = process.stdout.read()
         process.wait(timeout=120)
         parent = live.parent
-    return json.loads(out.strip().splitlines()[-1]), parent
+    try:
+        result = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        # Only this controller-owned probe runs here; it prints no secret contents.
+        last = out.strip().splitlines()[-1:] or ["no probe output"]
+        raise ProofFailure(f"identity probe returned {process.returncode}: {last[0]}") from None
+    check(process.returncode == 0, "identity probe exited successfully")
+    return result, parent
 
 
 def identity_proof(user, head):

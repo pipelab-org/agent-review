@@ -233,7 +233,8 @@ pathlib.Path(args[args.index('--output-last-message')+1]).write_text('{"findings
 ''')
         fake.chmod(0o755)
         with patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.environ["PATH"]}):
-            result = e.run_codex(e.policy("codex"), {"files": []}, "callers", head, action, home, root / "work")
+            result = e.run_codex(e.policy("codex"), {"files": []}, "callers", head, action, home, root / "work",
+                                 prompt="Inspect this fixture and return no findings.")
         assert result["findings"] == []
         assert result["receipt"]["turns"] == 1
         assert not list((root / "work").iterdir()), "disposable Codex pass was retained"
