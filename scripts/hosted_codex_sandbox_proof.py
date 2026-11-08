@@ -295,15 +295,17 @@ def native_proof(user, codex):
     """Run the real CLI and production monitor twice under the provisioned identity."""
     try:
         from . import native_codex_fixture as native
+        from .codex_identity_setup import RUNTIME_DIR
     except ImportError:
         import native_codex_fixture as native
+        from codex_identity_setup import RUNTIME_DIR
     from types import SimpleNamespace
 
     settings = native.engine.policy("codex-deep")
     identity = sessions.resolve_identity(user)
-    node = shutil.which("node")
+    path = RUNTIME_DIR + "/bin:/usr/bin:/bin"
+    node = shutil.which("node", path=path)
     check(node is not None, "the trusted Node runtime is available")
-    path = native.runtime_path(codex)
     native.require_version(codex, path)
     launcher = sessions.CodexSessions(identity, codex=str(codex), trusted_path=path)
     launcher.verify()

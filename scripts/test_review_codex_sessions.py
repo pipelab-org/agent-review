@@ -680,6 +680,47 @@ class SetupTests(unittest.TestCase):
         self.assertEqual([], credentials["supplementaryGroupIds"])
         self.assertNotEqual(os.getuid(), credentials["userId"])
 
+    def test_runtime_plan_uses_a_protected_prefix_and_copies_only_node(self):
+        from scripts import codex_identity_setup as setup
+        plan = self.plan("runtime")
+        self.assertEqual(3, len(plan))
+        for command, directory in zip(plan[:2], (setup.RUNTIME_DIR, setup.RUNTIME_DIR + "/bin")):
+            self.assertEqual(["/usr/bin/install", "-d", "-o", str(os.getuid()), "-g", str(os.getgid()),
+                              "-m", "0755", "--", directory], command[3:])
+        self.assertEqual(["/usr/bin/install", "-m", "0755", "--"], plan[2][3:7])
+        self.assertTrue(Path(plan[2][7]).is_absolute())
+        self.assertEqual(setup.RUNTIME_DIR + "/bin/node", plan[2][8])
+
+    def test_runtime_copy_passes_the_guard_while_the_shared_source_is_refused(self):
+        from scripts import codex_identity_setup as setup
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "toolcache"
+            cache.mkdir(mode=0o777)
+            cache.chmod(0o777)
+            source = cache / "node"
+            source.write_text("#!/bin/sh\nexit 0\n")
+            source.chmod(0o755)
+            identity = s.Identity("fixture", os.getuid() + 1, os.getgid() + 1)
+            with self.assertRaisesRegex(ReviewAbort, "writable"):
+                s.trusted_executable(str(source), os.getuid(), identity, s._System())
+            with patch.object(setup, "RUNTIME_DIR", str(root / "protected")):
+                for command in setup.runtime_plan(os.getuid(), os.getgid(), str(source)):
+                    subprocess.run(command[3:], check=True)
+                target = setup.RUNTIME_DIR + "/bin/node"
+                self.assertEqual(target, s.trusted_executable(target, os.getuid(), identity, s._System()))
+
+    def test_runtime_setup_refuses_an_existing_prefix_without_running_a_command(self):
+        from scripts import codex_identity_setup as setup
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(setup, "RUNTIME_DIR", directory), \
+                patch.object(setup, "hosted", return_value=True), \
+                patch.object(setup, "execute", side_effect=AssertionError("existing prefix touched")):
+            with self.assertRaisesRegex(SystemExit, "already exists"):
+                setup.main(["runtime"])
+
     def test_no_ancestor_acl_grant_exists_any_more(self):
         from scripts import codex_identity_setup as setup
         self.assertFalse(hasattr(setup, "share_plan"))
@@ -701,6 +742,9 @@ class SetupTests(unittest.TestCase):
                 patch.object(setup, "execute", side_effect=AssertionError("privileged execution")):
             with self.assertRaises(SystemExit) as caught:
                 setup.main(["provision", "--user", "agent-review-model"])
+            self.assertIn("GitHub-hosted", str(caught.exception))
+            with self.assertRaises(SystemExit) as caught:
+                setup.main(["runtime"])
             self.assertIn("GitHub-hosted", str(caught.exception))
             with self.assertRaises(SystemExit) as caught:
                 proof.main(["identity", "--user", "x", "--head", "/tmp"])

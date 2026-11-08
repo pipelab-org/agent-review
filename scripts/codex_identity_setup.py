@@ -35,6 +35,7 @@ except ImportError:
 
 SUDO = "/usr/bin/sudo"
 SESSIONS_DIR = "/var/lib/agent-review-sessions"
+RUNTIME_DIR = "/var/lib/agent-review-runtime"
 
 
 def hosted():
@@ -70,6 +71,20 @@ def restrict_plan(identity, action, node):
              "--root-phase", "--user", identity.user, "--group", "sudo", "--runner-credentials", credentials]]
 
 
+def runtime_plan(controller_uid, controller_gid, node):
+    """Create an npm prefix closed to other writers and copy the selected Node runtime.
+
+    install(1) sets the exact modes; npm's documented --prefix then puts the CLI
+    and its dependencies below this directory, outside the shared runner toolcache.
+    """
+    if not node or not os.path.isabs(node):
+        raise SystemExit("The trusted Node runtime was not found")
+    return [[SUDO, "-n", "--", "/usr/bin/install", "-d", "-o", str(controller_uid), "-g", str(controller_gid),
+             "-m", "0755", "--", directory] for directory in (RUNTIME_DIR, RUNTIME_DIR + "/bin")] + [
+            [SUDO, "-n", "--", "/usr/bin/install", "-m", "0755", "--", os.path.realpath(node),
+             RUNTIME_DIR + "/bin/node"]]
+
+
 def execute(plan):
     for number, argv in enumerate(plan, 1):
         print(f"step {number} of {len(plan)}: {argv[3] if len(argv) > 3 else argv[0]}", flush=True)
@@ -93,6 +108,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--print-plan", action="store_true", help="print the commands and stop")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("runtime")
     one = commands.add_parser("provision")
     one.add_argument("--user", required=True)
     one.add_argument("--sessions-dir", default=SESSIONS_DIR)
@@ -107,6 +123,8 @@ def main(argv=None):
     controller_uid, controller_gid = os.getuid(), os.getgid()
     if args.command == "provision":
         plan = provision_plan(args.user, args.sessions_dir, controller_uid, controller_gid)
+    elif args.command == "runtime":
+        plan = runtime_plan(controller_uid, controller_gid, shutil.which("node"))
     else:
         valid_user(args.user)
         if args.print_plan and args.command in ("restrict-sockets", "verify"):
@@ -125,7 +143,12 @@ def main(argv=None):
         print(json.dumps(plan))
         return 0
     refuse_unless_hosted()
-    if args.command == "provision":
+    if args.command == "runtime":
+        if Path(RUNTIME_DIR).exists() or Path(RUNTIME_DIR).is_symlink():
+            raise SystemExit("Refusing: the runtime prefix already exists; it must be created by this job")
+        execute(plan)
+        print("protected runtime prefix prepared")
+    elif args.command == "provision":
         try:
             pwd.getpwnam(args.user)
         except KeyError:

@@ -310,6 +310,13 @@ jobs:
       if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
       continue-on-error: true
       run: python trusted-agent-review/scripts/codex_identity_setup.py restrict-sockets --user agent-review-model --action trusted-codex-action
+    - name: Prepare the protected multi-session runtime
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
+      continue-on-error: true
+      run: |
+        python trusted-agent-review/scripts/codex_identity_setup.py runtime
+        umask 022
+        npm install --global --prefix /var/lib/agent-review-runtime @openai/codex@0.165.0
     - name: Review the admitted diff
       id: inference
       env:

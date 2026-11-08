@@ -100,10 +100,24 @@ jobs:
       run: python scripts/hosted_codex_sandbox_proof.py identity --user "$REVIEW_PROOF_USER" --head "$GITHUB_WORKSPACE"
     - name: Install the pinned native CLI
       run: |
-        npm install --global @openai/codex@0.165.0
-        "$(npm prefix --global)/bin/codex" --version
+        python scripts/codex_identity_setup.py runtime
+        umask 022
+        npm install --global --prefix /var/lib/agent-review-runtime @openai/codex@0.165.0
+        /var/lib/agent-review-runtime/bin/codex --version
+    - name: Enable the pinned native sandbox's namespace prerequisites
+      # Same prerequisites as openai/codex-action@c05cfd74ad95c626cdf05c6685e62becc3bf7813/action.yml.
+      # This fixture-only job does not run the action's credential-bearing setup.
+      run: |
+        current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+        if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+        fi
+        current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+        if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
     - name: Real native Codex sessions with offline Responses and no provider credentials
-      run: python scripts/hosted_codex_sandbox_proof.py native --user "$REVIEW_PROOF_USER" --codex "$(npm prefix --global)/bin/codex"
+      run: python scripts/hosted_codex_sandbox_proof.py native --user "$REVIEW_PROOF_USER" --codex /var/lib/agent-review-runtime/bin/codex
 'on':
   pull_request:
     branches:

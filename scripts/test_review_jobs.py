@@ -2263,6 +2263,35 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = yaml.safe_load((e.ROOT / ".github/workflows/agent-review-reusable.yaml").read_text())
 
+    def test_multi_session_consumer_selects_the_protected_runtime_without_searching_ambient_path(self):
+        from scripts import codex_identity_setup as setup, review_codex_sessions as launcher
+        with patch.dict(os.environ, {"REVIEW_CODEX_SESSION_USER": "agent-review-model"}), \
+                patch.object(j.shutil, "which", side_effect=AssertionError("ambient PATH used")), \
+                patch.object(launcher, "resolve_identity", return_value="fixture identity"), \
+                patch.object(launcher, "CodexSessions") as factory:
+            actual, workspace = j.codex_sessions({"provider": "codex"}, {"sections": [{}, {}]}, "/unused")
+        factory.assert_called_once_with("fixture identity", codex=setup.RUNTIME_DIR + "/bin/codex",
+                                        trusted_path=setup.RUNTIME_DIR + "/bin:/usr/bin:/bin")
+        self.assertIs(actual, factory.return_value)
+        factory.return_value.verify.assert_called_once_with()
+        self.assertEqual(str(workspace), setup.SESSIONS_DIR)
+
+    def test_hosted_proof_and_real_review_install_under_the_same_protected_prefix(self):
+        from scripts import codex_identity_setup as setup
+        steps = self.workflow["jobs"]["review"]["steps"]
+        runtime = next(step for step in steps if step.get("name") == "Prepare the protected multi-session runtime")
+        inference = next(step for step in steps if step.get("id") == "inference")
+        self.assertLess(steps.index(runtime), steps.index(inference))
+        self.assertTrue(runtime["continue-on-error"], "a setup failure must not block the single-session path")
+        ci = yaml.safe_load((e.ROOT / ".github/workflows/ci.yaml").read_text())
+        proof = ci["jobs"]["codex-multisession-proof"]["steps"]
+        install = next(step for step in proof if step.get("name") == "Install the pinned native CLI")
+        for step in (runtime, install):
+            self.assertIn("codex_identity_setup.py runtime", step["run"])
+            self.assertIn("npm install --global --prefix " + setup.RUNTIME_DIR + " @openai/codex@0.165.0", step["run"])
+        native = next(step for step in proof if "hosted_codex_sandbox_proof.py native" in step.get("run", ""))
+        self.assertIn("--codex " + setup.RUNTIME_DIR + "/bin/codex", native["run"])
+
     def test_provider_health_is_manual_main_only_and_keeps_provider_credentials_separate(self):
         workflow = yaml.load((e.ROOT / ".github/workflows/provider-health.yaml").read_text(), Loader=yaml.BaseLoader)
         self.assertEqual({"workflow_dispatch"}, set(workflow["on"]))

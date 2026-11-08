@@ -294,16 +294,14 @@ def codex_sessions(policy, bundle, default_workspace):
                           "configured; review incomplete, no paid retry")
     try:
         from . import review_codex_sessions as launcher
-        from .codex_identity_setup import SESSIONS_DIR
+        from .codex_identity_setup import RUNTIME_DIR, SESSIONS_DIR
     except ImportError:
         import review_codex_sessions as launcher
-        from codex_identity_setup import SESSIONS_DIR
-    codex, node = shutil.which("codex"), shutil.which("node")
-    if not codex or not node:
-        raise ReviewAbort("Codex or its runtime was not found for the isolated session launcher")
+        from codex_identity_setup import RUNTIME_DIR, SESSIONS_DIR
+    codex = RUNTIME_DIR + "/bin/codex"
     # The model account gets only the directories its launcher needs, each of which the launcher
     # then requires to be closed to the account, never the job's whole PATH.
-    trusted_path = ":".join(dict.fromkeys([os.path.dirname(codex), os.path.dirname(node), "/usr/bin", "/bin"]))
+    trusted_path = RUNTIME_DIR + "/bin:/usr/bin:/bin"
     sessions = launcher.CodexSessions(launcher.resolve_identity(user), codex=codex, trusted_path=trusted_path)
     sessions.verify()
     return sessions, Path(SESSIONS_DIR)
