@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import grp
+import json
 import os
 from pathlib import Path
 import pwd
@@ -74,7 +75,6 @@ RESIDUE_ROOTS = ("/",) + SCRATCH_DIRS
 # owner and creator UID, and ipcrm(1) removes them by id.
 IPC_KINDS = (("shm", "shmid", "-m"), ("msg", "msqid", "-q"), ("sem", "semid", "-s"))
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 
 class _System:
@@ -291,32 +291,6 @@ def launch_argv(identity, *, sudo, setpriv, codex, env, head, output, schema, mo
             "--config", 'default_permissions=":read-only"', "-"]
 
 
-def _open_dir(name, dir_fd, uid):
-    fd = os.open(name, _DIR, dir_fd=dir_fd)
-    try:
-        if os.fstat(fd).st_uid != uid:
-            raise ReviewAbort("Codex session files are unsafe or unreadable")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-def _read_regular(name, dir_fd, uid, max_bytes):
-    fd = os.open(name, _FILE, dir_fd=dir_fd)
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_size > max_bytes:
-            raise ReviewAbort("Codex session files are unsafe or unreadable")
-        data = stream.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise ReviewAbort("Codex session files are unsafe or unreadable")
-    try:
-        return data.decode("utf-8")
-    except UnicodeError:
-        raise ReviewAbort("Codex session files are unsafe or unreadable") from None
-
-
 class Session:
     """One fresh session tree. Created and torn down only by CodexSessions.session()."""
 
@@ -359,65 +333,39 @@ class Session:
         self._feeder.start()
         return self.process
 
-    def rollout_texts(self):
-        """(relative name, text) for every sessions/**/*.jsonl, read without following links."""
-        uid = self.owner.identity.uid
-        result = []
+    def _read_evidence(self, mode):
+        """Use the existing restricted UID hop to read that UID's private files.
 
-        def walk(fd, prefix):
-            for entry in sorted(os.scandir(fd), key=lambda e: e.name):
-                info = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    child = _open_dir(entry.name, fd, uid)
-                    try:
-                        walk(child, prefix + entry.name + "/")
-                    finally:
-                        os.close(child)
-                elif stat.S_ISREG(info.st_mode):
-                    if entry.name.endswith(".jsonl"):
-                        result.append((prefix + entry.name, _read_regular(entry.name, fd, uid, self.max_bytes)))
-                else:
-                    # Symlinks, FIFOs and sockets never occur in a genuine rollout tree.
-                    raise ReviewAbort("Codex session files are unsafe or unreadable")
-
+        The controller supplies the trusted reader source directly to isolated
+        Python, so neither the checkout nor the model's home supplies imports.
+        Reads share the invocation deadline and retain every original file guard.
+        """
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewAbort("Codex exceeded config.ai_timeout; no paid retry")
         try:
-            top = os.open(str(self.home), _DIR)
-        except OSError:
-            raise ReviewAbort("Codex session files are unsafe or unreadable") from None
-        try:
-            if os.fstat(top).st_uid != uid:
+            source = Path(__file__).with_name("review_codex_read.py").read_text(encoding="utf-8")
+            result = self.owner._identity_result(["/usr/bin/python3", "-I", "-c", source,
+                str(self.parent), str(self.owner.identity.uid), mode, str(self.max_bytes)], timeout=remaining)
+            if result.returncode:
                 raise ReviewAbort("Codex session files are unsafe or unreadable")
-            try:
-                sessions = _open_dir("sessions", top, uid)
-            except FileNotFoundError:
-                return []
-            try:
-                walk(sessions, "sessions/")
-            finally:
-                os.close(sessions)
-        except OSError:
+            return json.loads(result.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
             raise ReviewAbort("Codex session files are unsafe or unreadable") from None
-        finally:
-            os.close(top)
-        return result
+
+    def rollout_texts(self):
+        """(relative name, text) for every sessions/**/*.jsonl, without following links."""
+        data = self._read_evidence("rollouts")
+        if not isinstance(data, list) or any(not isinstance(pair, list) or len(pair) != 2
+                or any(not isinstance(value, str) for value in pair) for pair in data):
+            raise ReviewAbort("Codex session files are unsafe or unreadable")
+        return [tuple(pair) for pair in data]
 
     def read_output(self):
-        uid = self.owner.identity.uid
-        try:
-            directory = os.open(str(self.output.parent), _DIR)
-        except OSError:
-            raise ReviewAbort("Codex session files are unsafe or unreadable") from None
-        try:
-            if os.fstat(directory).st_uid != uid:
-                raise ReviewAbort("Codex session files are unsafe or unreadable")
-            try:
-                return _read_regular(OUTPUT_NAME, directory, uid, self.max_bytes)
-            except FileNotFoundError:
-                return None
-            except OSError:
-                raise ReviewAbort("Codex session files are unsafe or unreadable") from None
-        finally:
-            os.close(directory)
+        data = self._read_evidence("output")
+        if data is not None and not isinstance(data, str):
+            raise ReviewAbort("Codex session files are unsafe or unreadable")
+        return data
 
 
 class CodexSessions:
@@ -442,13 +390,18 @@ class CodexSessions:
     def _sudo(self, *args):
         return self._run([self.sudo, "-n", "--", *args])
 
-    def _as_identity(self, command):
-        """Run `command` with the session's exact credentials; return its exit status."""
+    def _identity_result(self, command, *, timeout=None):
+        """Run trusted helper code with the session's exact credentials and no account environment."""
         argv = [self.sudo, "-n", "--", "/usr/bin/env", "-i", "PATH=" + PRIVILEGED_PATH, self.setpriv,
                 f"--reuid={self.identity.uid}", f"--regid={self.identity.gid}", "--clear-groups",
                 "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
                 "--", *command]
-        return self._run(argv).returncode
+        return self._run(argv, cwd="/", stdin=subprocess.DEVNULL, close_fds=True,
+                         **({"timeout": timeout} if timeout is not None else {}))
+
+    def _as_identity(self, command):
+        """Run `command` with the session's exact credentials; return its exit status."""
+        return self._identity_result(command).returncode
 
     # -- checks ------------------------------------------------------------
     def verify(self):

@@ -113,7 +113,7 @@ class Host:
             command = inner[inner.index("--") + 1:]
             if command[:2] == ["/usr/bin/test", "-w"]:
                 return subprocess.CompletedProcess(args, 0 if command[2] in self.writable else 1, "", "")
-            return subprocess.run(command, capture_output=True, text=True, check=False)
+            return subprocess.run(command, capture_output=True, text=True, check=False, **kw)
         if inner[0] == "/usr/bin/install":
             *options, target = inner[1:]
             paths = [p for p in options if p.startswith("/")]
@@ -348,6 +348,59 @@ class ReaderTests(Base):
         (parent / "output" / s.OUTPUT_NAME).write_text('{"findings": []}')
         self.assertEqual([("sessions/2026/a.jsonl", '{"x": 1}\n')], session.rollout_texts())
         self.assertEqual('{"findings": []}', session.read_output())
+
+    def test_private_evidence_is_read_through_the_restricted_identity_hop(self):
+        from unittest.mock import patch
+        session, parent = self.session()
+        session.home.chmod(0o700)
+        path = parent / "codex-home" / "sessions" / "2026" / "a.jsonl"
+        path.write_text('{"x": 1}\n')
+        path.chmod(0o600)
+        with patch.object(self.sessions, "_run", wraps=self.host.run) as run:
+            self.assertEqual([("sessions/2026/a.jsonl", '{"x": 1}\n')], session.rollout_texts())
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(run.call_args.kwargs["close_fds"])
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
+        command = self.host.calls[-1]
+        self.assertIn(f"--reuid={self.identity.uid}", command)
+        self.assertIn("--clear-groups", command)
+        self.assertIn("--no-new-privs", command)
+        self.assertIn("--bounding-set=-all", command)
+        self.assertIn("--inh-caps=-all", command)
+        self.assertIn("--ambient-caps=-all", command)
+        python = command.index("/usr/bin/python3")
+        self.assertEqual(["-I", "-c"], command[python + 1:python + 3])
+        self.assertEqual([str(parent), str(self.identity.uid), "rollouts", "64"], command[-4:])
+
+    def test_reader_failure_malformed_output_and_expired_deadline_fail_closed(self):
+        from unittest.mock import patch
+        session, _ = self.session()
+        for mode, status, output in (("rollout_texts", 1, "[]"), ("rollout_texts", 0, "not json"),
+                                     ("rollout_texts", 0, "{}"), ("rollout_texts", 0, '[["path",3]]'),
+                                     ("read_output", 0, "[]")):
+            with self.subTest(mode=mode, output=output), \
+                    patch.object(self.sessions, "_identity_result", return_value=subprocess.CompletedProcess([], status, output, "")), \
+                    self.assertRaises(ReviewAbort):
+                getattr(session, mode)()
+        session.deadline = time.monotonic() - 1
+        with patch.object(self.sessions, "_identity_result", side_effect=AssertionError("expired reader started")), \
+                self.assertRaisesRegex(ReviewAbort, "ai_timeout"):
+            session.rollout_texts()
+
+    def test_reader_directory_and_file_ownership_guards_are_independent_of_the_uid_hop(self):
+        from scripts import review_codex_read as reader
+        _, parent = self.session()
+        path = parent / "output" / s.OUTPUT_NAME
+        path.write_text("{}")
+        with self.assertRaises(reader.Unsafe):
+            reader.open_dir(str(path.parent), None, ME + 1)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(reader.Unsafe):
+                reader.read_regular(s.OUTPUT_NAME, directory, ME + 1, 64)
+        finally:
+            os.close(directory)
 
     def test_missing_sessions_and_output_are_not_errors(self):
         session, parent = self.session()
@@ -739,13 +792,14 @@ class SetupTests(unittest.TestCase):
         from scripts import hosted_codex_sandbox_proof as proof
         # This negative state must remain unhosted when the suite itself runs in Actions.
         with patch.dict(os.environ, {}, clear=True), \
+                patch.object(setup.shutil, "which", return_value=None), \
+                patch.object(setup.sessions, "resolve_identity", side_effect=AssertionError("account lookup")), \
                 patch.object(setup, "execute", side_effect=AssertionError("privileged execution")):
-            with self.assertRaises(SystemExit) as caught:
-                setup.main(["provision", "--user", "agent-review-model"])
-            self.assertIn("GitHub-hosted", str(caught.exception))
-            with self.assertRaises(SystemExit) as caught:
-                setup.main(["runtime"])
-            self.assertIn("GitHub-hosted", str(caught.exception))
+            for arguments in (["provision", "--user", "agent-review-model"], ["runtime"],
+                              ["restrict-sockets", "--user", "fixture", "--action", "/fixture"],
+                              ["verify", "--user", "fixture", "--codex", "/fixture", "--trusted-path", "/usr/bin"]):
+                with self.subTest(command=arguments[0]), self.assertRaisesRegex(SystemExit, "GitHub-hosted"):
+                    setup.main(arguments)
             with self.assertRaises(SystemExit) as caught:
                 proof.main(["identity", "--user", "x", "--head", "/tmp"])
             self.assertIn("disposable GitHub-hosted", str(caught.exception))

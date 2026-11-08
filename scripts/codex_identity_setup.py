@@ -120,6 +120,8 @@ def main(argv=None):
     four.add_argument("--codex", required=True)
     four.add_argument("--trusted-path", required=True)
     args = parser.parse_args(argv)
+    if not args.print_plan:
+        refuse_unless_hosted()
     controller_uid, controller_gid = os.getuid(), os.getgid()
     if args.command == "provision":
         plan = provision_plan(args.user, args.sessions_dir, controller_uid, controller_gid)
@@ -133,7 +135,6 @@ def main(argv=None):
             except Exception:
                 identity = sessions.Identity(args.user, 60001, 60001)  # shown shape only; nothing runs
         elif args.command != "provision":
-            refuse_unless_hosted()
             identity = sessions.resolve_identity(args.user)
         if args.command == "restrict-sockets":
             plan = restrict_plan(identity, args.action, os.path.realpath(shutil.which("node") or "node"))
@@ -142,7 +143,6 @@ def main(argv=None):
     if args.print_plan:
         print(json.dumps(plan))
         return 0
-    refuse_unless_hosted()
     if args.command == "runtime":
         if Path(RUNTIME_DIR).exists() or Path(RUNTIME_DIR).is_symlink():
             raise SystemExit("Refusing: the runtime prefix already exists; it must be created by this job")
