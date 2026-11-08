@@ -85,6 +85,8 @@ jobs:
       learnings_identity: ${{ steps.plan.outputs.learnings_identity }}
       run_verification: ${{ steps.inference.outputs.run_verification }}
       learnings_revoke_failed: ${{ steps.learnings-revoke.outcome == 'failure' }}
+      # A fixed word the engine writes when it refuses an oversized change; the notifier maps it to text.
+      failure_reason: ${{ steps.plan.outputs.failure_reason || steps.inference.outputs.failure_reason }}
     steps:
     - name: Check out trusted base at workspace root
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -297,6 +299,24 @@ jobs:
         REVIEW_HEAD: ${{ needs.admit.outputs.head }}
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
+    # Only a change reviewed in several Codex sessions uses the dedicated identity; a single
+    # session keeps the pinned launcher. These steps must not fail a small review, so a failed
+    # step only leaves the multi-session path unavailable, and that path then refuses to start.
+    - name: Provision the isolated Codex session identity
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
+      continue-on-error: true
+      run: python trusted-agent-review/scripts/codex_identity_setup.py provision --user agent-review-model
+    - name: Restrict privileged sockets for that identity with the pinned action
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
+      continue-on-error: true
+      run: python trusted-agent-review/scripts/codex_identity_setup.py restrict-sockets --user agent-review-model --action trusted-codex-action
+    - name: Prepare the protected multi-session runtime
+      if: ${{ startsWith(env.REVIEW_DEPTH, 'codex') }}
+      continue-on-error: true
+      run: |
+        python trusted-agent-review/scripts/codex_identity_setup.py runtime
+        umask 022
+        npm install --global --prefix /var/lib/agent-review-runtime @openai/codex@0.165.0
     - name: Review the admitted diff
       id: inference
       env:
@@ -314,6 +334,7 @@ jobs:
         # It authenticates through the action's proxy, so it never receives this key.
         ANTHROPIC_API_KEY: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY || '' }}
         ANTHROPIC_API_KEY_2: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY_2 || '' }}
+        REVIEW_CODEX_SESSION_USER: ${{ startsWith(env.REVIEW_DEPTH, 'codex') && 'agent-review-model' || '' }}
       run: python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -816,6 +837,7 @@ jobs:
         REVIEW_BASE: ${{ needs.admit.outputs.base }}
         ADMISSION_RESULT: ${{ needs.admit.result }}
         LEARNINGS_REVOKE_FAILED: ${{ needs.review.outputs.learnings_revoke_failed == 'true' || needs.reply.outputs.learnings_revoke_failed == 'true' }}
+        REVIEW_FAILURE_REASON: ${{ needs.review.outputs.failure_reason }}
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-notifier/outcome.json
       shell: bash
       run: |
@@ -828,6 +850,21 @@ jobs:
 
         # The operation in progress, from a fixed vocabulary, for the failure record.
         where = ["start"]
+
+        # Wording for the reason codes scripts/review_reliability.py can emit, as notice text
+        # and what to do next. The review job output only selects a row; it never supplies text.
+        REASONS = {"sections_incomplete": (
+            "The requested diff review didn't complete because a review pass stopped before every section of the change "
+            "was reviewed (an allowance, the deadline, a provider stop or an invalid result), so nothing from the partial "
+            "pass was published. Treat this run as incomplete.",
+            " The Actions step summary shows how many invocations the pass finished; allowances change only through "
+            "the operator policy, then request a fresh review."),
+            "input_limit": (
+            "The requested diff review didn't complete because the change is larger than the configured review input limit "
+            "(max_model_tokens for this depth), and a partial review would leave coverage incomplete. "
+            "Treat this run as incomplete.",
+            " Shrink the change or have the configured limit changed before requesting another review; "
+            "repeating the command on this snapshot fails the same way.")}
 
 
         def record(error):
@@ -906,6 +943,8 @@ jobs:
             user = comment.get("user", {})
             issue = event.get("issue", {})
             revoke_failed = os.environ.get("LEARNINGS_REVOKE_FAILED") == "true"
+            # An exact match against the fixed table; any other value is ignored, never echoed.
+            reason = REASONS.get(os.environ.get("REVIEW_FAILURE_REASON", ""))
             command = (os.environ["GITHUB_EVENT_NAME"] == "issue_comment"
                     and os.environ["GITHUB_ACTOR"] == "luckyPipewrench"
                     and os.environ["GITHUB_ACTOR_ID"] == "142104046"
@@ -948,6 +987,7 @@ jobs:
                 return
             head, base = os.environ.get("REVIEW_HEAD", ""), os.environ.get("REVIEW_BASE", "")
             captured = bool(re.fullmatch(r"[0-9a-f]{40}", head) and re.fullmatch(r"[0-9a-f]{40}", base))
+            advice = None
             marker = f"<!-- agent-review-notice:v1 run={run_id} -->"
             if revoke_failed:
                 message = ("The requested review didn't complete because learnings-token revocation couldn't be confirmed. "
@@ -956,12 +996,16 @@ jobs:
                 message = "The requested diff review didn't complete because the commits changed."
             elif os.environ["ADMISSION_RESULT"] != "success" or not captured:
                 message = "The requested diff review never started. Treat this run as incomplete."
+            elif reason and not inline:
+                message, advice = reason
             else:
                 message = "The requested diff review didn't complete. Treat this run as incomplete."
             # An inline question is answered again by a new thread reply; review commands
             # are maintainer-only and start a whole-PR review instead.
             if inline:
                 message += " Inspect and fix the diagnosed cause before a new /ask in the review thread; Actions reruns are refused."
+            elif advice:
+                message += advice
             else:
                 message += " Inspect and fix the diagnosed cause before a fresh review command on the current snapshot; Actions reruns are refused."
             body = marker + "\n" + message
@@ -1094,7 +1138,7 @@ jobs:
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: agent-review-completion
-        path: ${{ runner.temp }}/agent-review-completion/completion.json
+        path: ${{ runner.temp }}/agent-review-completion
         if-no-files-found: ignore
   publish-reply:
     name: Publish verified inline answer

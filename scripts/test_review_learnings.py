@@ -370,12 +370,12 @@ class PromptTests(unittest.TestCase):
         (fx.root / "app.py").write_text("\n".join(lines) + "\n")
         fx.commit()
         policy = dict(engine_tests.POLICY, max_model_tokens=40000, max_output_tokens=1000)
-        self.assertIsNotNone(fx.bundle(policy)["files"][0]["content"])
+        self.assertEqual("full", fx.bundle(policy)["files"][0]["content"])
         learning = data(ENTRY.replace("This pattern is fine; evidence is checked in the parser.",
                                      "Check the parser with evidence. " * 300))
         bundle = fx.bundle(policy, learning_data=learning)
         self.assertEqual(1, bundle["learnings"]["count"])
-        self.assertIsNone(bundle["files"][0]["content"])
+        self.assertEqual("regions", bundle["files"][0]["content"])
         for prompt in (e.claude_prompt(bundle, "bundle"), e.claude_prompt(bundle, "callers"), e.codex_prompt(bundle)):
             self.assertLessEqual(e.token_bound(prompt + json.dumps(e.OUTPUT_SCHEMA)), l.allowance(policy))
         public = dict(bundle); public.pop("learnings_text")
@@ -397,6 +397,13 @@ class PromptTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    @staticmethod
+    def completion(fx):
+        """The complete record: the bounded root plus its verified pages."""
+        root = json.loads((fx.root / "completion.json").read_text())
+        pages = [path.read_bytes() for path in sorted((fx.root / "pages").glob("*.part"))]
+        return f.assemble(root, pages)
+
     def setUp(self):
         fixture = job_tests.JobTests()
         fixture.setUp()
@@ -710,7 +717,7 @@ class IntegrationTests(unittest.TestCase):
         else:
             fx.build([engine_tests.finding(path="app.py")])
             j.publish_artifact(fx.artifact, fx.head_dir)
-            proof = json.loads((fx.root / "completion.json").read_text())
+            proof = self.completion(fx)
             root = fx.pr.roots[0]
         # prior_threads/build consumes the snapshot. Subsequent preparations
         # must exercise actual learnings, not an absent snapshot.
@@ -808,7 +815,7 @@ class IntegrationTests(unittest.TestCase):
         fx.pr.writes.clear()
         fx.build()
         j.publish_artifact(fx.artifact, fx.head_dir)
-        record = json.loads((fx.root / "completion.json").read_text())
+        record = self.completion(fx)
         self.assertEqual("b" * 40, record["context"]["learnings"]["sha"])
         self.assertIn("Learnings: 1 loaded from agent-review-learnings@bbbbbbb",
                       fx.pr.comments[record["summary"]].body)
@@ -836,9 +843,11 @@ class IntegrationTests(unittest.TestCase):
             # shape, not a stale key or summary digest.
             broken["summary"] = 8
             broken["key"] = hashlib.sha256(json.dumps(broken["context"], sort_keys=True).encode()).hexdigest()
-            status, entries = comments(broken)
-            broken["digest"] = f.digest(entries[8].body)
-            status, entries = comments(broken)
+            # The comment carries the bounded root; the loader supplies the verified lists.
+            root = f.record_root(broken)
+            status, entries = comments(root)
+            broken["digest"] = root["digest"] = f.digest(entries[8].body)
+            status, entries = comments(root)
             with self.subTest(identity=identity), patch.object(
                     fx.pr, "get_issue_comments", return_value=list(entries.values())):
                 expected = {123: broken} if identity == ctx["learnings"] else {}

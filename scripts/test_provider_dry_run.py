@@ -40,6 +40,13 @@ def scenario(cli, mode):
             "fixture": {"command": "touch", "args": [str(sentinel)]}}}))
         steps = [("Read", {"file_path": str(head / "app.py")}),
                  ("StructuredOutput", {"findings": []})]
+        index_text = "file\tpath\tstate\tpatch_bytes\tsections\n0\t\"app.py\"\tpresent\t12\t0,1\n"
+        if mode == "store":
+            # The exact patch store lives under the checkout's git directory; restricted tools must read it.
+            store = head / ".git" / "agent-review"
+            store.mkdir(parents=True)
+            (store / "index.tsv").write_text(index_text)
+            steps = [("Read", {"file_path": str(store / "index.tsv")}), ("StructuredOutput", {"findings": []})]
         if mode == "schema":
             steps = [("StructuredOutput", {"invalid": True})]
         if mode == "tools":
@@ -161,6 +168,15 @@ def scenario(cli, mode):
                 parsed = e.claude_result(events, policy, {"files": [{"path": "app.py", "deleted": False}]},
                                         "bundle", head)
                 assert parsed["receipt"]["files_opened"] == ["app.py"]
+            elif mode == "store":
+                parsed = e.claude_result(events, policy, {"files": [{"path": "app.py", "deleted": False}]},
+                                        "bundle", head)
+                # The tool result carrying the index went back to the model, and the git-directory
+                # read is not a changed-file receipt.
+                # Read prefixes line numbers, so look for the index's own words in the returned content.
+                returned = json.dumps([m for r in requests for m in r.get("messages", [])])
+                assert "patch_bytes" in returned and "present" in returned, "index not delivered"
+                assert parsed["receipt"]["files_opened"] == []
             else:
                 try:
                     e.claude_result(events, policy, {"files": [{"path": "app.py", "deleted": False}]}, "bundle", head)
@@ -217,7 +233,8 @@ pathlib.Path(args[args.index('--output-last-message')+1]).write_text('{"findings
 ''')
         fake.chmod(0o755)
         with patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.environ["PATH"]}):
-            result = e.run_codex(e.policy("codex"), {"files": []}, "callers", head, action, home, root / "work")
+            result = e.run_codex(e.policy("codex"), {"files": []}, "callers", head, action, home, root / "work",
+                                 prompt="Inspect this fixture and return no findings.")
         assert result["findings"] == []
         assert result["receipt"]["turns"] == 1
         assert not list((root / "work").iterdir()), "disposable Codex pass was retained"
@@ -233,7 +250,7 @@ def main():
         parser.error("select --claude or --codex-action")
     if args.claude:
         cli = str(Path(args.claude).resolve())
-        for mode in ("normal", "tools", "turn", "budget", "api", "schema", "billing", "billing-both", "billing-after-output"):
+        for mode in ("normal", "store", "tools", "turn", "budget", "api", "schema", "billing", "billing-both", "billing-after-output"):
             scenario(cli, mode)
     if args.codex_action:
         codex_scenario(args.codex_action.resolve())
