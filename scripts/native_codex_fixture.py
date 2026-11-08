@@ -25,8 +25,10 @@ import threading
 
 try:
     from . import review_engine as engine
+    from . import review_codex_read as evidence
 except ImportError:
     import review_engine as engine
+    import review_codex_read as evidence
 
 PINNED_VERSION = "codex-cli 0.165.0"
 PROVIDER = "codex-action-responses-proxy"
@@ -395,8 +397,10 @@ def local_proof(codex):
                                              text=True, timeout=settings["ai_timeout"], check=False)
                     if process.returncode:
                         raise FixtureFailure("Native CLI failed; no sandbox or receipt pass is claimed")
-                    result = fixture.assert_complete(output=output.read_text(),
-                        rollout_texts=[(str(p.relative_to(chome)), p.read_text()) for p in chome.glob("sessions/**/*.jsonl")])
+                    room = shutil.disk_usage(root).free
+                    result = fixture.assert_complete(
+                        output=evidence.output(parent, output.name, os.getuid(), room),
+                        rollout_texts=evidence.rollouts(chome, os.getuid(), room))
                     print(json.dumps({"version": PINNED_VERSION, "scope": "current-uid-only", **result}, sort_keys=True))
                 previous = parent
 

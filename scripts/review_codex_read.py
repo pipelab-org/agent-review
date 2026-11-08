@@ -9,6 +9,7 @@ original openat(2) and stat(2) contract, with getuid(2) verifying the helper's i
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -40,10 +41,15 @@ def read_regular(name, dir_fd, uid, max_bytes):
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_size > max_bytes:
             raise Unsafe
-        data = stream.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise Unsafe
-    return data.decode("utf-8")
+        # Free disk space is a storage ceiling, not an allocation size. Python's
+        # standard I/O buffer keeps each read independent of that ceiling.
+        chunks, size = [], 0
+        while chunk := stream.read(min(io.DEFAULT_BUFFER_SIZE, max_bytes + 1 - size)):
+            size += len(chunk)
+            if size > max_bytes:
+                raise Unsafe
+            chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8")
 
 
 def rollouts(home, uid, max_bytes):

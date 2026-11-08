@@ -349,6 +349,49 @@ class ReaderTests(Base):
         self.assertEqual([("sessions/2026/a.jsonl", '{"x": 1}\n')], session.rollout_texts())
         self.assertEqual('{"findings": []}', session.read_output())
 
+    def test_large_storage_allowance_does_not_preallocate_it(self):
+        from unittest.mock import patch
+        from scripts import review_codex_read as reader
+        _, parent = self.session()
+        path = parent / "output" / s.OUTPUT_NAME
+        path.write_text('{"findings": []}')
+        real_fdopen = os.fdopen
+
+        @contextlib.contextmanager
+        def guarded_fdopen(fd, mode):
+            with real_fdopen(fd, mode) as stream:
+                def read(size):
+                    self.assertLessEqual(size, io.DEFAULT_BUFFER_SIZE,
+                                         "read allocation must not scale with free disk space")
+                    return stream.read(size)
+                yield NS(fileno=stream.fileno, read=read)
+
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with patch.object(reader.os, "fdopen", side_effect=guarded_fdopen):
+                self.assertEqual('{"findings": []}',
+                                 reader.read_regular(s.OUTPUT_NAME, directory, ME, 1 << 50))
+        finally:
+            os.close(directory)
+
+    def test_buffered_evidence_reads_preserve_unicode_and_refuse_growth_past_bound(self):
+        from unittest.mock import patch
+        from scripts import review_codex_read as reader
+        _, parent = self.session()
+        path = parent / "output" / s.OUTPUT_NAME
+        payload = ("abc\U0001f600" * io.DEFAULT_BUFFER_SIZE).encode()
+        path.write_bytes(payload)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self.assertEqual(payload.decode(), reader.read_regular(s.OUTPUT_NAME, directory, ME, len(payload)))
+            # fstat precedes reads. A growing file must still obey the original byte bound.
+            info = os.stat(path)
+            path.write_bytes(payload + b"x")
+            with patch.object(reader.os, "fstat", return_value=info), self.assertRaises(reader.Unsafe):
+                reader.read_regular(s.OUTPUT_NAME, directory, ME, len(payload))
+        finally:
+            os.close(directory)
+
     def test_private_evidence_is_read_through_the_restricted_identity_hop(self):
         from unittest.mock import patch
         session, parent = self.session()
