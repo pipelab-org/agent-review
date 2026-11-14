@@ -96,6 +96,17 @@ class AllowanceTests(unittest.TestCase):
 
 
 class PassTests(Repo):
+    def test_section_turn_exhaustion_keeps_the_reason_and_completed_counters(self):
+        bundle = self.bundle()
+        self.assertGreater(len(bundle["sections"]), 1)
+        policy = dict(SMALL, max_turns=2, max_budget_usd=50.0)
+        with self.assertRaises(e.IncompleteReviewAbort) as caught:
+            e.run_pass(policy, bundle, "bundle", self.root, self.invoke_factory())
+        diagnostic = e.reliability.diagnostic(caught.exception)
+        self.assertEqual("turn_limit", diagnostic["reason"])
+        self.assertEqual({"strategy": "bundle", "completed": 1, "total": len(bundle["sections"]) + 1},
+                         diagnostic["progress"])
+
     def invoke_factory(self, outputs=None, record=None):
         outputs = outputs or {}
         calls = record if record is not None else []

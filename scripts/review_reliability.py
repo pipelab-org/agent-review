@@ -399,7 +399,7 @@ def diagnostic(error, failed_phase=None):
     entry = {"phase": phase_name if phase_name in PHASES else "configuration"}
     if reason(error):
         entry["reason"] = reason(error)
-    progress = getattr(error, "progress", None) if reason(error) == "sections_incomplete" else None
+    progress = getattr(error, "progress", None) if reason(error) in ("sections_incomplete", "turn_limit") else None
     # Counters only: a strategy name from the fixed vocabulary and two integers.
     if (isinstance(progress, dict) and set(progress) == {"strategy", "completed", "total"}
             and progress["strategy"] in ("bundle", "callers")

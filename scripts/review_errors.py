@@ -39,6 +39,8 @@ class IncompleteReviewAbort(ReviewAbort, reliability.Reasoned):
 
     reason = "sections_incomplete"
 
-    def __init__(self, message, progress=None):
+    def __init__(self, message, progress=None, *, stop_reason=None):
         super().__init__(message)
         self.progress = progress
+        if stop_reason == "turn_limit":
+            self.reason = "turn_limit"

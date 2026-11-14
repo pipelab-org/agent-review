@@ -202,7 +202,7 @@ class CallerTests(unittest.TestCase):
         self.assertEqual('true', caller['jobs']['acknowledge']['with']['progress_only'])
         self.assertNotIn('secrets', caller['jobs']['acknowledge'])
         condition = WORKFLOW['jobs']['notify-failure']['if']
-        self.assertTrue(condition.startswith('always() && ((' + gate + ') && ('))
+        self.assertTrue(condition.startswith('always() && !inputs.progress_only && ((' + gate + ') && ('))
         self.assertTrue(condition.endswith("(" + reply_gate + ") && needs.reply.outputs.learnings_revoke_failed == 'true')"))
 
     def test_progress_is_best_effort_and_a_cancelled_run_starts_nothing_new(self):
@@ -213,8 +213,15 @@ class CallerTests(unittest.TestCase):
         self.assertTrue(caller['jobs']['review']['if'].startswith('!cancelled() &&'))
         self.assertNotIn('always()', caller['jobs']['review']['if'])
         jobs = WORKFLOW['jobs']
-        self.assertTrue(jobs['progress']['if'].startswith('${{ !cancelled() && '))
-        self.assertNotIn('always()', jobs['progress']['if'])
+        self.assertTrue(jobs['progress']['if'].startswith('${{ always() && '))
+        self.assertIn('(inputs.progress_only && inputs.progress_cancelled)', jobs['progress']['if'])
+        self.assertIn("(!cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true'))",
+                      jobs['progress']['if'])
+        terminal = caller['jobs']['cancelled']
+        self.assertEqual(['acknowledge', 'review'], terminal['needs'])
+        self.assertTrue(terminal['if'].startswith('cancelled() &&'))
+        self.assertEqual({'progress_only': 'true', 'progress_cancelled': 'true'}, terminal['with'])
+        self.assertNotIn('secrets', terminal)
         review = jobs['review']['if']
         self.assertTrue(review.startswith('${{ !cancelled() && '))
         for required in ("needs.source.result == 'success'", "needs.admit.result == 'success'",

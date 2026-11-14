@@ -523,7 +523,9 @@ class Allowance:
     def charge(self, receipt):
         self.turns += receipt["turns"]
         self.costs.append(receipt["cost_usd"])
-        if self.turns > self.settings["max_turns"] or self.spent() > self.settings["max_budget_usd"]:
+        if self.turns > self.settings["max_turns"]:
+            raise TurnLimitAbort("Pass exceeded its cumulative review_depth allowance; review incomplete")
+        if self.spent() > self.settings["max_budget_usd"]:
             raise ReviewAbort("Pass exceeded its cumulative review_depth allowance; review incomplete")
 
 
@@ -575,7 +577,8 @@ def run_pass(settings, bundle, strategy, head, invoke, *, clock=time.monotonic):
             raise
         raise IncompleteReviewAbort(
             f"{error}; pass {strategy} completed {len(records)} of {len(plan)} invocations and nothing was published",
-            {"strategy": strategy, "completed": len(records), "total": len(plan)}) from None
+            {"strategy": strategy, "completed": len(records), "total": len(plan)},
+            stop_reason=reliability.reason(error)) from None
     return records
 
 
@@ -810,6 +813,20 @@ def claude_failure_cause(events):
     return f"{text} (claude {label}{suffix}); no paid retry"
 
 
+
+def claude_abort(events, fallback):
+    """Carry a turn stop from the CLI's fixed result enums, never its error text."""
+    final = next((event for event in reversed(events) if isinstance(event, dict)
+                  and event.get("type") == "result"), {})
+    terminal = final.get("terminal_reason")
+    # The terminal reason takes precedence over a contradictory subtype, as in the
+    # existing fixed diagnostic renderer. Unknown shapes classify nothing.
+    known_terminal = isinstance(terminal, str) and terminal in CLAUDE_TERMINAL_CAUSES
+    turns = terminal == "max_turns" or (not known_terminal and final.get("subtype") == "error_max_turns")
+    kind = TurnLimitAbort if turns else ReviewAbort
+    return kind(claude_failure_cause(events) or fallback)
+
+
 def lenient_events(stdout):
     """Parse what a failed pass printed; malformed lines carry no classification."""
     events = []
@@ -896,8 +913,7 @@ def claude_result(events, settings, bundle, strategy, head, *, validate_output=v
         raise ReviewAbort("Claude result missing, extra, or truncated; inspect provider output")
     final = results[0]
     if final.get("subtype") != "success" or final.get("is_error") is not False:
-        raise ReviewAbort(claude_failure_cause(events)
-                          or "Claude stopped on a turn/budget/API/output limit; inspect max_turns and max_budget_usd")
+        raise claude_abort(events, "Claude stopped on a turn/budget/API/output limit; inspect max_turns and max_budget_usd")
     model = settings["model"].removeprefix("anthropic/")
     if model not in final.get("modelUsage", {}):
         raise ReviewAbort("Claude transcript does not attest the configured model")
@@ -1154,8 +1170,8 @@ def run_claude(settings, bundle, strategy, head, prompt=None, schema=OUTPUT_SCHE
         break
     credentials.started = True
     if result.returncode:
-        raise ReviewAbort(claude_failure_cause(lenient_events(result.stdout))
-                          or "Claude API/turn/budget/output failure; inspect approved limits and provider account")
+        raise claude_abort(lenient_events(result.stdout),
+                           "Claude API/turn/budget/output failure; inspect approved limits and provider account")
     events = [strict_json(line) for line in result.stdout.splitlines() if line.strip()]
     if not events or any(not isinstance(e, dict) for e in events):
         raise ReviewAbort("Invalid Claude transcript")
@@ -1602,7 +1618,7 @@ def _run_codex(settings, bundle, strategy, head, action, home, workspace, *, pro
             diagnostic = (diagnostic + chunk)[-65536:]
             turns, _, _, cost = codex_progress(home, head, model=settings["model"], request_limit=limit, ignore=earlier)
             if turns > settings["max_turns"]:
-                raise ReviewAbort("Codex reached the review_depth max_turns; pass incomplete")
+                raise TurnLimitAbort("Codex reached the review_depth max_turns; pass incomplete")
             if cost is not None and cost > settings["max_budget_usd"]:
                 raise ReviewAbort("Codex reached the review_depth max_budget_usd; pass incomplete")
             if not chunk:
@@ -1670,7 +1686,7 @@ def _run_isolated(settings, bundle, strategy, head, home, workspace, sessions, *
                 turns, _, _, cost = codex_progress(session.home, head, model=settings["model"], request_limit=limit,
                                                    texts=session.rollout_texts())
                 if turns > settings["max_turns"]:
-                    raise ReviewAbort("Codex reached the review_depth max_turns; pass incomplete")
+                    raise TurnLimitAbort("Codex reached the review_depth max_turns; pass incomplete")
                 if cost is not None and cost > settings["max_budget_usd"]:
                     raise ReviewAbort("Codex reached the review_depth max_budget_usd; pass incomplete")
             # Output the launcher wrote just before exiting is still in the pipe; read what is ready

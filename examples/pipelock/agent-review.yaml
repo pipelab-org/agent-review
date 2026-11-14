@@ -70,3 +70,28 @@ jobs:
       ORG_MEMBERS_TOKEN: ${{ secrets.ORG_MEMBERS_TOKEN }}
       AGENT_REVIEW_LEARNINGS_APP_ID: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_ID }}
       AGENT_REVIEW_LEARNINGS_APP_KEY: ${{ secrets.AGENT_REVIEW_LEARNINGS_APP_KEY }}
+  cancelled:
+    needs: [acknowledge, review]
+    if: >-
+      cancelled() &&
+      (github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.actor == 'luckyPipewrench' &&
+      github.actor_id == '142104046' &&
+      github.run_attempt == '1' &&
+      github.triggering_actor == 'luckyPipewrench' &&
+      github.event.comment.user.login == 'luckyPipewrench' &&
+      github.event.comment.user.id == 142104046 &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.author_association == 'MEMBER' &&
+      github.event.issue.pull_request &&
+      contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body))
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: pipelab-org/agent-review/.github/workflows/agent-review-reusable.yaml@<full-40-char-commit-sha> # main
+    with:
+      progress_only: true
+      progress_cancelled: true

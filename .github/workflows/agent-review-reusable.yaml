@@ -6,6 +6,10 @@ name: Reusable agentic review
         description: Acknowledge the command outside the per-PR review queue
         type: boolean
         default: false
+      progress_cancelled:
+        description: Report cancellation after the queued review invocation has ended
+        type: boolean
+        default: false
     secrets:
       ANTHROPIC_API_KEY:
         required: false
@@ -74,8 +78,8 @@ jobs:
   progress:
     name: Show review progress
     needs: [source, admit]
-    # Not always(): a cancelled run must not post "started" after the failure notice.
-    if: ${{ !cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true') && github.event_name == 'issue_comment' }}
+    # Only the caller's terminal writer may run after cancellation; it cannot start inference.
+    if: ${{ always() && ((inputs.progress_only && inputs.progress_cancelled) || (!cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true'))) && github.event_name == 'issue_comment' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -86,6 +90,7 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         PROGRESS_ONLY: ${{ inputs.progress_only }}
+        PROGRESS_CANCELLED: ${{ inputs.progress_cancelled }}
       run: |
         python3 - <<'PY'
         import json
@@ -137,8 +142,12 @@ jobs:
                     and comment.get("created_at") is not None and comment["created_at"] == comment.get("updated_at")
                     and all(live.get("user", {}).get(k) == user[k] for k in ("id", "login", "type"))):
                 return
+            terminal = env.get("PROGRESS_CANCELLED") == "true"
+            if terminal and env.get("PROGRESS_ONLY") != "true":
+                return
             marker = f"<!-- agent-review-notice:v1 run={run} -->"
-            message = ("Review request accepted and queued. No completed review yet."
+            message = ("Review run cancelled. This notice does not establish completed coverage; inspect Actions for any published result."
+                       if terminal else "Review request accepted and queued. No completed review yet."
                        if env.get("PROGRESS_ONLY") == "true" else
                        "Review started: preparing the captured diff and running the configured passes. No completed review yet.")
             body = marker + "\n" + message + f"\n\n[Actions run](https://github.com/{repo}/actions/runs/{run})."
@@ -917,7 +926,7 @@ jobs:
     - publish
     - reply
     if: |-
-      always() && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
+      always() && !inputs.progress_only && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
           needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || cancelled()) ||
           (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve'))) && needs.reply.outputs.learnings_revoke_failed == 'true')

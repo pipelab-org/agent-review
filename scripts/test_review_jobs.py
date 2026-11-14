@@ -505,6 +505,46 @@ class JobTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(["POST"], [method for method, _ in run(existing=[foreign])])
 
+    def test_caller_cancellation_updates_the_queued_notice(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        script = workflow["jobs"]["progress"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        marker = "<!-- agent-review-notice:v1 run=123 -->\n"
+        existing = {"id": 77, "body": marker + "Review request accepted and queued.", "user": f.BOT}
+        writes = []
+        def request(req, **kwargs):
+            if req.method == "GET":
+                data = ({"state": "open", "head": {"repo": {"full_name": self.repo.full_name, "fork": False}},
+                         "base": {"repo": {"full_name": self.repo.full_name}}}
+                        if "/pulls/" in req.full_url else self.event["comment"]
+                        if "/issues/comments/9" in req.full_url else [existing])
+            else:
+                writes.append((req.method, req.full_url, json.loads(req.data)["body"]))
+                data = {}
+            return io.BytesIO(json.dumps(data).encode())
+        with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true", "PROGRESS_CANCELLED": "true"}), \
+                patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertEqual(1, len(writes))
+            self.assertEqual(("PATCH", "https://api.github.com/repos/example/project/issues/comments/77"), writes[0][:2])
+            self.assertIn("Review run cancelled", writes[0][2])
+            self.assertNotIn("Review started", writes[0][2])
+            os.environ["PROGRESS_ONLY"] = "false"
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertEqual(1, len(writes), "a regular invocation cannot claim terminal-writer authority")
+
+    def test_native_claude_turn_stops_keep_the_fixed_reason(self):
+        cases = [{"subtype": "error_max_turns"}, {"terminal_reason": "max_turns"}]
+        for fields in cases:
+            events = [{"type": "result", "is_error": True, "private_error": "SECRET-sentinel", **fields}]
+            with self.subTest(fields=fields), self.assertRaises(e.TurnLimitAbort) as caught:
+                e.claude_result(events, POLICY, {}, "bundle", self.head_dir)
+            self.assertEqual("turn_limit", e.reliability.reason(caught.exception))
+            self.assertNotIn("SECRET-sentinel", str(caught.exception))
+        other = e.claude_abort([{"type": "result", "terminal_reason": "budget_exhausted",
+                                 "subtype": "error_max_turns"}], "fixed fallback")
+        self.assertNotIsInstance(other, e.TurnLimitAbort)
+
     def test_publication_rechecks_commits_after_inference(self):
         self.build()
         self.pr.head.sha = "e" * 40

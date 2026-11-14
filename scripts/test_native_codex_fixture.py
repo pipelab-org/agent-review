@@ -36,7 +36,12 @@ class NativeFixtureTests(unittest.TestCase):
         conn = http.client.HTTPConnection("127.0.0.1", self.api.api.server_port, timeout=2)
         try:
             headers = {"Authorization": "Bearer fixture-only", "Content-Type": "application/json", **extra}
-            conn.request(method, path, body=body, headers=headers)
+            try:
+                conn.request(method, path, body=body, headers=headers)
+            except BrokenPipeError:
+                # A header-level refusal can close the receive side before sendall
+                # finishes. Still require and verify the actual HTTP response below.
+                pass
             response = conn.getresponse()
             return response.status, response.read()
         finally:
