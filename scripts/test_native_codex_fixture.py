@@ -8,7 +8,7 @@ import socket
 import tempfile
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
     from . import native_codex_fixture as fixture
@@ -38,7 +38,7 @@ class NativeFixtureTests(unittest.TestCase):
             headers = {"Authorization": "Bearer fixture-only", "Content-Type": "application/json", **extra}
             try:
                 conn.request(method, path, body=body, headers=headers)
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 # A header-level refusal can close the receive side before sendall
                 # finishes. Still require and verify the actual HTTP response below.
                 pass
@@ -76,6 +76,20 @@ class NativeFixtureTests(unittest.TestCase):
                 self.assertEqual(self.request(data)[0], 400)
         self.assertEqual(self.request(b"{}", Authorization="Bearer not-the-fixture")[0], 400)
         self.assertEqual(self.api._active["step"], 0)
+
+    def test_early_send_refusals_still_require_the_actual_http_response(self):
+        for error in (BrokenPipeError, ConnectionResetError):
+            with self.subTest(error=error.__name__):
+                connection = Mock()
+                connection.request.side_effect = error()
+                response = connection.getresponse.return_value
+                response.status = 400
+                response.read.return_value = b""
+                with patch("http.client.HTTPConnection", return_value=connection):
+                    self.assertEqual((400, b""), self.request(b"oversized-body"))
+                connection.getresponse.assert_called_once_with()
+                response.read.assert_called_once_with()
+                connection.close.assert_called_once_with()
 
     def test_missing_native_delivery_and_failed_command_do_not_advance(self):
         request = self.initial()
