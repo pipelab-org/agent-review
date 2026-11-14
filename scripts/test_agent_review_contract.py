@@ -195,10 +195,41 @@ class CallerTests(unittest.TestCase):
     def test_every_job_repeats_the_exact_admission_gate(self):
         gate = WORKFLOW['jobs']['admit']['if']
         reply_gate = WORKFLOW['jobs']['reply']['if']
-        self.assertEqual(f'({gate}) || ({reply_gate})', WORKFLOW['jobs']['source']['if'])
+        self.assertEqual('${{ !inputs.progress_only && (' + f'({gate}) || ({reply_gate})' + ') }}',
+                         WORKFLOW['jobs']['source']['if'])
+        caller = yaml.load(contract.EXPECTED_CALLER, Loader=yaml.BaseLoader)
+        self.assertEqual('acknowledge', caller['jobs']['review']['needs'])
+        self.assertEqual('true', caller['jobs']['acknowledge']['with']['progress_only'])
+        self.assertNotIn('secrets', caller['jobs']['acknowledge'])
         condition = WORKFLOW['jobs']['notify-failure']['if']
-        self.assertTrue(condition.startswith('always() && ((' + gate + ') && ('))
+        self.assertTrue(condition.startswith('always() && !inputs.progress_only && ((' + gate + ') && ('))
         self.assertTrue(condition.endswith("(" + reply_gate + ") && needs.reply.outputs.learnings_revoke_failed == 'true')"))
+
+    def test_progress_is_best_effort_and_a_cancelled_run_starts_nothing_new(self):
+        # always() keeps running jobs after a normal cancel; !cancelled() does not, and unlike
+        # the implicit success() it tolerates a failed status job instead of silently skipping
+        # the review with no notice. GitHub's expression engine is not run here: this pins the text.
+        caller = yaml.load(contract.EXPECTED_CALLER, Loader=yaml.BaseLoader)
+        self.assertTrue(caller['jobs']['review']['if'].startswith('!cancelled() &&'))
+        self.assertNotIn('always()', caller['jobs']['review']['if'])
+        jobs = WORKFLOW['jobs']
+        self.assertTrue(jobs['progress']['if'].startswith('${{ always() && '))
+        self.assertIn('(inputs.progress_only && inputs.progress_cancelled)', jobs['progress']['if'])
+        self.assertIn("(!cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true'))",
+                      jobs['progress']['if'])
+        terminal = caller['jobs']['cancelled']
+        self.assertEqual(['acknowledge', 'review'], terminal['needs'])
+        self.assertTrue(terminal['if'].startswith('cancelled() &&'))
+        self.assertEqual({'progress_only': 'true', 'progress_cancelled': 'true'}, terminal['with'])
+        self.assertNotIn('secrets', terminal)
+        review = jobs['review']['if']
+        self.assertTrue(review.startswith('${{ !cancelled() && '))
+        for required in ("needs.source.result == 'success'", "needs.admit.result == 'success'",
+                         "needs.admit.outputs.admitted == 'true'"):
+            self.assertIn(required, review)
+        self.assertNotIn('needs.progress', review)
+        # The notifier is the last writer of the shared run comment.
+        self.assertIn('progress', jobs['notify-failure']['needs'])
 
 
     def test_engine_dependencies_install_before_any_step_that_imports_them(self):
@@ -413,7 +444,7 @@ class ReporterTests(unittest.TestCase):
 
     def test_reporter_is_host_only_and_minimally_privileged(self):
         job = WORKFLOW['jobs']['notify-failure']
-        self.assertEqual(['source', 'admit', 'review', 'codex-verification', 'publish', 'reply'], job['needs'])
+        self.assertEqual(['source', 'admit', 'progress', 'review', 'codex-verification', 'publish', 'reply'], job['needs'])
         self.assertIn('always()', job['if'])
         self.assertEqual({'pull-requests': 'write'}, job['permissions'])
         self.assertNotIn('container', job)

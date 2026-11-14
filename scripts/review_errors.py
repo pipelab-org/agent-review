@@ -23,6 +23,12 @@ class InputLimitAbort(ReviewAbort, reliability.Reasoned):
     reason = "input_limit"
 
 
+class TurnLimitAbort(ReviewAbort, reliability.Reasoned):
+    """The configured turn allowance stopped a review; no provider text is public."""
+
+    reason = "turn_limit"
+
+
 class IncompleteReviewAbort(ReviewAbort, reliability.Reasoned):
     """A logical pass stopped before every required section completed.
 
@@ -33,6 +39,8 @@ class IncompleteReviewAbort(ReviewAbort, reliability.Reasoned):
 
     reason = "sections_incomplete"
 
-    def __init__(self, message, progress=None):
+    def __init__(self, message, progress=None, *, stop_reason=None):
         super().__init__(message)
         self.progress = progress
+        if stop_reason == "turn_limit":
+            self.reason = "turn_limit"

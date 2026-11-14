@@ -97,7 +97,7 @@ class Pull:
         self.reviews[id] = NS(id=id, user=NS(**f.BOT), commit_id=commit, state="COMMENTED")
         root = Comment(len(self.roots) + 300, body, NS(**f.BOT),
                        {"pull_request_review_id": id, "original_commit_id": commit, "commit_id": commit,
-                        "line": None, "subject_type": "file", **self.file_thread_overrides},
+                        "line": 1, "original_line": 1, "subject_type": "file", **self.file_thread_overrides},
                        path=path, commit_id=commit)
         self.roots.append(root)
         self.threads[root.id] = {"id": "THREAD_" + str(root.id), "isResolved": False, "isOutdated": False}
@@ -350,6 +350,200 @@ class JobTests(unittest.TestCase):
             j.publish_artifact(self.artifact, self.head_dir)
         self.assertFalse((self.root / "completion.json").exists())
         self.assertFalse(any("state=success" in c.body for c in self.pr.comments.values()))
+
+    def test_inline_publication_accepts_github_comment_order_but_not_duplicates(self):
+        requests = [{"path": path, "line": 1, "side": "RIGHT", "body": path}
+                    for path in ("app.py", "helper.py")]
+        original = self.pr.get_review_comments
+        self.pr.get_review_comments = lambda: list(reversed(original()))
+        roots = []
+        publisher = j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, roots)
+        publisher(commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
+        self.assertEqual(2, len(roots))
+        self.pr.get_review_comments = lambda: [original()[-1], original()[-1]]
+        with self.assertRaisesRegex(e.ReviewAbort, "publication verification failed"):
+            j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, [])(
+                commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
+
+    def test_inline_publication_pairs_each_request_with_exactly_one_returned_comment(self):
+        def publish(requests, returned):
+            self.setUp()
+            self.pr.get_review_comments = lambda: returned(self.pr.roots)
+            roots = []
+            result = j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, roots)(
+                commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
+            return result, roots
+        def request(path, body):
+            return {"path": path, "line": 1, "side": "RIGHT", "body": body}
+        def twin(root):
+            other = copy.copy(root)
+            other.id = root.id + 500
+            return other
+        # The same text on two files is paired by path, whichever order GitHub lists them.
+        _, roots = publish([request("app.py", "same"), request("helper.py", "same")], lambda found: found[::-1])
+        self.assertEqual({"app.py", "helper.py"}, {root["path"] for root in roots})
+        cases = {
+            "one comment listed twice": ([request("app.py", "same")] * 2, lambda found: [found[0], found[0]]),
+            "a new id repeating another comment": ([request("app.py", "x"), request("app.py", "y")],
+                                                   lambda found: [found[0], twin(found[0])]),
+            "a missing comment": ([request("app.py", "x"), request("app.py", "y")], lambda found: found[:1]),
+            "an extra comment": ([request("app.py", "x")], lambda found: [found[0], twin(found[0])]),
+        }
+        for name, (requests, returned) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(e.ReviewAbort, "publication (verification failed|was partial)"):
+                publish(requests, returned)
+
+    def test_progress_acknowledges_only_live_commands_and_updates_the_same_comment(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        job = workflow["jobs"]["progress"]
+        self.assertEqual({"pull-requests": "write"}, job["permissions"])
+        self.assertIn("inputs.progress_only", workflow["concurrency"]["group"])
+        self.assertIn("!inputs.progress_only", workflow["jobs"]["source"]["if"])
+        self.assertIn("progress", workflow["jobs"]["review"]["needs"])
+        script = job["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        writes, posted = [], []
+        live = copy.deepcopy(self.event["comment"])
+        pr = {"state": "open", "head": {"repo": {"full_name": self.repo.full_name, "fork": False}},
+              "base": {"repo": {"full_name": self.repo.full_name}}}
+        def request(req, **kwargs):
+            if req.method == "GET":
+                data = pr if "/pulls/" in req.full_url else live if "/issues/comments/9" in req.full_url else posted
+            else:
+                writes.append((req.method, json.loads(req.data)["body"]))
+                data = {"id": 77, "body": writes[-1][1], "user": f.BOT}
+                posted[:] = [data]
+            return io.BytesIO(json.dumps(data).encode())
+        with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true"}), \
+                patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertIn("accepted and queued", writes[-1][1])
+            os.environ["PROGRESS_ONLY"] = "false"
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertEqual(["POST", "PATCH"], [method for method, _ in writes])
+            self.assertIn("Review started", writes[-1][1])
+            live["body"] = "/review deep"
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertEqual(2, len(writes))
+        # A queued comment must become the verified terminal status, not linger as running.
+        self.pr.comments[77] = Comment(77, posted[0]["body"], NS(**f.BOT))
+        self.build()
+        j.publish_artifact(self.artifact, self.head_dir)
+        self.assertIn("state=success", self.pr.comments[77].body)
+
+    def test_progress_writes_nothing_for_an_ineligible_command_or_a_foreign_comment(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        script = workflow["jobs"]["progress"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        def run(event=None, env=None, pr=None, live=None, existing=()):
+            body = copy.deepcopy(self.event)
+            for key, value in (event or {}).items():
+                if key.startswith("comment."):
+                    body["comment"][key.split(".", 1)[1]] = value
+                else:
+                    body[key] = value
+            path = self.root / "progress-event.json"
+            path.write_text(json.dumps(body))
+            current = {"state": "open", "head": {"repo": {"full_name": self.repo.full_name, "fork": False}},
+                       "base": {"repo": {"full_name": self.repo.full_name}}}
+            current.update(pr or {})
+            fetched = {**copy.deepcopy(body["comment"]), **(live or {})}
+            writes = []
+            def request(req, **kwargs):
+                if req.method != "GET":
+                    writes.append((req.method, req.full_url))
+                    return io.BytesIO(b"{}")
+                if "/pulls/" in req.full_url:
+                    return io.BytesIO(json.dumps(current).encode())
+                if "/issues/comments/9" in req.full_url:
+                    return io.BytesIO(json.dumps(fetched).encode())
+                return io.BytesIO(json.dumps(list(existing)).encode())
+            with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true",
+                                         "GITHUB_EVENT_PATH": str(path), **(env or {})}),                     patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
+                exec(compile(script, "<trusted-progress>", "exec"), {})
+            return writes
+        self.assertEqual(["POST"], [method for method, _ in run()], "the valid baseline must acknowledge")
+        later = "2026-10-28T00:00:01Z"
+        for name, kwargs in {
+            "closed": {"pr": {"state": "closed"}},
+            "fork": {"pr": {"head": {"repo": {"full_name": self.repo.full_name, "fork": True}}}},
+            "deleted fork": {"pr": {"head": {"repo": None}}},
+            "other head repo": {"pr": {"head": {"repo": {"full_name": "other/project", "fork": False}}}},
+            "other base repo": {"pr": {"base": {"repo": {"full_name": "other/project"}}}},
+            "edited at delivery": {"event": {"comment.updated_at": later}, "live": {"updated_at": later}},
+            "edited since delivery": {"live": {"updated_at": later}},
+            "uppercase command": {"event": {"comment.body": "/REVIEW"}, "live": {"body": "/REVIEW"}},
+            "unknown command": {"event": {"comment.body": "/review all"}, "live": {"body": "/review all"}},
+            "trailing newline": {"event": {"comment.body": "/review\n"}, "live": {"body": "/review\n"}},
+            "rerun": {"env": {"GITHUB_RUN_ATTEMPT": "2"}},
+            "other triggering actor": {"env": {"GITHUB_TRIGGERING_ACTOR": "someone"}},
+            "other actor id": {"env": {"GITHUB_ACTOR_ID": "1"}},
+            "other repository": {"env": {"GITHUB_REPOSITORY": "other/project"}},
+            "non-member": {"event": {"comment.author_association": "CONTRIBUTOR"}},
+            "bot author": {"event": {"comment.user": {**f.JOSH, "type": "Bot"}}},
+            "live author changed": {"live": {"user": {**f.JOSH, "id": 2}}},
+            "review comment event": {"env": {"GITHUB_EVENT_NAME": "pull_request_review_comment"}},
+            "edited event": {"event": {"action": "edited"}},
+            "plain issue": {"event": {"issue": {"number": 1}}},
+            "event for another repository": {"event": {"repository": {"full_name": "other/project"}}},
+            "another maintainer": {"event": {"comment.user": {"login": "someone", "id": 2, "type": "User"}},
+                                   "live": {"user": {"login": "someone", "id": 2, "type": "User"}}},
+            "body changed live": {"live": {"body": "/review deep"}},
+        }.items():
+            with self.subTest(name):
+                self.assertEqual([], run(**kwargs))
+        marker = "<!-- agent-review-notice:v1 run=123 -->\n"
+        own = {"id": 77, "body": marker + "queued", "user": f.BOT}
+        self.assertEqual([("PATCH", "https://api.github.com/repos/example/project/issues/comments/77")],
+                         run(existing=[own]))
+        for name, foreign in {
+            "human": {**own, "user": {"login": "someone", "id": 5, "type": "User"}},
+            "another bot": {**own, "user": {**f.BOT, "id": 41898283}},
+            "marker not first": {**own, "body": "quoted " + marker + "queued"},
+            "another run": {**own, "body": marker.replace("run=123", "run=124") + "queued"},
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(["POST"], [method for method, _ in run(existing=[foreign])])
+
+    def test_caller_cancellation_updates_the_queued_notice(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        script = workflow["jobs"]["progress"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        marker = "<!-- agent-review-notice:v1 run=123 -->\n"
+        existing = {"id": 77, "body": marker + "Review request accepted and queued.", "user": f.BOT}
+        writes = []
+        def request(req, **kwargs):
+            if req.method == "GET":
+                data = ({"state": "open", "head": {"repo": {"full_name": self.repo.full_name, "fork": False}},
+                         "base": {"repo": {"full_name": self.repo.full_name}}}
+                        if "/pulls/" in req.full_url else self.event["comment"]
+                        if "/issues/comments/9" in req.full_url else [existing])
+            else:
+                writes.append((req.method, req.full_url, json.loads(req.data)["body"]))
+                data = {}
+            return io.BytesIO(json.dumps(data).encode())
+        with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true", "PROGRESS_CANCELLED": "true"}), \
+                patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertEqual(1, len(writes))
+            self.assertEqual(("PATCH", "https://api.github.com/repos/example/project/issues/comments/77"), writes[0][:2])
+            self.assertIn("Review run cancelled", writes[0][2])
+            self.assertNotIn("Review started", writes[0][2])
+            os.environ["PROGRESS_ONLY"] = "false"
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertEqual(1, len(writes), "a regular invocation cannot claim terminal-writer authority")
+
+    def test_native_claude_turn_stops_keep_the_fixed_reason(self):
+        cases = [{"subtype": "error_max_turns"}, {"terminal_reason": "max_turns"}]
+        for fields in cases:
+            events = [{"type": "result", "is_error": True, "private_error": "SECRET-sentinel", **fields}]
+            with self.subTest(fields=fields), self.assertRaises(e.TurnLimitAbort) as caught:
+                e.claude_result(events, POLICY, {}, "bundle", self.head_dir)
+            self.assertEqual("turn_limit", e.reliability.reason(caught.exception))
+            self.assertNotIn("SECRET-sentinel", str(caught.exception))
+        other = e.claude_abort([{"type": "result", "terminal_reason": "budget_exhausted",
+                                 "subtype": "error_max_turns"}], "fixed fallback")
+        self.assertNotIsInstance(other, e.TurnLimitAbort)
 
     def test_publication_rechecks_commits_after_inference(self):
         self.build()
@@ -702,6 +896,37 @@ class JobTests(unittest.TestCase):
         self.assertEqual(1, len(bodies))
         self.assertIn("larger than the configured review input limit", bodies[0])
         self.assertNotIn("diagnosed cause", bodies[0])
+
+    def test_turn_limit_receipt_reaches_the_fixed_pr_notice(self):
+        value = receipt("bundle")
+        value["turns"] = POLICY["max_turns"] + 1
+        with self.assertRaises(e.TurnLimitAbort) as raised:
+            e.validate_receipt(value, POLICY, {}, "bundle")
+        written, _, outcome = self.failed_prepare(raised.exception)
+        self.assertEqual("failure_reason=turn_limit\n", written)
+        self.assertEqual("turn_limit", json.loads(outcome)["failure"]["reason"])
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        self.assertIn("configured turn allowance", self.run_notifier(workflow, written)[0])
+
+    def test_a_malformed_turn_count_is_an_invalid_receipt_not_a_turn_limit(self):
+        for bad in (0, -1, True, 1.5, "5", None):
+            value = receipt("bundle")
+            value["turns"] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(e.ReviewAbort, "turn receipt is invalid") as raised:
+                e.validate_receipt(value, POLICY, {}, "bundle")
+            self.assertNotIsInstance(raised.exception, e.TurnLimitAbort)
+
+    def test_publication_never_edits_a_comment_the_workflow_bot_did_not_write(self):
+        notice = "<!-- agent-review-notice:v1 run=123 -->\n"
+        for name, user in (("human", NS(**f.JOSH)), ("another bot", NS(login="github-actions[bot]", id=1, type="Bot"))):
+            with self.subTest(name):
+                self.setUp()
+                self.pr.comments[77] = Comment(77, notice + "queued", user)
+                self.build()
+                j.publish_artifact(self.artifact, self.head_dir)
+                self.assertEqual(notice + "queued", self.pr.comments[77].body)
+                self.assertTrue(any("state=success" in c.body for c in self.pr.comments.values()))
 
     def test_unrelated_and_secret_bearing_failures_publish_only_the_generic_notice(self):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
@@ -1868,6 +2093,9 @@ class JobTests(unittest.TestCase):
             def requestJsonAndCheck(self, method, url, input):
                 self.sent = (method, url, input)
                 comment = original(input["body"], input["commit_id"], input["path"], subject_type=input["subject_type"])
+                # Real GitHub file-thread responses from failed publications carry
+                # this placeholder even though no line was sent in the request.
+                comment.raw_data.update(line=1, original_line=1)
                 return {}, {"id": comment.id, "body": input["body"], "path": input["path"], "user": f.BOT}
         requester = Requester()
         pull._requester, pull.url = requester, "https://api.github.com/repos/example/project/pulls/1"
@@ -1931,7 +2159,7 @@ class JobTests(unittest.TestCase):
                  lambda root: setattr(self.pr, "get_review", lambda i: NS(id=i, user=NS(**f.BOT), commit_id=self.pr.head.sha,
                                                                          state="COMMENTED"))),
                 ("moved original commit", {"original_commit_id": "0" * 40}, None),
-                ("line anchor present", {"line": 40}, None),
+                ("missing subject type", {"subject_type": None}, None),
                 ("line subject", {"subject_type": "line"}, None),
                 ("reply, not a root", {"in_reply_to_id": 5}, None),
                 ("human author", {}, lambda root: setattr(root, "user", NS(**f.JOSH))),
@@ -2362,7 +2590,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual({"cancel-in-progress": False, "queue": "max"},
                          {k: v for k, v in concurrency.items() if k != "group"})
         self.assertEqual(
-            "agent-review-${{ github.repository }}-${{ (github.event_name == 'issue_comment' || "
+            "agent-review-${{ github.repository }}-${{ inputs.progress_only && format('progress-{0}', github.run_id) || (github.event_name == 'issue_comment' || "
             "startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')) "
             "&& (github.event.issue.number || github.event.pull_request.number) || github.run_id }}",
             concurrency["group"])

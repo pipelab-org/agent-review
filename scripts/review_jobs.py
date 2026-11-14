@@ -597,6 +597,15 @@ def place_findings(plan, result, findings, previous, store):
     return placement, reasons
 
 
+def review_status(pr, notice, body):
+    """Reuse this run's trusted progress comment; never interpret it as coverage."""
+    for comment in pr.get_issue_comments():
+        if followups.identity(comment.user, followups.BOT) and comment.body.startswith(notice + "\n"):
+            comment.edit(body)
+            return comment
+    return pr.create_issue_comment(body)
+
+
 def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_dir=None):
     check_command(repo, pr, ctx["depth"])
     proof = records(repo, pr, ctx, policy)
@@ -608,7 +617,7 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
         raise ReviewAbort("Invalid workflow run identity")
     notice = f"<!-- agent-review-notice:v1 run={run} -->"
     if scope["kind"] == "unchanged":
-        pr.create_issue_comment(notice + f"\nThis snapshot already has verified coverage in Actions run {scope['parent']}; no inference requested.")
+        review_status(pr, notice, notice + f"\nThis snapshot already has verified coverage in Actions run {scope['parent']}; no inference requested.")
         return
     engine.validate_result(result, policy, plan["bundle"])
     if (plan["bundle"]["head"] != ctx["head"] or plan["bundle"]["base"] != ctx["base"]
@@ -628,7 +637,7 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
     roots = []
     def fresh():
         check_pr(repo, ctx)
-    status = pr.create_issue_comment(notice + "\nReview publication pending; no completed review yet.")
+    status = review_status(pr, notice, notice + "\nReview publication pending; no completed review yet.")
     inline = publish.InlinePublisher(pr, ctx["head"], fresh, roots)
     if comments:
         inline(commit=repo.get_commit(ctx["head"]), event="COMMENT", comments=comments)
@@ -674,7 +683,7 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
     fresh()
     check_command(repo, pr, ctx["depth"])
     body = (f"<!-- agent-review-status:v1 state=success key={key} summary={summary.id} digest={digest} -->\n"
-            + notice + "\nCompleted review.\n\n" + manifest)
+            + notice + f"\nCompleted review. [Review summary]({summary.html_url}).\n\n" + manifest)
     status.edit(body)
     actual = pr.get_issue_comment(status.id)
     if not followups.identity(actual.user, followups.BOT) or actual.body != body:

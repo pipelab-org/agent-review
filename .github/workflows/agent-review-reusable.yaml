@@ -1,6 +1,15 @@
 name: Reusable agentic review
 'on':
   workflow_call:
+    inputs:
+      progress_only:
+        description: Acknowledge the command outside the per-PR review queue
+        type: boolean
+        default: false
+      progress_cancelled:
+        description: Report cancellation after the queued review invocation has ended
+        type: boolean
+        default: false
     secrets:
       ANTHROPIC_API_KEY:
         required: false
@@ -19,12 +28,12 @@ permissions: {}
 # any human inline reply, so only commands the reply job itself accepts share the PR's queue
 # (at most 100 pending); plain conversation gets a unique group and never takes a slot.
 concurrency:
-  group: agent-review-${{ github.repository }}-${{ (github.event_name == 'issue_comment' || startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')) && (github.event.issue.number || github.event.pull_request.number) || github.run_id }}
+  group: agent-review-${{ github.repository }}-${{ inputs.progress_only && format('progress-{0}', github.run_id) || (github.event_name == 'issue_comment' || startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')) && (github.event.issue.number || github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: false
   queue: max
 jobs:
   source:
-    if: (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')))
+    if: ${{ !inputs.progress_only && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve')))) }}
     permissions: {}
     uses: ./.github/workflows/agent-review-source.yaml
   admit:
@@ -66,12 +75,108 @@ jobs:
         base="$(jq -er '.base.sha' <<< "$pr")"
         [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ ]]
         printf 'admitted=true\nhead=%s\nbase=%s\n' "$head" "$base" >> "$GITHUB_OUTPUT"
+  progress:
+    name: Show review progress
+    needs: [source, admit]
+    # Only the caller's terminal writer may run after cancellation; it cannot start inference.
+    if: ${{ always() && ((inputs.progress_only && inputs.progress_cancelled) || (!cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true'))) && github.event_name == 'issue_comment' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+    - name: Acknowledge the exact live command without checking out code
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PROGRESS_ONLY: ${{ inputs.progress_only }}
+        PROGRESS_CANCELLED: ${{ inputs.progress_cancelled }}
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+        import re
+        import time
+        import urllib.request
+
+        def main():
+            env = os.environ
+            with open(env["GITHUB_EVENT_PATH"]) as stream:
+                event = json.load(stream)
+            comment = event.get("comment", {})
+            user = comment.get("user", {})
+            issue = event.get("issue", {})
+            commands = ("/review", "/review deep", "/review codex", "/review codex deep")
+            if not (event.get("action") == "created" and env["GITHUB_EVENT_NAME"] == "issue_comment"
+                    and env["GITHUB_RUN_ATTEMPT"] == "1"
+                    and env["GITHUB_ACTOR"] == env["GITHUB_TRIGGERING_ACTOR"] == "luckyPipewrench"
+                    and env["GITHUB_ACTOR_ID"] == "142104046"
+                    and user.get("login") == "luckyPipewrench" and user.get("id") == 142104046
+                    and user.get("type") == "User" and comment.get("author_association") == "MEMBER"
+                    and comment.get("body") in commands and issue.get("pull_request")):
+                return
+            repo, number, run = env["GITHUB_REPOSITORY"], issue.get("number"), env["GITHUB_RUN_ID"]
+            if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+                    and repo == event.get("repository", {}).get("full_name")
+                    and type(number) is int and number > 0
+                    and type(comment.get("id")) is int and comment["id"] > 0
+                    and re.fullmatch(r"[1-9][0-9]*", run)):
+                return
+            def api(method, path, data=None):
+                if method != "GET":
+                    time.sleep(1)  # GitHub REST best practices: one second between writes.
+                request = urllib.request.Request("https://api.github.com/" + path, method=method,
+                    headers={"Authorization": "Bearer " + env["GH_TOKEN"],
+                             "Accept": "application/vnd.github+json", "Content-Type": "application/json"},
+                    data=json.dumps(data).encode() if data is not None else None)
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return json.load(response)
+            prefix = f"repos/{repo}"
+            pr = api("GET", f"{prefix}/pulls/{number}")
+            if not (pr["state"] == "open" and pr["head"]["repo"] is not None
+                    and pr["head"]["repo"]["fork"] is False
+                    and pr["head"]["repo"]["full_name"] == repo and pr["base"]["repo"]["full_name"] == repo):
+                return
+            live = api("GET", f"{prefix}/issues/comments/{comment['id']}")
+            if not (all(live.get(k) == comment.get(k) for k in ("id", "body", "created_at", "updated_at"))
+                    and comment.get("created_at") is not None and comment["created_at"] == comment.get("updated_at")
+                    and all(live.get("user", {}).get(k) == user[k] for k in ("id", "login", "type"))):
+                return
+            terminal = env.get("PROGRESS_CANCELLED") == "true"
+            if terminal and env.get("PROGRESS_ONLY") != "true":
+                return
+            marker = f"<!-- agent-review-notice:v1 run={run} -->"
+            message = ("Review run cancelled. This notice does not establish completed coverage; inspect Actions for any published result."
+                       if terminal else "Review request accepted and queued. No completed review yet."
+                       if env.get("PROGRESS_ONLY") == "true" else
+                       "Review started: preparing the captured diff and running the configured passes. No completed review yet.")
+            body = marker + "\n" + message + f"\n\n[Actions run](https://github.com/{repo}/actions/runs/{run})."
+            page = 1
+            while True:
+                comments = api("GET", f"{prefix}/issues/{number}/comments?per_page=100&page={page}")
+                for item in comments:
+                    author = item.get("user", {})
+                    if (author.get("login") == "github-actions[bot]" and author.get("id") == 41898282
+                            and author.get("type") == "Bot" and item.get("body", "").startswith(marker + "\n")):
+                        api("PATCH", f"{prefix}/issues/comments/{item['id']}", {"body": body})
+                        return
+                if len(comments) < 100:
+                    break
+                page += 1
+            api("POST", f"{prefix}/issues/{number}/comments", {"body": body})
+        try:
+            main()
+        except Exception:
+            raise SystemExit("Review progress update unavailable; inspect the Actions run") from None
+        PY
   review:
     name: Review admitted diff
     needs:
     - source
     - admit
-    if: needs.admit.outputs.admitted == 'true'
+    - progress
+    # Progress is best effort: a failed or skipped status job must not silently cancel the review.
+    if: ${{ !cancelled() && needs.source.result == 'success' && needs.admit.result == 'success' && needs.admit.outputs.admitted == 'true' }}
     # Ubuntu 26.04's Rust test/sudo implementations break the pinned action's
     # ACL verification and environment preservation. Keep its safeguards intact.
     # https://github.com/openai/codex-action/issues/188
@@ -815,12 +920,13 @@ jobs:
     needs:
     - source
     - admit
+    - progress
     - review
     - codex-verification
     - publish
     - reply
     if: |-
-      always() && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
+      always() && !inputs.progress_only && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
           needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || cancelled()) ||
           (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve'))) && needs.reply.outputs.learnings_revoke_failed == 'true')
@@ -853,7 +959,11 @@ jobs:
 
         # Wording for the reason codes scripts/review_reliability.py can emit, as notice text
         # and what to do next. The review job output only selects a row; it never supplies text.
-        REASONS = {"sections_incomplete": (
+        REASONS = {"turn_limit": (
+            "The requested review stopped at the configured turn allowance (max_turns), not a PR line-count limit. "
+            "Treat this run as incomplete.",
+            " Inspect the operator policy before a new command; repeating it unchanged can stop at the same allowance."),
+            "sections_incomplete": (
             "The requested diff review didn't complete because a review pass stopped before every section of the change "
             "was reviewed (an allowance, the deadline, a provider stop or an invalid result), so nothing from the partial "
             "pass was published. Treat this run as incomplete.",

@@ -62,7 +62,7 @@ RATE_CATEGORIES = frozenset(c for c in CATEGORIES if c.startswith("rate_limit"))
 # max_model_tokens allowance, so complete coverage is refused. sections_incomplete: a pass
 # stopped (an allowance, the deadline, a provider stop or a malformed result) before every
 # review section completed; nothing from the partial pass is published.
-REASONS = ("input_limit", "sections_incomplete")
+REASONS = ("input_limit", "sections_incomplete", "turn_limit")
 DECISIONS = ("wait", "exceeds_budget", "unbounded")
 EVENTS = ("issue_comment", "pull_request_review_comment")
 # Names PyGithub's retry and Requester see; anything else in a URL is dropped.
@@ -399,7 +399,7 @@ def diagnostic(error, failed_phase=None):
     entry = {"phase": phase_name if phase_name in PHASES else "configuration"}
     if reason(error):
         entry["reason"] = reason(error)
-    progress = getattr(error, "progress", None) if reason(error) == "sections_incomplete" else None
+    progress = getattr(error, "progress", None) if reason(error) in ("sections_incomplete", "turn_limit") else None
     # Counters only: a strategy name from the fixed vocabulary and two integers.
     if (isinstance(progress, dict) and set(progress) == {"strategy", "completed", "total"}
             and progress["strategy"] in ("bundle", "callers")
