@@ -205,6 +205,25 @@ class CallerTests(unittest.TestCase):
         self.assertTrue(condition.startswith('always() && ((' + gate + ') && ('))
         self.assertTrue(condition.endswith("(" + reply_gate + ") && needs.reply.outputs.learnings_revoke_failed == 'true')"))
 
+    def test_progress_is_best_effort_and_a_cancelled_run_starts_nothing_new(self):
+        # always() keeps running jobs after a normal cancel; !cancelled() does not, and unlike
+        # the implicit success() it tolerates a failed status job instead of silently skipping
+        # the review with no notice. GitHub's expression engine is not run here: this pins the text.
+        caller = yaml.load(contract.EXPECTED_CALLER, Loader=yaml.BaseLoader)
+        self.assertTrue(caller['jobs']['review']['if'].startswith('!cancelled() &&'))
+        self.assertNotIn('always()', caller['jobs']['review']['if'])
+        jobs = WORKFLOW['jobs']
+        self.assertTrue(jobs['progress']['if'].startswith('${{ !cancelled() && '))
+        self.assertNotIn('always()', jobs['progress']['if'])
+        review = jobs['review']['if']
+        self.assertTrue(review.startswith('${{ !cancelled() && '))
+        for required in ("needs.source.result == 'success'", "needs.admit.result == 'success'",
+                         "needs.admit.outputs.admitted == 'true'"):
+            self.assertIn(required, review)
+        self.assertNotIn('needs.progress', review)
+        # The notifier is the last writer of the shared run comment.
+        self.assertIn('progress', jobs['notify-failure']['needs'])
+
 
     def test_engine_dependencies_install_before_any_step_that_imports_them(self):
         # Also requires the install to run on the Python version its hashes were resolved for.
@@ -418,7 +437,7 @@ class ReporterTests(unittest.TestCase):
 
     def test_reporter_is_host_only_and_minimally_privileged(self):
         job = WORKFLOW['jobs']['notify-failure']
-        self.assertEqual(['source', 'admit', 'review', 'codex-verification', 'publish', 'reply'], job['needs'])
+        self.assertEqual(['source', 'admit', 'progress', 'review', 'codex-verification', 'publish', 'reply'], job['needs'])
         self.assertIn('always()', job['if'])
         self.assertEqual({'pull-requests': 'write'}, job['permissions'])
         self.assertNotIn('container', job)

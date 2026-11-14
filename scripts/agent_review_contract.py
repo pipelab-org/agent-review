@@ -55,7 +55,7 @@ jobs:
   review:
     needs: acknowledge
     if: >-
-      always() &&
+      !cancelled() &&
       (
       (github.event_name == 'issue_comment' &&
       github.event.action == 'created' &&

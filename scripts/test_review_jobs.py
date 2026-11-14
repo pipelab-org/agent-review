@@ -97,7 +97,7 @@ class Pull:
         self.reviews[id] = NS(id=id, user=NS(**f.BOT), commit_id=commit, state="COMMENTED")
         root = Comment(len(self.roots) + 300, body, NS(**f.BOT),
                        {"pull_request_review_id": id, "original_commit_id": commit, "commit_id": commit,
-                        "line": None, "subject_type": "file", **self.file_thread_overrides},
+                        "line": 1, "original_line": 1, "subject_type": "file", **self.file_thread_overrides},
                        path=path, commit_id=commit)
         self.roots.append(root)
         self.threads[root.id] = {"id": "THREAD_" + str(root.id), "isResolved": False, "isOutdated": False}
@@ -365,6 +365,34 @@ class JobTests(unittest.TestCase):
             j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, [])(
                 commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
 
+    def test_inline_publication_pairs_each_request_with_exactly_one_returned_comment(self):
+        def publish(requests, returned):
+            self.setUp()
+            self.pr.get_review_comments = lambda: returned(self.pr.roots)
+            roots = []
+            result = j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, roots)(
+                commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
+            return result, roots
+        def request(path, body):
+            return {"path": path, "line": 1, "side": "RIGHT", "body": body}
+        def twin(root):
+            other = copy.copy(root)
+            other.id = root.id + 500
+            return other
+        # The same text on two files is paired by path, whichever order GitHub lists them.
+        _, roots = publish([request("app.py", "same"), request("helper.py", "same")], lambda found: found[::-1])
+        self.assertEqual({"app.py", "helper.py"}, {root["path"] for root in roots})
+        cases = {
+            "one comment listed twice": ([request("app.py", "same")] * 2, lambda found: [found[0], found[0]]),
+            "a new id repeating another comment": ([request("app.py", "x"), request("app.py", "y")],
+                                                   lambda found: [found[0], twin(found[0])]),
+            "a missing comment": ([request("app.py", "x"), request("app.py", "y")], lambda found: found[:1]),
+            "an extra comment": ([request("app.py", "x")], lambda found: [found[0], twin(found[0])]),
+        }
+        for name, (requests, returned) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(e.ReviewAbort, "publication (verification failed|was partial)"):
+                publish(requests, returned)
+
     def test_progress_acknowledges_only_live_commands_and_updates_the_same_comment(self):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
                                    ".github/workflows/agent-review-reusable.yaml").read_text())
@@ -402,6 +430,80 @@ class JobTests(unittest.TestCase):
         self.build()
         j.publish_artifact(self.artifact, self.head_dir)
         self.assertIn("state=success", self.pr.comments[77].body)
+
+    def test_progress_writes_nothing_for_an_ineligible_command_or_a_foreign_comment(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   ".github/workflows/agent-review-reusable.yaml").read_text())
+        script = workflow["jobs"]["progress"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        def run(event=None, env=None, pr=None, live=None, existing=()):
+            body = copy.deepcopy(self.event)
+            for key, value in (event or {}).items():
+                if key.startswith("comment."):
+                    body["comment"][key.split(".", 1)[1]] = value
+                else:
+                    body[key] = value
+            path = self.root / "progress-event.json"
+            path.write_text(json.dumps(body))
+            current = {"state": "open", "head": {"repo": {"full_name": self.repo.full_name, "fork": False}},
+                       "base": {"repo": {"full_name": self.repo.full_name}}}
+            current.update(pr or {})
+            fetched = {**copy.deepcopy(body["comment"]), **(live or {})}
+            writes = []
+            def request(req, **kwargs):
+                if req.method != "GET":
+                    writes.append((req.method, req.full_url))
+                    return io.BytesIO(b"{}")
+                if "/pulls/" in req.full_url:
+                    return io.BytesIO(json.dumps(current).encode())
+                if "/issues/comments/9" in req.full_url:
+                    return io.BytesIO(json.dumps(fetched).encode())
+                return io.BytesIO(json.dumps(list(existing)).encode())
+            with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true",
+                                         "GITHUB_EVENT_PATH": str(path), **(env or {})}),                     patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
+                exec(compile(script, "<trusted-progress>", "exec"), {})
+            return writes
+        self.assertEqual(["POST"], [method for method, _ in run()], "the valid baseline must acknowledge")
+        later = "2026-10-28T00:00:01Z"
+        for name, kwargs in {
+            "closed": {"pr": {"state": "closed"}},
+            "fork": {"pr": {"head": {"repo": {"full_name": self.repo.full_name, "fork": True}}}},
+            "deleted fork": {"pr": {"head": {"repo": None}}},
+            "other head repo": {"pr": {"head": {"repo": {"full_name": "other/project", "fork": False}}}},
+            "other base repo": {"pr": {"base": {"repo": {"full_name": "other/project"}}}},
+            "edited at delivery": {"event": {"comment.updated_at": later}, "live": {"updated_at": later}},
+            "edited since delivery": {"live": {"updated_at": later}},
+            "uppercase command": {"event": {"comment.body": "/REVIEW"}, "live": {"body": "/REVIEW"}},
+            "unknown command": {"event": {"comment.body": "/review all"}, "live": {"body": "/review all"}},
+            "trailing newline": {"event": {"comment.body": "/review\n"}, "live": {"body": "/review\n"}},
+            "rerun": {"env": {"GITHUB_RUN_ATTEMPT": "2"}},
+            "other triggering actor": {"env": {"GITHUB_TRIGGERING_ACTOR": "someone"}},
+            "other actor id": {"env": {"GITHUB_ACTOR_ID": "1"}},
+            "other repository": {"env": {"GITHUB_REPOSITORY": "other/project"}},
+            "non-member": {"event": {"comment.author_association": "CONTRIBUTOR"}},
+            "bot author": {"event": {"comment.user": {**f.JOSH, "type": "Bot"}}},
+            "live author changed": {"live": {"user": {**f.JOSH, "id": 2}}},
+            "review comment event": {"env": {"GITHUB_EVENT_NAME": "pull_request_review_comment"}},
+            "edited event": {"event": {"action": "edited"}},
+            "plain issue": {"event": {"issue": {"number": 1}}},
+            "event for another repository": {"event": {"repository": {"full_name": "other/project"}}},
+            "another maintainer": {"event": {"comment.user": {"login": "someone", "id": 2, "type": "User"}},
+                                   "live": {"user": {"login": "someone", "id": 2, "type": "User"}}},
+            "body changed live": {"live": {"body": "/review deep"}},
+        }.items():
+            with self.subTest(name):
+                self.assertEqual([], run(**kwargs))
+        marker = "<!-- agent-review-notice:v1 run=123 -->\n"
+        own = {"id": 77, "body": marker + "queued", "user": f.BOT}
+        self.assertEqual([("PATCH", "https://api.github.com/repos/example/project/issues/comments/77")],
+                         run(existing=[own]))
+        for name, foreign in {
+            "human": {**own, "user": {"login": "someone", "id": 5, "type": "User"}},
+            "another bot": {**own, "user": {**f.BOT, "id": 41898283}},
+            "marker not first": {**own, "body": "quoted " + marker + "queued"},
+            "another run": {**own, "body": marker.replace("run=123", "run=124") + "queued"},
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(["POST"], [method for method, _ in run(existing=[foreign])])
 
     def test_publication_rechecks_commits_after_inference(self):
         self.build()
@@ -766,6 +868,25 @@ class JobTests(unittest.TestCase):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
                                    ".github/workflows/agent-review-reusable.yaml").read_text())
         self.assertIn("configured turn allowance", self.run_notifier(workflow, written)[0])
+
+    def test_a_malformed_turn_count_is_an_invalid_receipt_not_a_turn_limit(self):
+        for bad in (0, -1, True, 1.5, "5", None):
+            value = receipt("bundle")
+            value["turns"] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(e.ReviewAbort, "turn receipt is invalid") as raised:
+                e.validate_receipt(value, POLICY, {}, "bundle")
+            self.assertNotIsInstance(raised.exception, e.TurnLimitAbort)
+
+    def test_publication_never_edits_a_comment_the_workflow_bot_did_not_write(self):
+        notice = "<!-- agent-review-notice:v1 run=123 -->\n"
+        for name, user in (("human", NS(**f.JOSH)), ("another bot", NS(login="github-actions[bot]", id=1, type="Bot"))):
+            with self.subTest(name):
+                self.setUp()
+                self.pr.comments[77] = Comment(77, notice + "queued", user)
+                self.build()
+                j.publish_artifact(self.artifact, self.head_dir)
+                self.assertEqual(notice + "queued", self.pr.comments[77].body)
+                self.assertTrue(any("state=success" in c.body for c in self.pr.comments.values()))
 
     def test_unrelated_and_secret_bearing_failures_publish_only_the_generic_notice(self):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
@@ -1998,7 +2119,7 @@ class JobTests(unittest.TestCase):
                  lambda root: setattr(self.pr, "get_review", lambda i: NS(id=i, user=NS(**f.BOT), commit_id=self.pr.head.sha,
                                                                          state="COMMENTED"))),
                 ("moved original commit", {"original_commit_id": "0" * 40}, None),
-                ("line anchor present", {"line": 40}, None),
+                ("missing subject type", {"subject_type": None}, None),
                 ("line subject", {"subject_type": "line"}, None),
                 ("reply, not a root", {"in_reply_to_id": 5}, None),
                 ("human author", {}, lambda root: setattr(root, "user", NS(**f.JOSH))),

@@ -74,7 +74,8 @@ jobs:
   progress:
     name: Show review progress
     needs: [source, admit]
-    if: always() && (inputs.progress_only || needs.admit.outputs.admitted == 'true') && github.event_name == 'issue_comment'
+    # Not always(): a cancelled run must not post "started" after the failure notice.
+    if: ${{ !cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true') && github.event_name == 'issue_comment' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -165,7 +166,8 @@ jobs:
     - source
     - admit
     - progress
-    if: needs.admit.outputs.admitted == 'true'
+    # Progress is best effort: a failed or skipped status job must not silently cancel the review.
+    if: ${{ !cancelled() && needs.source.result == 'success' && needs.admit.result == 'success' && needs.admit.outputs.admitted == 'true' }}
     # Ubuntu 26.04's Rust test/sudo implementations break the pinned action's
     # ACL verification and environment preservation. Keep its safeguards intact.
     # https://github.com/openai/codex-action/issues/188
@@ -909,6 +911,7 @@ jobs:
     needs:
     - source
     - admit
+    - progress
     - review
     - codex-verification
     - publish
