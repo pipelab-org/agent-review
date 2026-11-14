@@ -23,6 +23,12 @@ class InputLimitAbort(ReviewAbort, reliability.Reasoned):
     reason = "input_limit"
 
 
+class TurnLimitAbort(ReviewAbort, reliability.Reasoned):
+    """The configured turn allowance stopped a review; no provider text is public."""
+
+    reason = "turn_limit"
+
+
 class IncompleteReviewAbort(ReviewAbort, reliability.Reasoned):
     """A logical pass stopped before every required section completed.
 

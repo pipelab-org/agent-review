@@ -22,12 +22,12 @@ try:
     from . import review_learnings as learnings
     from . import review_reliability as reliability
     from . import review_sections as sections
-    from .review_errors import IncompleteReviewAbort, InputLimitAbort, ReviewAbort
+    from .review_errors import IncompleteReviewAbort, InputLimitAbort, ReviewAbort, TurnLimitAbort
 except ImportError:
     import review_learnings as learnings
     import review_reliability as reliability
     import review_sections as sections
-    from review_errors import IncompleteReviewAbort, InputLimitAbort, ReviewAbort
+    from review_errors import IncompleteReviewAbort, InputLimitAbort, ReviewAbort, TurnLimitAbort
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -442,8 +442,10 @@ def validate_receipt(receipt, settings, bundle, strategy):
     if (receipt["provider"] != settings["provider"] or receipt["model"] != settings["model"]
             or receipt["strategy"] != strategy or receipt["status"] != "complete"):
         raise ReviewAbort("Pass did not complete under the selected provider/model policy")
-    if not positive_int(receipt["turns"]) or receipt["turns"] > settings["max_turns"]:
-        raise ReviewAbort("Pass reached review_depth turn limit; increase the approved max_turns")
+    if not positive_int(receipt["turns"]):
+        raise ReviewAbort("Pass turn receipt is invalid")
+    if receipt["turns"] > settings["max_turns"]:
+        raise TurnLimitAbort("Pass reached review_depth turn limit; increase the approved max_turns")
     if not finite_number(receipt["cost_usd"]) or receipt["cost_usd"] > settings["max_budget_usd"]:
         raise ReviewAbort("Pass reached review_depth per-pass budget or has no cost receipt; set max_budget_usd")
     usage = receipt["usage"]
@@ -511,7 +513,7 @@ class Allowance:
         turns = self.settings["max_turns"] - self.turns
         budget = self.settings["max_budget_usd"] - self.spent()
         if turns <= 0:
-            raise ReviewAbort("Pass reached review_depth max_turns across its sections; review incomplete")
+            raise TurnLimitAbort("Pass reached review_depth max_turns across its sections; review incomplete")
         if budget <= 0:
             raise ReviewAbort("Pass reached review_depth max_budget_usd across its sections; review incomplete")
         if seconds <= 0:

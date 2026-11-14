@@ -195,7 +195,12 @@ class CallerTests(unittest.TestCase):
     def test_every_job_repeats_the_exact_admission_gate(self):
         gate = WORKFLOW['jobs']['admit']['if']
         reply_gate = WORKFLOW['jobs']['reply']['if']
-        self.assertEqual(f'({gate}) || ({reply_gate})', WORKFLOW['jobs']['source']['if'])
+        self.assertEqual('${{ !inputs.progress_only && (' + f'({gate}) || ({reply_gate})' + ') }}',
+                         WORKFLOW['jobs']['source']['if'])
+        caller = yaml.load(contract.EXPECTED_CALLER, Loader=yaml.BaseLoader)
+        self.assertEqual('acknowledge', caller['jobs']['review']['needs'])
+        self.assertEqual('true', caller['jobs']['acknowledge']['with']['progress_only'])
+        self.assertNotIn('secrets', caller['jobs']['acknowledge'])
         condition = WORKFLOW['jobs']['notify-failure']['if']
         self.assertTrue(condition.startswith('always() && ((' + gate + ') && ('))
         self.assertTrue(condition.endswith("(" + reply_gate + ") && needs.reply.outputs.learnings_revoke_failed == 'true')"))

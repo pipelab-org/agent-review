@@ -30,8 +30,33 @@ on:
 permissions: {}
 
 jobs:
-  review:
+  acknowledge:
     if: >-
+      (github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.actor == 'luckyPipewrench' &&
+      github.actor_id == '142104046' &&
+      github.run_attempt == '1' &&
+      github.triggering_actor == 'luckyPipewrench' &&
+      github.event.comment.user.login == 'luckyPipewrench' &&
+      github.event.comment.user.id == 142104046 &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.author_association == 'MEMBER' &&
+      github.event.issue.pull_request &&
+      contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body))
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/agent-review-reusable.yaml
+    with:
+      progress_only: true
+  review:
+    needs: acknowledge
+    if: >-
+      always() &&
+      (
       (github.event_name == 'issue_comment' &&
       github.event.action == 'created' &&
       github.actor == 'luckyPipewrench' &&
@@ -51,6 +76,7 @@ jobs:
       github.triggering_actor == github.actor &&
       github.event.comment.user.type == 'User' &&
       github.event.comment.in_reply_to_id)
+      )
     permissions:
       actions: read
       contents: read

@@ -74,10 +74,21 @@ class InlinePublisher:
         if len(comments) != len(remaining):
             raise ReviewAbort("Inline review publication was partial")
         verified = []
-        for comment, request in zip(comments, remaining):
+        # GitHub lists review comments by its own ordering, not the order in the
+        # create-review request. Match the complete multiset; consume each request
+        # exactly once so missing, duplicated or changed comments still fail closed.
+        unmatched = list(remaining)
+        seen = set()
+        for comment in comments:
+            request = next((r for r in unmatched
+                            if comment.body == r["body"] and comment.path == r["path"]), None)
+            if request is None or comment.id in seen:
+                raise ReviewAbort("Inline comment publication could not be verified")
             if (not self.valid_root(comment, result.id) or comment.body != request["body"]
                     or comment.path != request["path"]):
                 raise ReviewAbort("Inline comment publication could not be verified")
+            unmatched.remove(request)
+            seen.add(comment.id)
             verified.append({"id": comment.id, "review_id": result.id, "path": comment.path,
                              "commit": self.head, "digest": followups.digest(comment.body)})
         self.roots.extend(verified)
@@ -109,8 +120,11 @@ class InlinePublisher:
         if (not followups.identity(comment.user, followups.BOT) or not followups.positive(comment.id)
                 or comment.id != created.id or comment.commit_id != self.head
                 or raw.get("original_commit_id") != self.head or comment.path != path or comment.body != body
-                or raw.get("in_reply_to_id") is not None or raw.get("line") is not None
-                or raw.get("subject_type") not in (None, "file") or not followups.positive(review_id)):
+                or raw.get("in_reply_to_id") is not None
+                # GitHub returns line=1 even for subject_type=file responses.
+                # Subject type identifies the thread; its placeholder line is not
+                # the finding's source location, which remains in the verified body.
+                or raw.get("subject_type") != "file" or not followups.positive(review_id)):
             raise ReviewAbort("Inline comment publication could not be verified")
         review = self.pr.get_review(review_id)
         if (not followups.identity(review.user, followups.BOT) or review.commit_id != self.head

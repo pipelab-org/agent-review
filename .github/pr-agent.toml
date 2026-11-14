@@ -34,6 +34,9 @@
 # the USD and turn caps bound large reviews. The GitHub wait budget equals one ai_timeout, so
 # the review job (two passes, verification and a full wait, 3,600 s) gets 65 minutes and the
 # reply job (one call and a wait, 1,800 s) 35 minutes; publish jobs make no provider calls.
+# Owner approved 2026-11-14: raise all depths from 40 to 80 turns per pass.
+# The observed large-change turn stop motivates this change; USD allowances and
+# the 900-second per-pass timeout remain unchanged. This is not an unlimited review.
 [config]
 max_model_tokens = 272000
 max_output_tokens = 16000
@@ -45,25 +48,25 @@ ai_timeout = 900
 [review_depth.default]
 model = "anthropic/claude-sonnet-5-5"
 reasoning_effort = "high"
-max_turns = 40
+max_turns = 80
 max_budget_usd = 5.0
 max_model_tokens = 516000
 
 [review_depth.deep]
 model = "anthropic/claude-opus-5-5"
 reasoning_effort = "high"
-max_turns = 40
+max_turns = 80
 max_budget_usd = 9.0
 max_model_tokens = 516000
 
 [review_depth.codex]
 model = "gpt-6.1-terra"
 reasoning_effort = "high"
-max_turns = 40
+max_turns = 80
 max_budget_usd = 2.0
 
 [review_depth.codex-deep]
 model = "gpt-6.1-sol"
 reasoning_effort = "medium"
-max_turns = 40
+max_turns = 80
 max_budget_usd = 2.0

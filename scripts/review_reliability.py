@@ -62,7 +62,7 @@ RATE_CATEGORIES = frozenset(c for c in CATEGORIES if c.startswith("rate_limit"))
 # max_model_tokens allowance, so complete coverage is refused. sections_incomplete: a pass
 # stopped (an allowance, the deadline, a provider stop or a malformed result) before every
 # review section completed; nothing from the partial pass is published.
-REASONS = ("input_limit", "sections_incomplete")
+REASONS = ("input_limit", "sections_incomplete", "turn_limit")
 DECISIONS = ("wait", "exceeds_budget", "unbounded")
 EVENTS = ("issue_comment", "pull_request_review_comment")
 # Names PyGithub's retry and Requester see; anything else in a URL is dropped.
