@@ -552,7 +552,10 @@ def run_pass(settings, bundle, strategy, head, invoke, *, clock=time.monotonic, 
                 progress(state, kind, section, len(bundle["sections"]))
             except Exception:
                 # Progress is diagnostic only; it cannot alter inference or certify coverage.
-                print("Review progress unavailable; continuing the admitted pass", file=sys.stderr, flush=True)
+                try:
+                    print("Review progress unavailable; continuing the admitted pass", file=sys.stderr, flush=True)
+                except (OSError, ValueError):
+                    pass
 
     try:
         for kind, section in plan:

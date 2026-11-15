@@ -174,6 +174,19 @@ class PassTests(Repo):
         self.assertEqual(count + 1, len(records))
         self.assertNotIn("SECRET-progress-error", str(log.call_args_list))
 
+    def test_an_unwritable_diagnostic_stream_never_stops_a_pass(self):
+        bundle = self.bundle()
+        policy = dict(SMALL, max_turns=100, max_budget_usd=50.0)
+        class Closed:
+            def write(self, *_):
+                raise OSError("stream closed")
+            flush = write
+        def broken(*_):
+            raise OSError("progress failed")
+        with patch("sys.stderr", Closed()):
+            records = e.run_pass(policy, bundle, "bundle", self.root, self.invoke_factory(), progress=broken)
+        self.assertEqual(len(bundle["sections"]) + 1, len(records))
+
     def test_both_default_strategies_cover_all_sections_independently(self):
         bundle = self.bundle()
         policy = dict(SMALL, max_turns=100, max_budget_usd=50.0)

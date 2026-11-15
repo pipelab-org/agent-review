@@ -231,6 +231,18 @@ class JobTests(unittest.TestCase):
             j.report_progress("Publication pending.")
         self.assertIn("summary unavailable", log.getvalue())
 
+    def test_progress_survives_an_unwritable_log_and_still_records_the_summary(self):
+        summary = self.root / "step-summary.md"
+        class Closed:
+            def write(self, *_):
+                raise OSError("stream closed")
+            flush = write
+        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), patch("sys.stderr", Closed()):
+            j.report_progress("Review pass 1/1, section 1/1: started. Publication pending.")
+        self.assertIn("section 1/1: started", summary.read_text())
+        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.root)}), patch("sys.stderr", Closed()):
+            j.report_progress("Publication pending.")
+
     def test_complete_passes_publish_inline_summary_and_verifiable_completion(self):
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)

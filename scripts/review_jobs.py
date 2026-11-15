@@ -318,14 +318,20 @@ def strip_learning_text(plan):
 
 def report_progress(message):
     """Fixed driver-generated stages only, never provider text or a completion certificate."""
-    print(message, file=sys.stderr, flush=True)
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass  # A diagnostic sink must not change the review result.
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         try:
             with Path(summary).open("a", encoding="utf-8") as stream:
                 stream.write(message + "\n\n")
         except OSError:
-            print("Review progress summary unavailable; inspect the step log", file=sys.stderr, flush=True)
+            try:
+                print("Review progress summary unavailable; inspect the step log", file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
 
 
 def infer(plan_path, output, head_dir, action=None, codex_home=None):
