@@ -555,8 +555,11 @@ class JobTests(unittest.TestCase):
         script = workflow["jobs"]["progress"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
         marker = "<!-- agent-review-notice:v1 run=123 -->\n"
         existing = {"id": 77, "body": marker + "Review request accepted and queued.", "user": f.BOT}
-        writes = []
+        writes, reactions = [], []
         def request(req, **kwargs):
+            if req.full_url.endswith("/reactions"):
+                reactions.append(req.full_url)
+                return io.BytesIO(b'{"id": 88}')
             if req.method == "GET":
                 data = ({"state": "open", "head": {"repo": {"full_name": self.repo.full_name, "fork": False}},
                          "base": {"repo": {"full_name": self.repo.full_name}}}
@@ -573,9 +576,11 @@ class JobTests(unittest.TestCase):
             self.assertEqual(("PATCH", "https://api.github.com/repos/example/project/issues/comments/77"), writes[0][:2])
             self.assertIn("Review run cancelled", writes[0][2])
             self.assertNotIn("Review started", writes[0][2])
+            self.assertEqual([], reactions, "a cancelled run must not acknowledge receipt")
             os.environ["PROGRESS_ONLY"] = "false"
             exec(compile(script, "<trusted-progress>", "exec"), {})
             self.assertEqual(1, len(writes), "a regular invocation cannot claim terminal-writer authority")
+            self.assertEqual([], reactions)
 
     def test_native_claude_turn_stops_keep_the_fixed_reason(self):
         cases = [{"subtype": "error_max_turns"}, {"terminal_reason": "max_turns"}]
