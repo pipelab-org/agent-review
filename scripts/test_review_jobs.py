@@ -2179,6 +2179,69 @@ class JobTests(unittest.TestCase):
                 self.assertFalse(any(f.RESULT.search(c.body) for c in self.pr.comments.values()))
                 self.assertEqual(1, len(self.file_threads()), "an ambiguous write is never repeated")
 
+    def test_remaining_publication_checks_name_the_failed_fixed_label_only(self):
+        def twin(root):
+            other = copy.copy(root)
+            other.id = root.id + 500
+            return other
+        bad_commit = "0" * 40
+        review_of = lambda root: self.pr.reviews[root.raw_data["pull_request_review_id"]]
+        for name, after, check in (
+                ("non-positive comment id", lambda root: setattr(root, "id", 0), "file_id"),
+                ("another comment returned", lambda root: setattr(self.pr, "get_review_comment", lambda i: twin(root)),
+                 "file_created_id"),
+                ("moved comment commit", lambda root: setattr(root, "commit_id", bad_commit), "file_commit"),
+                ("moved review commit", lambda root: setattr(review_of(root), "commit_id", bad_commit), "review_commit")):
+            with self.subTest(name):
+                self.setUp()
+                self.pr.after_file_thread = after
+                self.offdiff(finding(path="app.py", line=40, end_line=40))
+                with self.assertRaisesRegex(e.ReviewAbort, rf"Inline publication verification failed \(check={check}\)"):
+                    j.publish_artifact(self.artifact, self.head_dir)
+                self.assertFalse((self.root / "completion.json").exists())
+                self.assertEqual(1, len(self.file_threads()), "an ambiguous write is never repeated")
+        requests = [{"path": "app.py", "line": 1, "side": "RIGHT", "body": "text"}]
+        def publisher(roots=None):
+            return j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, [] if roots is None else roots)
+        def publish(inline):
+            return inline(commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
+        def review_with(**changes):
+            original = self.pr.create_review
+            def create(**kwargs):
+                review = original(**kwargs)
+                for key, value in changes.items():
+                    setattr(review, key, value)
+                return review
+            self.pr.create_review = create
+        for name, change, check in (("review by someone else", {"user": NS(**f.JOSH)}, "review_author"),
+                                    ("non-positive review id", {"id": 0}, "review_id"),
+                                    ("review on another commit", {"commit_id": bad_commit}, "review_commit")):
+            with self.subTest(name):
+                self.setUp()
+                review_with(**change)
+                with self.assertRaisesRegex(e.ReviewAbort, rf"publication verification failed \(check={check}\)"):
+                    publish(publisher())
+        with self.subTest("comment by someone else"):
+            self.setUp()
+            original = self.pr.get_review_comments
+            def foreign():
+                found = [copy.copy(c) for c in original()]
+                for comment in found:
+                    comment.user = NS(**f.JOSH)
+                return found
+            self.pr.get_review_comments = foreign
+            with self.assertRaisesRegex(e.ReviewAbort, r"publication verification failed \(check=comment_identity\)"):
+                publish(publisher())
+        with self.subTest("previously verified root disappeared"):
+            self.setUp()
+            roots = []
+            publish(publisher(roots))
+            self.pr.get_review_comments = lambda: []
+            with self.assertRaisesRegex(e.ReviewAbort, r"publication verification failed \(check=prior_root\)"):
+                publish(publisher(roots))
+        self.assertEqual("unknown", j.publish._PublicationCheck("private-body").check.value)
+        self.assertNotIn("private-body", str(j.publish._PublicationCheck("private-body")))
+
     def test_partial_and_ambiguous_file_thread_failures_are_not_retried_and_leave_no_success(self):
         lines = [f"line {i}\n" for i in range(60)]
         self.restage("".join(lines), "".join(["changed first\n", *lines[1:]]))
