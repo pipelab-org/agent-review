@@ -145,11 +145,21 @@ jobs:
             terminal = env.get("PROGRESS_CANCELLED") == "true"
             if terminal and env.get("PROGRESS_ONLY") != "true":
                 return
+            # GitHub's issue-comment reaction API is idempotent for the same actor/content:
+            # https://docs.github.com/en/rest/reactions/reactions#create-reaction-for-an-issue-comment
+            # Eyes acknowledges receipt, not completed coverage. A reaction failure must not
+            # prevent the existing queued/running notice or the independently admitted review.
+            if not terminal and env.get("PROGRESS_ONLY") == "true":
+                try:
+                    api("POST", f"{prefix}/issues/comments/{comment['id']}/reactions", {"content": "eyes"})
+                except Exception:
+                    print("::warning::Review reaction unavailable; continuing with the status notice")
             marker = f"<!-- agent-review-notice:v1 run={run} -->"
             message = ("Review run cancelled. This notice does not establish completed coverage; inspect Actions for any published result."
                        if terminal else "Review request accepted and queued. No completed review yet."
                        if env.get("PROGRESS_ONLY") == "true" else
-                       "Review started: preparing the captured diff and running the configured passes. No completed review yet.")
+                       "Review started: preparing the captured diff and running the configured passes. No completed review yet. "
+                       "Open Actions for live pass and section progress. This comment updates again when the run finishes.")
             body = marker + "\n" + message + f"\n\n[Actions run](https://github.com/{repo}/actions/runs/{run})."
             page = 1
             while True:

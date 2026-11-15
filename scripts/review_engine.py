@@ -7,6 +7,7 @@ import fnmatch
 import json
 import math
 import os
+import sys
 from pathlib import Path
 import re
 import shutil
@@ -534,7 +535,7 @@ def expected_plan(bundle):
     return [("section", i) for i in range(count)] + ([("consolidation", None)] if count > 1 else [])
 
 
-def run_pass(settings, bundle, strategy, head, invoke, *, clock=time.monotonic):
+def run_pass(settings, bundle, strategy, head, invoke, *, clock=time.monotonic, progress=None):
     """One logical strategy over every section, then a cross-section stage when there are several.
 
     `invoke(current_settings, prompt, schema, validator, key)` runs one native invocation
@@ -544,6 +545,15 @@ def run_pass(settings, bundle, strategy, head, invoke, *, clock=time.monotonic):
     provider, plan = settings["provider"], expected_plan(bundle)
     multi = len(bundle["sections"]) > 1
     allowance, ledger, records = Allowance(settings, clock), Ledger(), []
+
+    def report(state, kind, section):
+        if progress is not None:
+            try:
+                progress(state, kind, section, len(bundle["sections"]))
+            except Exception:
+                # Progress is diagnostic only; it cannot alter inference or certify coverage.
+                print("Review progress unavailable; continuing the admitted pass", file=sys.stderr, flush=True)
+
     try:
         for kind, section in plan:
             current = allowance.remaining()
@@ -560,6 +570,7 @@ def run_pass(settings, bundle, strategy, head, invoke, *, clock=time.monotonic):
                 public, shown, omitted = final_prompt(bundle, provider, strategy, ledger, settings)
                 schema, validator, key = OUTPUT_SCHEMA, validate_schema, "findings"
             learned = bundle.get("learnings_text", "")
+            report("started", kind, section)
             result = invoke(current, public + learned, schema, validator, key)
             output = result["output"] if "output" in result else {"findings": result["findings"], "questions": []}
             allowance.charge(result["receipt"])
@@ -572,6 +583,7 @@ def run_pass(settings, bundle, strategy, head, invoke, *, clock=time.monotonic):
                             "receipt": result["receipt"], "output": output})
             if kind == "section":
                 ledger.add(section, output)
+            report("processed", kind, section)
     except ReviewAbort as error:
         if len(plan) == 1:
             raise

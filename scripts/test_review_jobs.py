@@ -207,6 +207,30 @@ class JobTests(unittest.TestCase):
                        if "Reviewed base" in c.body)
         self.assertIn('Sent as changed regions only and not opened by any pass: `["docs/big.md"]`.', summary)
 
+    def test_inference_progress_reports_each_pass_and_section_without_certifying_coverage(self):
+        self.sectioned()
+        summary = self.root / "step-summary.md"
+        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), \
+                patch("sys.stderr", new_callable=io.StringIO) as log, \
+                patch("sys.stdout", new_callable=io.StringIO) as normal_output:
+            self.build(single=False)
+        count = len(json.loads(self.plan.read_text())["bundle"]["sections"])
+        self.assertGreater(count, 1)
+        for pass_index in (1, 2):
+            for section in range(1, count + 1):
+                for state in ("started", "processed"):
+                    self.assertIn(f"Review pass {pass_index}/2, section {section}/{count}: {state}", summary.read_text())
+            self.assertIn(f"Review pass {pass_index}/2, cross-section consolidation: processed", summary.read_text())
+        self.assertEqual(log.getvalue(), summary.read_text().replace("\n\n", "\n"))
+        self.assertIn("Publication pending", summary.read_text())
+        self.assertNotIn("state=success", summary.read_text())
+        self.assertEqual([], self.pr.writes)
+        self.assertEqual("", normal_output.getvalue())
+        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.root)}), \
+                patch("sys.stderr", new_callable=io.StringIO) as log:
+            j.report_progress("Publication pending.")
+        self.assertIn("summary unavailable", log.getvalue())
+
     def test_complete_passes_publish_inline_summary_and_verifiable_completion(self):
         self.build([finding(path="app.py")])
         j.publish_artifact(self.artifact, self.head_dir)
@@ -402,11 +426,17 @@ class JobTests(unittest.TestCase):
         self.assertIn("!inputs.progress_only", workflow["jobs"]["source"]["if"])
         self.assertIn("progress", workflow["jobs"]["review"]["needs"])
         script = job["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-        writes, posted = [], []
+        writes, posted, reactions = [], [], []
+        reaction_failure = False
         live = copy.deepcopy(self.event["comment"])
         pr = {"state": "open", "head": {"repo": {"full_name": self.repo.full_name, "fork": False}},
               "base": {"repo": {"full_name": self.repo.full_name}}}
         def request(req, **kwargs):
+            if req.full_url.endswith("/reactions"):
+                reactions.append((req.full_url, json.loads(req.data)))
+                if reaction_failure:
+                    raise OSError("SECRET-provider-body")
+                return io.BytesIO(b'{"id": 88}')
             if req.method == "GET":
                 data = pr if "/pulls/" in req.full_url else live if "/issues/comments/9" in req.full_url else posted
             else:
@@ -418,13 +448,24 @@ class JobTests(unittest.TestCase):
                 patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
             exec(compile(script, "<trusted-progress>", "exec"), {})
             self.assertIn("accepted and queued", writes[-1][1])
+            self.assertEqual([("https://api.github.com/repos/example/project/issues/comments/9/reactions",
+                               {"content": "eyes"})], reactions)
             os.environ["PROGRESS_ONLY"] = "false"
             exec(compile(script, "<trusted-progress>", "exec"), {})
             self.assertEqual(["POST", "PATCH"], [method for method, _ in writes])
             self.assertIn("Review started", writes[-1][1])
+            self.assertIn("Actions for live pass and section progress", writes[-1][1])
+            self.assertEqual(1, len(reactions), "running updates must not repeat acknowledgment")
+            os.environ["PROGRESS_ONLY"] = "true"
+            reaction_failure = True
+            with patch("sys.stdout", new_callable=io.StringIO) as log:
+                exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertIn("reaction unavailable", log.getvalue())
+            self.assertNotIn("SECRET-provider-body", log.getvalue())
+            self.assertEqual("PATCH", writes[-1][0], "reaction failure must not suppress status")
             live["body"] = "/review deep"
             exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertEqual(2, len(writes))
+            self.assertEqual(3, len(writes))
         # A queued comment must become the verified terminal status, not linger as running.
         self.pr.comments[77] = Comment(77, posted[0]["body"], NS(**f.BOT))
         self.build()
@@ -462,7 +503,7 @@ class JobTests(unittest.TestCase):
                                          "GITHUB_EVENT_PATH": str(path), **(env or {})}),                     patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
                 exec(compile(script, "<trusted-progress>", "exec"), {})
             return writes
-        self.assertEqual(["POST"], [method for method, _ in run()], "the valid baseline must acknowledge")
+        self.assertEqual(["POST", "POST"], [method for method, _ in run()], "valid baseline needs reaction and notice")
         later = "2026-10-28T00:00:01Z"
         for name, kwargs in {
             "closed": {"pr": {"state": "closed"}},
@@ -494,7 +535,8 @@ class JobTests(unittest.TestCase):
                 self.assertEqual([], run(**kwargs))
         marker = "<!-- agent-review-notice:v1 run=123 -->\n"
         own = {"id": 77, "body": marker + "queued", "user": f.BOT}
-        self.assertEqual([("PATCH", "https://api.github.com/repos/example/project/issues/comments/77")],
+        self.assertEqual([("POST", "https://api.github.com/repos/example/project/issues/comments/9/reactions"),
+                          ("PATCH", "https://api.github.com/repos/example/project/issues/comments/77")],
                          run(existing=[own]))
         for name, foreign in {
             "human": {**own, "user": {"login": "someone", "id": 5, "type": "User"}},
@@ -503,7 +545,7 @@ class JobTests(unittest.TestCase):
             "another run": {**own, "body": marker.replace("run=123", "run=124") + "queued"},
         }.items():
             with self.subTest(name):
-                self.assertEqual(["POST"], [method for method, _ in run(existing=[foreign])])
+                self.assertEqual(["POST", "POST"], [method for method, _ in run(existing=[foreign])])
 
     def test_caller_cancellation_updates_the_queued_notice(self):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
@@ -1187,8 +1229,9 @@ class JobTests(unittest.TestCase):
         provider.assert_not_called()
         self.assertEqual(j.FOLLOWUP_NOTE + "\n", output.getvalue())
         # The fixed engine cause reaches the Actions log; stdout keeps the note alone.
-        self.assertEqual("Thread verification stopped: Complete prompt exceeds the review depth's max_model_tokens\n",
-                         errors.getvalue())
+        self.assertTrue(errors.getvalue().endswith(
+            "Thread verification stopped: Complete prompt exceeds the review depth's max_model_tokens\n"),
+            errors.getvalue())
         self.assertIsNone(json.loads(self.artifact.read_text())["verification"])
 
     def test_graphql_prepare_inference_and_publish_failures_leave_review_successful(self):

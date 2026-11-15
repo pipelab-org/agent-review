@@ -316,6 +316,18 @@ def strip_learning_text(plan):
     return plan
 
 
+def report_progress(message):
+    """Fixed driver-generated stages only, never provider text or a completion certificate."""
+    print(message, file=sys.stderr, flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with Path(summary).open("a", encoding="utf-8") as stream:
+                stream.write(message + "\n\n")
+        except OSError:
+            print("Review progress summary unavailable; inspect the step log", file=sys.stderr, flush=True)
+
+
 def infer(plan_path, output, head_dir, action=None, codex_home=None):
     policy, depth = settings()
     credentials = engine.ClaudeCredentials() if policy["provider"] == "claude" else None
@@ -343,7 +355,11 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
             review_dir = sessions.stage_head(head_dir, workspace)
             bundle = engine.attach_store(plan["bundle"], engine.sections.Store.for_checkout(review_dir))
         passes = []
-        for strategy in policy["passes"]:
+        for pass_index, strategy in enumerate(policy["passes"], 1):
+            def progress(state, kind, section, total):
+                stage = f"section {section + 1}/{total}" if kind == "section" else "cross-section consolidation"
+                report_progress(f"Review pass {pass_index}/{len(policy['passes'])}, {stage}: {state}. Publication pending.")
+
             def invoke(current, prompt, schema, validator, key, strategy=strategy):
                 if policy["provider"] == "claude":
                     return engine.run_claude(current, bundle, strategy, review_dir, prompt=prompt, schema=schema,
@@ -351,7 +367,7 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
                 return engine.run_codex(current, bundle, strategy, review_dir, action, codex_home,
                                         workspace, prompt=prompt, schema=schema,
                                         validate_output=validator, output_key=key, sessions=sessions)
-            passes.append((strategy, engine.run_pass(policy, bundle, strategy, review_dir, invoke)))
+            passes.append((strategy, engine.run_pass(policy, bundle, strategy, review_dir, invoke, progress=progress)))
         result = engine.combine_results(policy, passes)
         engine.validate_result(result, policy, bundle, prompts=True)
         validate_locations(result, head_dir, ctx["head"])
@@ -360,6 +376,7 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
     needs_verification = (plan["kind"] == "review" and plan["scope"]["kind"] != "unchanged"
                           and bool(plan.get("threads")))
     if needs_verification and policy["provider"] == "claude":
+        report_progress("Review passes processed; checking prior threads. Publication pending.")
         try:
             prompt = verification_prompt(plan)
             kwargs = dict(prompt=prompt, schema=VERIFICATION_SCHEMA,
