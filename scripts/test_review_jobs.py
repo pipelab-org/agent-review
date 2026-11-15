@@ -346,7 +346,7 @@ class JobTests(unittest.TestCase):
             self.pr.roots.clear()
             return review
         self.pr.create_review = partial
-        with self.assertRaisesRegex(e.ReviewAbort, "publication verification failed"):
+        with self.assertRaisesRegex(e.ReviewAbort, r"publication verification failed \(check=comment_count\)"):
             j.publish_artifact(self.artifact, self.head_dir)
         self.assertFalse((self.root / "completion.json").exists())
         self.assertFalse(any("state=success" in c.body for c in self.pr.comments.values()))
@@ -361,7 +361,7 @@ class JobTests(unittest.TestCase):
         publisher(commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
         self.assertEqual(2, len(roots))
         self.pr.get_review_comments = lambda: [original()[-1], original()[-1]]
-        with self.assertRaisesRegex(e.ReviewAbort, "publication verification failed"):
+        with self.assertRaisesRegex(e.ReviewAbort, r"publication verification failed \(check=comment_pair\)"):
             j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, [])(
                 commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
 
@@ -383,14 +383,14 @@ class JobTests(unittest.TestCase):
         _, roots = publish([request("app.py", "same"), request("helper.py", "same")], lambda found: found[::-1])
         self.assertEqual({"app.py", "helper.py"}, {root["path"] for root in roots})
         cases = {
-            "one comment listed twice": ([request("app.py", "same")] * 2, lambda found: [found[0], found[0]]),
+            "one comment listed twice": ([request("app.py", "same")] * 2, lambda found: [found[0], found[0]], "comment_duplicate"),
             "a new id repeating another comment": ([request("app.py", "x"), request("app.py", "y")],
-                                                   lambda found: [found[0], twin(found[0])]),
-            "a missing comment": ([request("app.py", "x"), request("app.py", "y")], lambda found: found[:1]),
-            "an extra comment": ([request("app.py", "x")], lambda found: [found[0], twin(found[0])]),
+                                                   lambda found: [found[0], twin(found[0])], "comment_pair"),
+            "a missing comment": ([request("app.py", "x"), request("app.py", "y")], lambda found: found[:1], "comment_count"),
+            "an extra comment": ([request("app.py", "x")], lambda found: [found[0], twin(found[0])], "comment_count"),
         }
-        for name, (requests, returned) in cases.items():
-            with self.subTest(name), self.assertRaisesRegex(e.ReviewAbort, "publication (verification failed|was partial)"):
+        for name, (requests, returned, check) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(e.ReviewAbort, rf"publication verification failed \(check={check}\)"):
                 publish(requests, returned)
 
     def test_progress_acknowledges_only_live_commands_and_updates_the_same_comment(self):
@@ -2154,26 +2154,93 @@ class JobTests(unittest.TestCase):
             j.reconstruct_root(forged, record)
 
     def test_a_file_thread_that_cannot_be_verified_aborts_publication_and_never_reports_success(self):
-        for name, overrides, after in (
+        for name, overrides, after, check in (
                 ("no owning review", {"pull_request_review_id": None},
                  lambda root: setattr(self.pr, "get_review", lambda i: NS(id=i, user=NS(**f.BOT), commit_id=self.pr.head.sha,
-                                                                         state="COMMENTED"))),
-                ("moved original commit", {"original_commit_id": "0" * 40}, None),
-                ("missing subject type", {"subject_type": None}, None),
-                ("line subject", {"subject_type": "line"}, None),
-                ("reply, not a root", {"in_reply_to_id": 5}, None),
-                ("human author", {}, lambda root: setattr(root, "user", NS(**f.JOSH))),
-                ("pending review", {}, lambda root: setattr(self.pr.reviews[root.raw_data["pull_request_review_id"]], "state", "PENDING")),
-                ("review by someone else", {}, lambda root: setattr(self.pr.reviews[root.raw_data["pull_request_review_id"]], "user", NS(**f.JOSH)))):
+                                                                         state="COMMENTED")), "file_review_id"),
+                ("moved original commit", {"original_commit_id": "0" * 40}, None, "file_original_commit"),
+                ("missing subject type", {"subject_type": None}, None, "file_subject"),
+                ("line subject", {"subject_type": "line"}, None, "file_subject"),
+                ("reply, not a root", {"in_reply_to_id": 5}, None, "file_reply"),
+                ("human author", {}, lambda root: setattr(root, "user", NS(**f.JOSH)), "file_author"),
+                ("wrong path", {}, lambda root: setattr(root, "path", "private-path"), "file_path"),
+                ("wrong body", {}, lambda root: setattr(root, "body", "private-body"), "file_body"),
+                ("pending review", {}, lambda root: setattr(self.pr.reviews[root.raw_data["pull_request_review_id"]], "state", "PENDING"), "file_review_state"),
+                ("review by someone else", {}, lambda root: setattr(self.pr.reviews[root.raw_data["pull_request_review_id"]], "user", NS(**f.JOSH)), "review_author")):
             with self.subTest(name):
                 self.setUp()    # a fresh repository, pull request and artifact for every case
                 self.pr.file_thread_overrides, self.pr.after_file_thread = overrides, after
                 self.offdiff(finding(path="app.py", line=40, end_line=40))
-                with self.assertRaisesRegex(e.ReviewAbort, "Inline publication verification failed"):
+                with self.assertRaisesRegex(e.ReviewAbort, rf"Inline publication verification failed \(check={check}\)") as raised:
                     j.publish_artifact(self.artifact, self.head_dir)
+                self.assertNotIn("private-path", str(raised.exception))
+                self.assertNotIn("private-body", str(raised.exception))
                 self.assertFalse((self.root / "completion.json").exists())
                 self.assertFalse(any(f.RESULT.search(c.body) for c in self.pr.comments.values()))
                 self.assertEqual(1, len(self.file_threads()), "an ambiguous write is never repeated")
+
+    def test_remaining_publication_checks_name_the_failed_fixed_label_only(self):
+        def twin(root):
+            other = copy.copy(root)
+            other.id = root.id + 500
+            return other
+        bad_commit = "0" * 40
+        review_of = lambda root: self.pr.reviews[root.raw_data["pull_request_review_id"]]
+        for name, after, check in (
+                ("non-positive comment id", lambda root: setattr(root, "id", 0), "file_id"),
+                ("another comment returned", lambda root: setattr(self.pr, "get_review_comment", lambda i: twin(root)),
+                 "file_created_id"),
+                ("moved comment commit", lambda root: setattr(root, "commit_id", bad_commit), "file_commit"),
+                ("moved review commit", lambda root: setattr(review_of(root), "commit_id", bad_commit), "review_commit")):
+            with self.subTest(name):
+                self.setUp()
+                self.pr.after_file_thread = after
+                self.offdiff(finding(path="app.py", line=40, end_line=40))
+                with self.assertRaisesRegex(e.ReviewAbort, rf"Inline publication verification failed \(check={check}\)"):
+                    j.publish_artifact(self.artifact, self.head_dir)
+                self.assertFalse((self.root / "completion.json").exists())
+                self.assertEqual(1, len(self.file_threads()), "an ambiguous write is never repeated")
+        requests = [{"path": "app.py", "line": 1, "side": "RIGHT", "body": "text"}]
+        def publisher(roots=None):
+            return j.publish.InlinePublisher(self.pr, self.pr.head.sha, lambda: None, [] if roots is None else roots)
+        def publish(inline):
+            return inline(commit=self.repo.get_commit(self.pr.head.sha), event="COMMENT", comments=requests)
+        def review_with(**changes):
+            original = self.pr.create_review
+            def create(**kwargs):
+                review = original(**kwargs)
+                for key, value in changes.items():
+                    setattr(review, key, value)
+                return review
+            self.pr.create_review = create
+        for name, change, check in (("review by someone else", {"user": NS(**f.JOSH)}, "review_author"),
+                                    ("non-positive review id", {"id": 0}, "review_id"),
+                                    ("review on another commit", {"commit_id": bad_commit}, "review_commit")):
+            with self.subTest(name):
+                self.setUp()
+                review_with(**change)
+                with self.assertRaisesRegex(e.ReviewAbort, rf"publication verification failed \(check={check}\)"):
+                    publish(publisher())
+        with self.subTest("comment by someone else"):
+            self.setUp()
+            original = self.pr.get_review_comments
+            def foreign():
+                found = [copy.copy(c) for c in original()]
+                for comment in found:
+                    comment.user = NS(**f.JOSH)
+                return found
+            self.pr.get_review_comments = foreign
+            with self.assertRaisesRegex(e.ReviewAbort, r"publication verification failed \(check=comment_identity\)"):
+                publish(publisher())
+        with self.subTest("previously verified root disappeared"):
+            self.setUp()
+            roots = []
+            publish(publisher(roots))
+            self.pr.get_review_comments = lambda: []
+            with self.assertRaisesRegex(e.ReviewAbort, r"publication verification failed \(check=prior_root\)"):
+                publish(publisher(roots))
+        self.assertEqual("unknown", j.publish._PublicationCheck("private-body").check.value)
+        self.assertNotIn("private-body", str(j.publish._PublicationCheck("private-body")))
 
     def test_partial_and_ambiguous_file_thread_failures_are_not_retried_and_leave_no_success(self):
         lines = [f"line {i}\n" for i in range(60)]
@@ -2181,12 +2248,26 @@ class JobTests(unittest.TestCase):
         self.pr.file_thread_failure = 2           # the second write fails after it may have persisted
         self.build([finding(path="app.py", line=40, end_line=40, title="First", mechanism="m1"),
                     finding(path="app.py", line=50, end_line=50, title="Second", mechanism="m2")])
-        with self.assertRaisesRegex(e.ReviewAbort, "Inline publication verification failed"):
+        with self.assertRaisesRegex(e.ReviewAbort, r"Inline publication verification failed \(OSError\)") as raised:
             j.publish_artifact(self.artifact, self.head_dir)
+        self.assertNotIn("ambiguous write", str(raised.exception))
         self.assertEqual(2, len(self.file_threads()))
         self.assertFalse((self.root / "completion.json").exists())
         self.assertFalse(any(f.RESULT.search(c.body) for c in self.pr.comments.values()))
         self.assertTrue(any("pending; no completed review yet" in c.body for c in self.pr.comments.values()))
+
+    def test_binding_failures_name_the_stage_without_exposing_exception_text(self):
+        for mode in ("batch", "file"):
+            for kind in (e.ReviewAbort, RuntimeError):
+                with self.subTest(mode=mode, kind=kind.__name__):
+                    def refused():
+                        raise kind("private binding detail")
+                    inline = j.publish.InlinePublisher(self.pr, self.pr.head.sha, refused, [])
+                    label = "check=binding" if kind is e.ReviewAbort else "RuntimeError"
+                    with self.assertRaisesRegex(e.ReviewAbort, rf"verification failed \({label}\)") as raised:
+                        inline() if mode == "batch" else inline.file_thread("app.py", "body")
+                    self.assertNotIn("private binding detail", str(raised.exception))
+                    self.assertEqual([], self.pr.writes, "failed binding must precede every write")
 
     def test_the_head_is_rechecked_before_each_separate_file_thread_write(self):
         lines = [f"line {i}\n" for i in range(60)]
@@ -2194,7 +2275,7 @@ class JobTests(unittest.TestCase):
         self.build([finding(path="app.py", line=40, end_line=40, title="First", mechanism="m1"),
                     finding(path="app.py", line=50, end_line=50, title="Second", mechanism="m2")])
         self.pr.after_file_thread = lambda root: setattr(self.pr.head, "sha", "f" * 40)
-        with self.assertRaisesRegex(e.ReviewAbort, "Inline publication verification failed"):
+        with self.assertRaisesRegex(e.ReviewAbort, r"Inline publication verification failed \(check=binding\)"):
             j.publish_artifact(self.artifact, self.head_dir)
         self.assertEqual(1, len(self.file_threads()), "the second write must not start on a moved head")
 

@@ -4,6 +4,7 @@
 import base64
 import hashlib
 import json
+from enum import Enum
 
 try:
     from . import review_followups as followups, review_reliability as reliability
@@ -12,6 +13,43 @@ except ImportError:
     import review_followups as followups
     import review_reliability as reliability
     from review_engine import ReviewAbort
+
+class _Check(Enum):
+    """Fixed diagnostics for the existing GitHub publication checks; never API text."""
+
+    UNKNOWN = "unknown"
+    BINDING = "binding"
+    PRIOR_ROOT = "prior_root"
+    REVIEW_AUTHOR = "review_author"
+    REVIEW_ID = "review_id"
+    REVIEW_COMMIT = "review_commit"
+    COMMENT_COUNT = "comment_count"
+    COMMENT_PAIR = "comment_pair"
+    COMMENT_DUPLICATE = "comment_duplicate"
+    COMMENT_IDENTITY = "comment_identity"
+    FILE_AUTHOR = "file_author"
+    FILE_ID = "file_id"
+    FILE_CREATED_ID = "file_created_id"
+    FILE_COMMIT = "file_commit"
+    FILE_ORIGINAL_COMMIT = "file_original_commit"
+    FILE_PATH = "file_path"
+    FILE_BODY = "file_body"
+    FILE_REPLY = "file_reply"
+    FILE_SUBJECT = "file_subject"
+    FILE_REVIEW_ID = "file_review_id"
+    FILE_REVIEW_STATE = "file_review_state"
+
+
+class _PublicationCheck(ReviewAbort):
+    def __init__(self, check):
+        self.check = check if isinstance(check, _Check) else _Check.UNKNOWN
+        super().__init__(f"Inline publication verification failed (check={self.check.value})")
+
+
+def _require(condition, check):
+    if not condition:
+        raise _PublicationCheck(check)
+
 
 class InlinePublisher:
     """Verify publications and make repeated marked requests idempotent per run."""
@@ -28,17 +66,25 @@ class InlinePublisher:
                 and comment.raw_data.get("in_reply_to_id") is None
                 and comment.raw_data.get("pull_request_review_id") == review_id)
 
+    def verify_binding(self):
+        try:
+            self.check_binding()
+        except ReviewAbort:
+            raise _PublicationCheck(_Check.BINDING) from None
+
     def __call__(self, *args, **kwargs):
         try:
             with reliability.phase("publication"):
                 return self.publish(*args, **kwargs)
+        except _PublicationCheck as error:
+            raise ReviewAbort(f"Inline publication verification failed (check={error.check.value})") from None
         except Exception as error:
             # Includes HTTP 422: never let upstream retry an ambiguous write.
             raise ReviewAbort(f"Inline publication verification failed ({type(error).__name__})") from None
 
     def publish(self, *args, **kwargs):
 
-        self.check_binding()
+        self.verify_binding()
         requested = kwargs.get("comments", [])
         remaining, reused = [], None
         # Only roots verified by this adapter in this run may suppress a write.
@@ -49,7 +95,7 @@ class InlinePublisher:
             if (comment is None or not self.valid_root(comment, root["review_id"])
                     or comment.path != root["path"]
                     or followups.digest(comment.body) != root["digest"]):
-                raise ReviewAbort("Previously verified inline publication changed")
+                raise _PublicationCheck(_Check.PRIOR_ROOT)
         for request in requested:
             found = False
             if request["body"]:
@@ -66,13 +112,13 @@ class InlinePublisher:
         if requested and not remaining:
             return reused
         result = self.create_review(*args, **dict(kwargs, comments=remaining))
-        if (not followups.identity(result.user, followups.BOT)
-                or not followups.positive(result.id) or result.commit_id != self.head):
-            raise ReviewAbort("Inline review publication identity could not be verified")
+        _require(followups.identity(result.user, followups.BOT), _Check.REVIEW_AUTHOR)
+        _require(followups.positive(result.id), _Check.REVIEW_ID)
+        _require(result.commit_id == self.head, _Check.REVIEW_COMMIT)
         comments = [c for c in self.pr.get_review_comments()
                     if c.raw_data.get("pull_request_review_id") == result.id]
         if len(comments) != len(remaining):
-            raise ReviewAbort("Inline review publication was partial")
+            raise _PublicationCheck(_Check.COMMENT_COUNT)
         verified = []
         # GitHub lists review comments by its own ordering, not the order in the
         # create-review request. Match the complete multiset; consume each request
@@ -82,11 +128,11 @@ class InlinePublisher:
         for comment in comments:
             request = next((r for r in unmatched
                             if comment.body == r["body"] and comment.path == r["path"]), None)
-            if request is None or comment.id in seen:
-                raise ReviewAbort("Inline comment publication could not be verified")
+            _require(request is not None, _Check.COMMENT_PAIR)
+            _require(comment.id not in seen, _Check.COMMENT_DUPLICATE)
             if (not self.valid_root(comment, result.id) or comment.body != request["body"]
                     or comment.path != request["path"]):
-                raise ReviewAbort("Inline comment publication could not be verified")
+                raise _PublicationCheck(_Check.COMMENT_IDENTITY)
             unmatched.remove(request)
             seen.add(comment.id)
             verified.append({"id": comment.id, "review_id": result.id, "path": comment.path,
@@ -108,28 +154,33 @@ class InlinePublisher:
         try:
             with reliability.phase("publication"):
                 return self.publish_file(path, body)
+        except _PublicationCheck as error:
+            raise ReviewAbort(f"Inline publication verification failed (check={error.check.value})") from None
         except Exception as error:
             raise ReviewAbort(f"Inline publication verification failed ({type(error).__name__})") from None
 
     def publish_file(self, path, body):
-        self.check_binding()
+        self.verify_binding()
         created = self.pr.create_review_comment(body, self.head, path, subject_type="file")
         comment = self.pr.get_review_comment(created.id)
         raw = comment.raw_data
         review_id = raw.get("pull_request_review_id")
-        if (not followups.identity(comment.user, followups.BOT) or not followups.positive(comment.id)
-                or comment.id != created.id or comment.commit_id != self.head
-                or raw.get("original_commit_id") != self.head or comment.path != path or comment.body != body
-                or raw.get("in_reply_to_id") is not None
-                # GitHub returns line=1 even for subject_type=file responses.
-                # Subject type identifies the thread; its placeholder line is not
-                # the finding's source location, which remains in the verified body.
-                or raw.get("subject_type") != "file" or not followups.positive(review_id)):
-            raise ReviewAbort("Inline comment publication could not be verified")
+        _require(followups.identity(comment.user, followups.BOT), _Check.FILE_AUTHOR)
+        _require(followups.positive(comment.id), _Check.FILE_ID)
+        _require(comment.id == created.id, _Check.FILE_CREATED_ID)
+        _require(comment.commit_id == self.head, _Check.FILE_COMMIT)
+        _require(raw.get("original_commit_id") == self.head, _Check.FILE_ORIGINAL_COMMIT)
+        _require(comment.path == path, _Check.FILE_PATH)
+        _require(comment.body == body, _Check.FILE_BODY)
+        _require(raw.get("in_reply_to_id") is None, _Check.FILE_REPLY)
+        # GitHub returns line=1 even for subject_type=file responses. Subject
+        # type identifies the thread; the verified body carries its location.
+        _require(raw.get("subject_type") == "file", _Check.FILE_SUBJECT)
+        _require(followups.positive(review_id), _Check.FILE_REVIEW_ID)
         review = self.pr.get_review(review_id)
-        if (not followups.identity(review.user, followups.BOT) or review.commit_id != self.head
-                or review.state != "COMMENTED"):
-            raise ReviewAbort("Inline review publication identity could not be verified")
+        _require(followups.identity(review.user, followups.BOT), _Check.REVIEW_AUTHOR)
+        _require(review.commit_id == self.head, _Check.REVIEW_COMMIT)
+        _require(review.state == "COMMENTED", _Check.FILE_REVIEW_STATE)
         self.roots.append({"id": comment.id, "review_id": review_id, "path": path, "commit": self.head,
                            "digest": followups.digest(body)})
         return comment
