@@ -430,6 +430,7 @@ class JobTests(unittest.TestCase):
                 publish(requests, returned)
 
     def test_progress_acknowledges_only_live_commands_and_updates_the_same_comment(self):
+        from urllib.error import HTTPError
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
                                    ".github/workflows/agent-review-reusable.yaml").read_text())
         job = workflow["jobs"]["progress"]
@@ -448,8 +449,10 @@ class JobTests(unittest.TestCase):
         def request(req, **kwargs):
             if req.full_url.endswith("/reactions"):
                 reactions.append((req.full_url, json.loads(req.data)))
-                if reaction_failure:
+                if reaction_failure == "transport":
                     raise OSError("SECRET-provider-body")
+                if reaction_failure:
+                    raise HTTPError(req.full_url, reaction_failure, "SECRET-provider-body", {}, None)
                 return io.BytesIO(b'{"id": 88}')
             if req.method == "GET":
                 data = pr if "/pulls/" in req.full_url else live if "/issues/comments/9" in req.full_url else posted
@@ -471,15 +474,17 @@ class JobTests(unittest.TestCase):
             self.assertIn("Actions for live pass and section progress", writes[-1][1])
             self.assertEqual(1, len(reactions), "running updates must not repeat acknowledgment")
             os.environ["PROGRESS_ONLY"] = "true"
-            reaction_failure = True
-            with patch("sys.stdout", new_callable=io.StringIO) as log:
-                exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertIn("reaction unavailable", log.getvalue())
-            self.assertNotIn("SECRET-provider-body", log.getvalue())
-            self.assertEqual("PATCH", writes[-1][0], "reaction failure must not suppress status")
+            for reaction_failure in (403, 429, "transport"):
+                with patch("sys.stdout", new_callable=io.StringIO) as log:
+                    exec(compile(script, "<trusted-progress>", "exec"), {})
+                self.assertIn("reaction unavailable", log.getvalue())
+                if type(reaction_failure) is int:
+                    self.assertIn(f"HTTP {reaction_failure}", log.getvalue())
+                self.assertNotIn("SECRET-provider-body", log.getvalue())
+                self.assertEqual("PATCH", writes[-1][0], "reaction failure must not suppress status")
             live["body"] = "/review deep"
             exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertEqual(3, len(writes))
+            self.assertEqual(5, len(writes))
         # A queued comment must become the verified terminal status, not linger as running.
         self.pr.comments[77] = Comment(77, posted[0]["body"], NS(**f.BOT))
         self.build()
@@ -490,6 +495,7 @@ class JobTests(unittest.TestCase):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
                                    ".github/workflows/agent-review-reusable.yaml").read_text())
         script = workflow["jobs"]["progress"]["steps"][0]["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        last_log = []
         def run(event=None, env=None, pr=None, live=None, existing=()):
             body = copy.deepcopy(self.event)
             for key, value in (event or {}).items():
@@ -515,7 +521,9 @@ class JobTests(unittest.TestCase):
                 return io.BytesIO(json.dumps(list(existing)).encode())
             with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true",
                                          "GITHUB_EVENT_PATH": str(path), **(env or {})}),                     patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
-                exec(compile(script, "<trusted-progress>", "exec"), {})
+                with patch("sys.stdout", new_callable=io.StringIO) as log:
+                    exec(compile(script, "<trusted-progress>", "exec"), {})
+                last_log[:] = [log.getvalue()]
             return writes
         self.assertEqual(["POST", "POST"], [method for method, _ in run()], "valid baseline needs reaction and notice")
         later = "2026-10-28T00:00:01Z"
@@ -547,6 +555,7 @@ class JobTests(unittest.TestCase):
         }.items():
             with self.subTest(name):
                 self.assertEqual([], run(**kwargs))
+                self.assertRegex(last_log[0], r"Review acknowledgment skipped \(check=[a-z_]+\)")
         marker = "<!-- agent-review-notice:v1 run=123 -->\n"
         own = {"id": 77, "body": marker + "queued", "user": f.BOT}
         self.assertEqual([("POST", "https://api.github.com/repos/example/project/issues/comments/9/reactions"),
@@ -1231,6 +1240,27 @@ class JobTests(unittest.TestCase):
                                  (j.validate_reply, self.answer()["output"])):
             with patch.object(f, "MAX_DATA_BYTES", len(f.canonical(value).encode()) - 1), self.assertRaises(e.ReviewAbort):
                 validator(value)
+
+    def test_unwritable_followup_diagnostics_preserve_completed_paid_passes(self):
+        proof, _ = self.prior_threads()
+        class Closed:
+            def write(self, *_):
+                raise OSError("SECRET-closed-stream")
+            flush = write
+        for failure in (e.ReviewAbort("Fixed engine stop"), RuntimeError("SECRET-provider-body")):
+            self.prepare_verification(proof)
+            def run(policy, bundle, strategy, head, **kwargs):
+                if strategy == "verify-threads":
+                    raise failure
+                r = receipt(strategy); r["files_opened"] = ["app.py"]
+                return {"findings": [], "receipt": r}
+            with patch.object(e, "run_claude", side_effect=run), \
+                    patch("sys.stdout", Closed()), patch("sys.stderr", Closed()):
+                j.infer(self.plan, self.artifact, self.head_dir)
+            artifact = json.loads(self.artifact.read_text())
+            self.assertIsNone(artifact["verification"])
+            self.assertEqual(2, len(artifact["result"]["receipt"]["passes"]))
+            self.assertNotIn("SECRET", self.artifact.read_text())
 
     def test_oversized_verification_prompt_skips_without_a_provider_call(self):
         import io

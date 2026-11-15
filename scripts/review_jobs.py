@@ -157,7 +157,7 @@ def prepare(head_dir, output, reply=False):
         try:
             threads = collect_threads(pr, records(repo, pr, ctx, policy, all_depths=True))
         except Exception:
-            print(FOLLOWUP_NOTE)
+            diagnostic(FOLLOWUP_NOTE)
     plan = {"context": ctx, "scope": scope, "bundle": bundle, "kind": "review", "threads": threads}
     engine.save(output, plan)
     write_learning_identity(ctx)
@@ -316,6 +316,14 @@ def strip_learning_text(plan):
     return plan
 
 
+def diagnostic(message, *, error=False):
+    """Optional follow-up notices must not discard completed paid review passes."""
+    try:
+        print(message, file=sys.stderr if error else sys.stdout, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def report_progress(message):
     """Fixed driver-generated stages only, never provider text or a completion certificate."""
     try:
@@ -393,11 +401,11 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
         except engine.ReviewAbort as error:
             # ReviewAbort text is fixed engine wording, never provider output.
             verification = None
-            print(FOLLOWUP_NOTE)
-            print(f"Thread verification stopped: {error}", file=sys.stderr)
+            diagnostic(FOLLOWUP_NOTE)
+            diagnostic(f"Thread verification stopped: {error}", error=True)
         except Exception:
             verification = None
-            print(FOLLOWUP_NOTE)
+            diagnostic(FOLLOWUP_NOTE)
     # Exact byte metadata reproduces bundle sizing without fetching private text.
     engine.save(output, {"plan": plan, "result": result, "verification": verification})
     if os.environ.get("GITHUB_OUTPUT"):
@@ -453,7 +461,7 @@ def publish_reply(repo, pr, ctx, policy, plan, result, head_dir=None):
         try:
             thread = followups.review_threads(pr).get(root.id)
         except Exception:
-            print(FOLLOWUP_NOTE)
+            diagnostic(FOLLOWUP_NOTE)
     if command and (thread is None or thread["isResolved"]):
         return
     resolvable = bool(authorized and thread and not thread["isResolved"]
@@ -497,7 +505,7 @@ def publish_reply(repo, pr, ctx, policy, plan, result, head_dir=None):
         except Exception:
             failed = True
     if failed:
-        print(FOLLOWUP_NOTE)
+        diagnostic(FOLLOWUP_NOTE)
 
 
 COMMAND_NOT_ATTEMPTED_NOTE = "Resolution was not attempted; check the thread."
@@ -1036,7 +1044,7 @@ def publish_verification(repo, pr, ctx, policy, plan, verification, head_dir):
         judged = judged_comments(comments)
         expected = {item["thread"]: item for item in plan["threads"]}
     except Exception:
-        print(FOLLOWUP_NOTE)
+        diagnostic(FOLLOWUP_NOTE)
         return
     failed = False
     for item in value["threads"]:
@@ -1070,7 +1078,7 @@ def publish_verification(repo, pr, ctx, policy, plan, verification, head_dir):
         except Exception:
             failed = True
     if failed:
-        print(FOLLOWUP_NOTE)
+        diagnostic(FOLLOWUP_NOTE)
 
 
 def code(text):
@@ -1394,7 +1402,7 @@ def optional_verification(path, artifact, policy, head_dir, head):
         validate_verification_result(verification, artifact["plan"]["threads"], policy, head_dir, head, confirm=False)
         return verification
     except Exception:
-        print(FOLLOWUP_NOTE)
+        diagnostic(FOLLOWUP_NOTE)
         return None
 
 
