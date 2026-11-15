@@ -82,7 +82,11 @@ jobs:
     if: ${{ always() && ((inputs.progress_only && inputs.progress_cancelled) || (!cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true'))) && github.event_name == 'issue_comment' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # GitHub's permission table authorizes the issue-comment reaction endpoint with Issues write
+    # alone; creating and editing the notice accepts either permission. The callers already grant both.
+    # https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
     permissions:
+      issues: write
       pull-requests: write
     steps:
     - name: Acknowledge the exact live command without checking out code
@@ -97,6 +101,7 @@ jobs:
         import os
         import re
         import time
+        import urllib.error
         import urllib.request
 
         def main():
@@ -114,6 +119,7 @@ jobs:
                     and user.get("login") == "luckyPipewrench" and user.get("id") == 142104046
                     and user.get("type") == "User" and comment.get("author_association") == "MEMBER"
                     and comment.get("body") in commands and issue.get("pull_request")):
+                print("Review acknowledgment skipped (check=event)")
                 return
             repo, number, run = env["GITHUB_REPOSITORY"], issue.get("number"), env["GITHUB_RUN_ID"]
             if not (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
@@ -121,6 +127,7 @@ jobs:
                     and type(number) is int and number > 0
                     and type(comment.get("id")) is int and comment["id"] > 0
                     and re.fullmatch(r"[1-9][0-9]*", run)):
+                print("Review acknowledgment skipped (check=binding)")
                 return
             def api(method, path, data=None):
                 if method != "GET":
@@ -136,20 +143,37 @@ jobs:
             if not (pr["state"] == "open" and pr["head"]["repo"] is not None
                     and pr["head"]["repo"]["fork"] is False
                     and pr["head"]["repo"]["full_name"] == repo and pr["base"]["repo"]["full_name"] == repo):
+                print("Review acknowledgment skipped (check=pull_request)")
                 return
             live = api("GET", f"{prefix}/issues/comments/{comment['id']}")
             if not (all(live.get(k) == comment.get(k) for k in ("id", "body", "created_at", "updated_at"))
                     and comment.get("created_at") is not None and comment["created_at"] == comment.get("updated_at")
                     and all(live.get("user", {}).get(k) == user[k] for k in ("id", "login", "type"))):
+                print("Review acknowledgment skipped (check=command)")
                 return
             terminal = env.get("PROGRESS_CANCELLED") == "true"
             if terminal and env.get("PROGRESS_ONLY") != "true":
+                print("Review acknowledgment skipped (check=terminal_writer)")
                 return
+            # GitHub's issue-comment reaction API is idempotent for the same actor/content:
+            # https://docs.github.com/en/rest/reactions/reactions#create-reaction-for-an-issue-comment
+            # Eyes acknowledges receipt, not completed coverage. A reaction failure must not
+            # prevent the existing queued/running notice or the independently admitted review.
+            if not terminal and env.get("PROGRESS_ONLY") == "true":
+                try:
+                    api("POST", f"{prefix}/issues/comments/{comment['id']}/reactions", {"content": "eyes"})
+                except urllib.error.HTTPError as error:
+                    # HTTP status range: RFC 9110 section 15. Never log response bodies or headers.
+                    status = error.code if type(error.code) is int and 100 <= error.code <= 599 else "unknown"
+                    print(f"::warning::Review reaction unavailable (HTTP {status}); continuing with the status notice")
+                except Exception:
+                    print("::warning::Review reaction unavailable; continuing with the status notice")
             marker = f"<!-- agent-review-notice:v1 run={run} -->"
             message = ("Review run cancelled. This notice does not establish completed coverage; inspect Actions for any published result."
                        if terminal else "Review request accepted and queued. No completed review yet."
                        if env.get("PROGRESS_ONLY") == "true" else
-                       "Review started: preparing the captured diff and running the configured passes. No completed review yet.")
+                       "Review started: preparing the captured diff and running the configured passes. No completed review yet. "
+                       "Open Actions for live pass and section progress. This comment updates again when the run finishes.")
             body = marker + "\n" + message + f"\n\n[Actions run](https://github.com/{repo}/actions/runs/{run})."
             page = 1
             while True:

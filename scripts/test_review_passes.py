@@ -126,7 +126,12 @@ class PassTests(Repo):
         self.assertGreater(count, 1)
         calls = []
         policy = dict(SMALL, max_turns=100, max_budget_usd=50.0)
-        records = e.run_pass(policy, bundle, "bundle", self.root, self.invoke_factory(record=calls))
+        progress = []
+        records = e.run_pass(policy, bundle, "bundle", self.root, self.invoke_factory(record=calls),
+                             progress=lambda *event: progress.append(event))
+        expected = [(state, "section", index, count) for index in range(count) for state in ("started", "processed")]
+        expected += [(state, "consolidation", None, count) for state in ("started", "processed")]
+        self.assertEqual(expected, progress)
         self.assertEqual(count + 1, len(calls))
         self.assertEqual(["section"] * count + ["consolidation"], [r["kind"] for r in records])
         self.assertEqual(list(range(count)) + [None], [r["section"] for r in records])
@@ -145,6 +150,42 @@ class PassTests(Repo):
         validated = e.combine_results(policy, [("bundle", records)])
         policy_one = dict(policy, passes=["bundle"])
         e.validate_result(validated, policy_one, bundle, prompts=True)
+
+    def test_progress_failure_is_best_effort_and_a_stopped_section_is_not_processed(self):
+        bundle = self.bundle()
+        policy = dict(SMALL, max_turns=100, max_budget_usd=50.0)
+        events = []
+        calls = []
+        native = self.invoke_factory(record=calls)
+        def invoke(*args):
+            if calls:
+                raise e.ReviewAbort("Provider stopped")
+            return native(*args)
+        with self.assertRaises(e.IncompleteReviewAbort):
+            e.run_pass(policy, bundle, "bundle", self.root, invoke,
+                       progress=lambda *event: events.append(event))
+        count = len(bundle["sections"])
+        self.assertEqual([("started", "section", 0, count), ("processed", "section", 0, count),
+                          ("started", "section", 1, count)], events)
+        def broken(*_):
+            raise OSError("SECRET-progress-error")
+        with patch("builtins.print") as log:
+            records = e.run_pass(policy, bundle, "bundle", self.root, self.invoke_factory(), progress=broken)
+        self.assertEqual(count + 1, len(records))
+        self.assertNotIn("SECRET-progress-error", str(log.call_args_list))
+
+    def test_an_unwritable_diagnostic_stream_never_stops_a_pass(self):
+        bundle = self.bundle()
+        policy = dict(SMALL, max_turns=100, max_budget_usd=50.0)
+        class Closed:
+            def write(self, *_):
+                raise OSError("stream closed")
+            flush = write
+        def broken(*_):
+            raise OSError("progress failed")
+        with patch("sys.stderr", Closed()):
+            records = e.run_pass(policy, bundle, "bundle", self.root, self.invoke_factory(), progress=broken)
+        self.assertEqual(len(bundle["sections"]) + 1, len(records))
 
     def test_both_default_strategies_cover_all_sections_independently(self):
         bundle = self.bundle()
