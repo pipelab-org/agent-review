@@ -82,7 +82,11 @@ jobs:
     if: ${{ always() && ((inputs.progress_only && inputs.progress_cancelled) || (!cancelled() && (inputs.progress_only || needs.admit.outputs.admitted == 'true'))) && github.event_name == 'issue_comment' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # GitHub's permission table authorizes the issue-comment reaction endpoint with Issues write
+    # alone; creating and editing the notice accepts either permission. The callers already grant both.
+    # https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
     permissions:
+      issues: write
       pull-requests: write
     steps:
     - name: Acknowledge the exact live command without checking out code

@@ -421,7 +421,9 @@ class JobTests(unittest.TestCase):
         workflow = yaml.safe_load((Path(__file__).resolve().parents[1] /
                                    ".github/workflows/agent-review-reusable.yaml").read_text())
         job = workflow["jobs"]["progress"]
-        self.assertEqual({"pull-requests": "write"}, job["permissions"])
+        # The reaction endpoint is authorized by Issues write only (GitHub's published permission table);
+        # a fixture API cannot model that, so the permission is pinned alongside the call it serves.
+        self.assertEqual({"issues": "write", "pull-requests": "write"}, job["permissions"])
         self.assertIn("inputs.progress_only", workflow["concurrency"]["group"])
         self.assertIn("!inputs.progress_only", workflow["jobs"]["source"]["if"])
         self.assertIn("progress", workflow["jobs"]["review"]["needs"])
