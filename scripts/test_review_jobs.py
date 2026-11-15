@@ -2256,13 +2256,26 @@ class JobTests(unittest.TestCase):
         self.assertFalse(any(f.RESULT.search(c.body) for c in self.pr.comments.values()))
         self.assertTrue(any("pending; no completed review yet" in c.body for c in self.pr.comments.values()))
 
+    def test_binding_failures_name_the_stage_without_exposing_exception_text(self):
+        for mode in ("batch", "file"):
+            for kind in (e.ReviewAbort, RuntimeError):
+                with self.subTest(mode=mode, kind=kind.__name__):
+                    def refused():
+                        raise kind("private binding detail")
+                    inline = j.publish.InlinePublisher(self.pr, self.pr.head.sha, refused, [])
+                    label = "check=binding" if kind is e.ReviewAbort else "RuntimeError"
+                    with self.assertRaisesRegex(e.ReviewAbort, rf"verification failed \({label}\)") as raised:
+                        inline() if mode == "batch" else inline.file_thread("app.py", "body")
+                    self.assertNotIn("private binding detail", str(raised.exception))
+                    self.assertEqual([], self.pr.writes, "failed binding must precede every write")
+
     def test_the_head_is_rechecked_before_each_separate_file_thread_write(self):
         lines = [f"line {i}\n" for i in range(60)]
         self.restage("".join(lines), "".join(["changed first\n", *lines[1:]]))
         self.build([finding(path="app.py", line=40, end_line=40, title="First", mechanism="m1"),
                     finding(path="app.py", line=50, end_line=50, title="Second", mechanism="m2")])
         self.pr.after_file_thread = lambda root: setattr(self.pr.head, "sha", "f" * 40)
-        with self.assertRaisesRegex(e.ReviewAbort, "Inline publication verification failed"):
+        with self.assertRaisesRegex(e.ReviewAbort, r"Inline publication verification failed \(check=binding\)"):
             j.publish_artifact(self.artifact, self.head_dir)
         self.assertEqual(1, len(self.file_threads()), "the second write must not start on a moved head")
 

@@ -18,6 +18,7 @@ class _Check(Enum):
     """Fixed diagnostics for the existing GitHub publication checks; never API text."""
 
     UNKNOWN = "unknown"
+    BINDING = "binding"
     PRIOR_ROOT = "prior_root"
     REVIEW_AUTHOR = "review_author"
     REVIEW_ID = "review_id"
@@ -65,6 +66,12 @@ class InlinePublisher:
                 and comment.raw_data.get("in_reply_to_id") is None
                 and comment.raw_data.get("pull_request_review_id") == review_id)
 
+    def verify_binding(self):
+        try:
+            self.check_binding()
+        except ReviewAbort:
+            raise _PublicationCheck(_Check.BINDING) from None
+
     def __call__(self, *args, **kwargs):
         try:
             with reliability.phase("publication"):
@@ -77,7 +84,7 @@ class InlinePublisher:
 
     def publish(self, *args, **kwargs):
 
-        self.check_binding()
+        self.verify_binding()
         requested = kwargs.get("comments", [])
         remaining, reused = [], None
         # Only roots verified by this adapter in this run may suppress a write.
@@ -153,7 +160,7 @@ class InlinePublisher:
             raise ReviewAbort(f"Inline publication verification failed ({type(error).__name__})") from None
 
     def publish_file(self, path, body):
-        self.check_binding()
+        self.verify_binding()
         created = self.pr.create_review_comment(body, self.head, path, subject_type="file")
         comment = self.pr.get_review_comment(created.id)
         raw = comment.raw_data
