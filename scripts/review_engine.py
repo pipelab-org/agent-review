@@ -465,10 +465,6 @@ def validate_schema(data):
         raise ReviewAbort("Invalid findings schema")
     if len(data["findings"]) > MAX_FINDINGS:
         raise ReviewAbort("Findings exceed the six-candidate per-pass schema")
-    try:
-        from . import review_suggestions as suggestions
-    except ImportError:
-        import review_suggestions as suggestions
     required = set(FINDING_SCHEMA["required"]) - {"suggestion"}
     for item in data["findings"]:
         if not isinstance(item, dict) or not required <= set(item) <= required | {"suggestion"}:
@@ -478,8 +474,6 @@ def validate_schema(data):
                                      or not isinstance(suggestion.get("original"), str) or not suggestion["original"]
                                      or not isinstance(suggestion.get("replacement"), str)):
             item.pop("suggestion", None)
-        for key in ("title", "mechanism", "trigger", "consequence", "repair"):
-            item[key] = suggestions.strip_fences(item[key])
         if any(not isinstance(item[k], str) or not item[k].strip() for k in
                ("path", "title", "mechanism", "trigger", "consequence", "repair", "confidence")):
             raise ReviewAbort("Invalid finding text")

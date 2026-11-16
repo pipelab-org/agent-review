@@ -94,9 +94,12 @@ class CounterTests(unittest.TestCase):
                 data = {"artifacts": []}
             elif "/jobs?per_page=100" in request.full_url:
                 data = {"jobs": [{"name": "review / Review admitted diff", "status":
-                    "in_progress" if sum("/jobs?" in url for _, url in calls) == 1 else "completed"}]}
+                    "completed" if any(method == "PATCH" for method, _ in calls) else "in_progress"}]}
             elif request.full_url.endswith("/artifact"):
                 return io.BytesIO(blob.getvalue())
+            elif "/issues/comments/5" in request.full_url:
+                data = {"id": 5, "body": progress.NOTICE.format(run="99") + "\nqueued",
+                        "user": {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}}
             else:
                 data = [{"id": 5, "body": progress.NOTICE.format(run="99") + "\nqueued",
                          "user": {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}}]
@@ -118,6 +121,63 @@ class CounterTests(unittest.TestCase):
         self.assertFalse(progress._job_done([{"name": "acknowledge / Review admitted diff", "status": "completed"}]))
         self.assertFalse(progress._job_done([{"name": "review / Review admitted diff", "status": "in_progress"}]))
         self.assertTrue(progress._job_done([{"name": "review / Review admitted diff", "status": "completed"}]))
+
+    def test_paced_pagination_reaches_patch_and_rechecks_completed_jobs(self):
+        blob = io.BytesIO()
+        with zipfile.ZipFile(blob, "w") as archive:
+            archive.writestr("progress.json", json.dumps(record(seq=2)))
+        env = {"GH_TOKEN": "fixture", "GITHUB_REPOSITORY": BINDING["repository"],
+               "PR_NUMBER": "7", "REVIEW_HEAD": HEAD, "GITHUB_RUN_ID": "99", "GITHUB_RUN_ATTEMPT": "1"}
+        for stop_case in ('running', 'job', 'notice'):
+            now, calls, finished = [0.0], [], [False]
+            def sleep(seconds):
+                now[0] += seconds
+            class Opener:
+                def open(self, request, timeout=0):
+                    calls.append((request.get_method(), request.full_url, now[0]))
+                    url = request.full_url
+                    if '/jobs?' in url:
+                        data = {"jobs": [{"name": "review / Review admitted diff",
+                                          "status": "completed" if finished[0] else "in_progress"}]}
+                    elif '/comments?' in url:
+                        page = int(url.rsplit('page=', 1)[1])
+                        if page < 3:
+                            data = [{"id": 100 + page * 100 + i, "body": "unrelated"} for i in range(100)]
+                            finished[0] = stop_case == 'job'
+                        else:
+                            data = [{"id": 5, "body": progress.NOTICE.format(run="99") + "\nqueued",
+                                     "user": {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}}]
+                    elif '/artifacts?' in url:
+                        data = {"artifacts": [{"id": 21, "name": progress.artifact_name('99', '1', 2),
+                                               "expired": False, "size_in_bytes": len(blob.getvalue())}]}
+                    elif url.endswith('/zip'):
+                        data = None
+                    elif '/issues/comments/5' in url and request.get_method() == 'GET':
+                        data = {"id": 5, "body": progress.NOTICE.format(run="99") + ("\nReview run cancelled" if stop_case == "notice" else "\nqueued"),
+                                "user": {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}}
+                    elif request.get_method() == 'PATCH':
+                        data = {"body": json.loads(request.data)['body']}
+                        finished[0] = True
+                    else:
+                        raise AssertionError(url)
+                    response = io.BytesIO(blob.getvalue() if data is None else json.dumps(data).encode())
+                    response.headers = {"x-ratelimit-remaining": str(1000 - len(calls)), "x-ratelimit-reset": '3600'}
+                    return response
+            original = progress.RateOpener
+            class ClockedRateOpener(original):
+                def __init__(self, opener, sleeper):
+                    super().__init__(opener, sleeper, clock=lambda: now[0])
+            with self.subTest(stop_case=stop_case), \
+                    patch.object(progress, 'RateOpener', ClockedRateOpener), \
+                    patch.object(progress.time, 'monotonic', side_effect=lambda: now[0]):
+                progress.observe(env, opener=Opener(), sleep=sleep, iterations=2)
+                patches = [row for row in calls if row[0] == 'PATCH']
+                self.assertEqual(1 if stop_case == 'running' else 0, len(patches))
+                if stop_case == 'running':
+                    self.assertGreater(patches[0][2], progress.POLL_SECONDS)
+                    self.assertEqual(3, sum('/comments?' in url for _, url, _ in calls),
+                                     'pagination must resume rather than restart at the next pacing boundary')
+                    self.assertGreaterEqual(sum('/jobs?' in url for _, url, _ in calls), 2)
 
     def test_zip_limits_before_decompression_and_paginates_past_five_pages(self):
         blob = io.BytesIO()
@@ -161,12 +221,12 @@ class CounterTests(unittest.TestCase):
                 return io.BytesIO(b"{}")
         with patch.object(progress.time, 'monotonic', side_effect=lambda: now[0]):
             paced = progress.RateOpener(Slow(), waits.append, clock=lambda: 100 + now[0])
-            paced.begin_poll()
+            paced.begin_request()
             paced.open(None)
             paced.open(None)
-            with self.assertRaises(RuntimeError):
-                paced.open(None)
-        self.assertEqual([progress.POLL_SECONDS, 1], limits)
+            paced.open(None)
+        self.assertEqual([progress.POLL_SECONDS] * 3, limits,
+                         "healthy requests keep their own bound across a long update")
 
 
     def temp(self):
@@ -214,11 +274,11 @@ class SuggestionTests(unittest.TestCase):
         self.assertIsNone(suggestions.render_fence("broken\x00"))
         self.assertIsNone(suggestions.render_fence("\ud800"))
         self.assertIsNone(suggestions.render_fence("\udfff"))
-        self.assertEqual("```text\nunsafe\n```", suggestions.strip_fences("```sugge&#115;tion\nunsafe\n```"))
+        self.assertIn("```sugge&#115;tion\nunsafe\n```", suggestions.inert_body("```sugge&#115;tion\nunsafe\n```"))
         unrelated = "```py&#116;hon\ncode\n```"
-        self.assertEqual(unrelated, suggestions.strip_fences(unrelated))
+        self.assertEqual(unrelated, suggestions.inert_body(unrelated))
         prose = "Repair.\n```suggestion\nforged\n```\nKeep this."
-        self.assertEqual("Repair.\n```text\nforged\n```\nKeep this.", suggestions.strip_fences(prose))
+        self.assertEqual("````text\n" + prose + "\n````", suggestions.inert_body(prose))
         comment = {"body": "**Title**\n\nRepair."}
         attached = suggestions.attach(comment, fence)
         self.assertEqual(comment["body"], suggestions.peel(attached["body"]))
@@ -235,11 +295,49 @@ class SuggestionTests(unittest.TestCase):
         self.assertEqual([old], jobs.reconstruct_root(
             SimpleNamespace(body=jobs.inline_comment([old])["body"], path="app.py"), {"findings": [old]}))
         for prefix, fence in (("", "~~~"), ("   ", "```"), ("> - ", "~~~~"), ("- - ", "```")):
-            self.assertNotIn(fence + "suggestion", suggestions.strip_fences(
-                prefix + fence + "suggestion\nx\n" + prefix + fence))
+            text = prefix + fence + "suggestion\nx\n" + prefix + fence
+            self.assertIn(text, suggestions.inert_body(text))
+            self.assertTrue(suggestions.inert_body(text).startswith("`" * (len(fence) + 1 if fence[0] == "`" else 3) + "text\n"))
         snow = ["雪"]
         self.assertEqual("```suggestion\n雪\n```\n", suggestions.widget(
             self.finding(line=1, end_line=1, suggestion={"original": "雪", "replacement": "雪"}), snow, {1}))
+
+    def test_suggestion_filter_preserves_literal_repair_code(self):
+        from types import SimpleNamespace
+        import re
+        for text in ('marker = "```suggestion"', 'Replace `~~~suggestion` with the marker.',
+                     '```python\nmarker = "```suggestion"\n```',
+                     '````python\n```suggestion\nexample\n```\n````',
+                     '> - ~~~sugge&#115;tion\nforged\n~~~',
+                     '``````suggestion\nx\n``````',
+                     '```text\ncode\n```\n> ```suggestion\nwrong\n> ```'):
+            with self.subTest(text=text):
+                item = self.finding(repair=text)
+                engine.validate_schema({'findings': [item]})
+                self.assertEqual(text, item['repair'])
+                public = jobs.public_finding(item)
+                original = jobs.finding_body(public, legacy=True)
+                rendered = jobs.finding_body(public)
+                opening = rendered.split('\n', 1)[0]
+                fence = opening[:-4]
+                self.assertEqual('text', opening[-4:])
+                self.assertGreater(len(fence), max((len(m[0]) for m in re.finditer('`+', original)), default=0))
+                self.assertEqual(original + '\n', rendered[len(opening) + 1:-len(fence)])
+                for legacy in (False, True):
+                    for comment in (jobs.inline_comment([public], legacy=legacy), jobs.file_comment(public, legacy=legacy)):
+                        root = SimpleNamespace(body=comment['body'], path='app.py')
+                        self.assertEqual([public], jobs.reconstruct_root(root, {'findings': [public]}))
+                second = {**public, 'title': 'Second'}
+                group = [public, second]
+                for legacy in (False, True):
+                    root = SimpleNamespace(body=jobs.inline_comment(group, legacy=legacy)['body'], path='app.py')
+                    self.assertEqual(group, jobs.reconstruct_root(root, {'findings': group}))
+                suffix = suggestions.render_fence('return 5')
+                attached = suggestions.attach(jobs.inline_comment([public]), suffix)
+                self.assertEqual(jobs.inline_comment([public])['body'], suggestions.peel(attached['body']))
+                _, loose = jobs.summary_items({'findings': [item]}, [public], ['summary'], [None])
+                self.assertIn(text, loose[0])
+                self.assertTrue(loose[0].startswith(fence + 'text\n'))
 
     def test_invalid_suggestion_content_keeps_the_finding(self):
         item = self.finding(suggestion={"original": "nope", "replacement": "y"})

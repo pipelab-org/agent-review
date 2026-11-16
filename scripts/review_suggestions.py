@@ -47,19 +47,20 @@ def _safe_text(text):
                                 and not 0xD800 <= ord(ch) <= 0xDFFF) for ch in text)
 
 
-def strip_fences(text):
-    """Neutralize model-authored suggestion info strings, including nested fences.
+def inert_body(text):
+    """Preserve suspect prose/code literally, without an unchecked Apply block.
 
-    GitHub follows CommonMark fenced blocks. Changing only the info word keeps
-    the proposed code visible as prose/code, without an unchecked Apply button.
-    This also safely handles nested quote/list containers and longer fences.
+    Wrap the fully composed finding, never an individual interpolated field.
+    CommonMark 0.31.2 section 4.5 makes all content literal until a closing
+    fence at least as long; our delimiter exceeds every run in the body.
+    Only the separately source-validated publisher widget goes outside it.
     """
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not re.search(r"(?:`{3,}|~{3,})[ \t]*suggestion", html.unescape(text)):
         return text
-    def neutralize(match):
-        info = html.unescape(match[3])
-        return match[1] + match[2] + "text" + info[len("suggestion"):] if info.startswith("suggestion") else match[0]
-    return re.sub(r"(`{3,}|~{3,})([ \t]*)([^\s`~]+)", neutralize, text)
+    longest = max((len(m[0]) for m in re.finditer(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    body = text if text.endswith("\n") else text + "\n"
+    return fence + "text\n" + body + fence
 
 
 def render_fence(replacement):

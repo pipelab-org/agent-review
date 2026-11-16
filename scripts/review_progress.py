@@ -196,9 +196,18 @@ class RateOpener:
         self.opener, self.sleep, self.clock = opener, sleep, clock
         self.remaining, self.reset, self.last, self.retry = None, None, None, 0
         self.deadline = None
+        self.before_request, self.checking = None, False
 
-    def begin_poll(self):
-        # One existing poll interval bounds all requests, pages and rate waits.
+    def checkpoint(self):
+        if self.before_request is not None and not self.checking:
+            self.checking = True
+            try:
+                self.before_request()
+            finally:
+                self.checking = False
+
+    def begin_request(self):
+        # Keep the existing bound per request, including pacing and redirects.
         self.deadline = time.monotonic() + POLL_SECONDS
 
     def read_timeout(self, maximum=30):
@@ -220,21 +229,30 @@ class RateOpener:
             self.retry = self.clock() + retry
 
     def open(self, request, timeout=30):
-        now = self.clock()
-        spacing = 3600 / 1000
-        if self.remaining is not None and self.reset is not None and self.reset > now:
-            spacing = (self.reset - now + 1) / max(self.remaining, 1)
-        wait = max(self.retry - now, 0 if self.last is None else self.last + spacing - now, 0)
-        if self.remaining == 0 and self.reset is not None:
-            wait = max(wait, self.reset - now + 1)
-        left = POLL_SECONDS if self.deadline is None else self.deadline - time.monotonic()
-        if self.remaining == 0 or wait >= left:
-            raise ProgressUnavailable('Progress yields to terminal publication')
-        if wait > 0:
-            self.sleep(wait)
-        left = POLL_SECONDS if self.deadline is None else self.deadline - time.monotonic()
+        self.checkpoint()
+        self.begin_request()
+        deadline = self.deadline
+        while True:
+            now = self.clock()
+            spacing = 3600 / 1000
+            if self.remaining is not None and self.reset is not None and self.reset > now:
+                spacing = (self.reset - now + 1) / max(self.remaining, 1)
+            wait = max(self.retry - now, 0 if self.last is None else self.last + spacing - now, 0)
+            left = deadline - time.monotonic()
+            if self.remaining == 0 or wait >= left or left <= 0:
+                raise ProgressUnavailable('Progress yields to terminal publication')
+            if wait > 0:
+                last = self.last
+                self.sleep(wait)
+                self.checkpoint()
+                self.deadline = deadline
+                # A job check used the same token: pace again after that read.
+                if self.last != last:
+                    continue
+            break
+        left = deadline - time.monotonic()
         if left <= 0:
-            raise ProgressUnavailable('Progress poll deadline reached')
+            raise ProgressUnavailable('Progress request deadline reached')
         self.last = self.clock()
         try:
             response = self.opener.open(request, timeout=min(timeout, left))
@@ -387,13 +405,29 @@ def observe(env=None, *, opener=None, sleep=None, iterations=None):
         repo, run = binding['repository'], binding['run_id']
         prefix = f'https://api.github.com/repos/{repo}'
         applied, quiet, steps, notice_id, rejected = 0, False, 0, None, set()
+        next_job_check = [0.0]
+        def check_active(*, force=False):
+            if not force and time.monotonic() < next_job_check[0]:
+                return
+            # Recursion-safe: checkpoint reads use this same paced opener.
+            checking = opener.checking
+            opener.checking = True
+            try:
+                current = _collect(opener, token, f'{prefix}/actions/runs/{run}/jobs?per_page=100', 'jobs')
+            finally:
+                opener.checking = checking
+            next_job_check[0] = time.monotonic() + POLL_SECONDS
+            if _job_done(current):
+                raise ProgressUnavailable('Review job finished')
         while iterations is None or steps < iterations:
             steps += 1
             try:
-                opener.begin_poll()
+                opener.before_request = None
                 jobs = _collect(opener, token, f'{prefix}/actions/runs/{run}/jobs?per_page=100', 'jobs')
                 if _job_done(jobs):
                     break
+                next_job_check[0] = time.monotonic() + POLL_SECONDS
+                opener.before_request = check_active
                 if notice_id is None:
                     comments = _collect(opener, token, f"{prefix}/issues/{binding['number']}/comments?per_page=100")
                     matches = [item for item in comments if _notice(item, run)]
@@ -430,6 +464,10 @@ def observe(env=None, *, opener=None, sleep=None, iterations=None):
                             rejected.add(identity)
                             continue
                         if notice is not None and decide(notice.get('body'), record, applied) == 'patch':
+                            check_active(force=True)
+                            fresh = _api(opener, token, 'GET', f"{prefix}/issues/comments/{notice['id']}")
+                            if not _notice(fresh, run) or is_terminal(fresh.get('body')):
+                                raise ProgressUnavailable('Progress notice is terminal or changed')
                             body = notice_text(record)
                             updated = _patch(opener, token, f"{prefix}/issues/comments/{notice['id']}", body)
                             if isinstance(updated, dict) and updated.get('body') == body:

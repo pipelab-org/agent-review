@@ -789,8 +789,18 @@ def bounded_groups(findings, indexes):
     return result
 
 
-def finding_body(finding):
-    return f"**{finding['title']}**\n\n{finding['body']}"
+def _render_finding(text, legacy=False):
+    if legacy:
+        return text  # Read-only inversion of earlier immutable comment bodies.
+    try:
+        from . import review_suggestions as suggestions
+    except ImportError:
+        import review_suggestions as suggestions
+    return suggestions.inert_body(text)
+
+
+def finding_body(finding, *, legacy=False):
+    return _render_finding(f"**{finding['title']}**\n\n{finding['body']}", legacy)
 
 
 def fit_thread_body(body, finding):
@@ -803,13 +813,13 @@ def fit_thread_body(body, finding):
             f"<!-- agent-review-finding:v1 digest={marker} -->")
 
 
-def inline_comment(group):
+def inline_comment(group, *, legacy=False):
     first, last = min(f["line"] for f in group), max(f["end_line"] for f in group)
     if len(group) == 1:
-        body = fit_thread_body(finding_body(group[0]), group[0])
+        body = fit_thread_body(finding_body(group[0], legacy=legacy), group[0])
     else:
         body = (f"**{len(group)} findings on these lines**\n\n"
-                + "\n\n---\n\n".join(f"**{f['title']}**\n\n{f['body']}" for f in group))
+                + "\n\n---\n\n".join(finding_body(f, legacy=legacy) for f in group))
     comment = {"path": group[0]["path"], "line": last, "side": "RIGHT", "body": body}
     if last != first:
         comment.update(start_line=first, start_side="RIGHT")
@@ -817,6 +827,13 @@ def inline_comment(group):
 
 
 def reconstruct_root(root, record):
+    try:
+        return _reconstruct_root(root, record, legacy=False)
+    except ReviewAbort:
+        return _reconstruct_root(root, record, legacy=True)
+
+
+def _reconstruct_root(root, record, *, legacy):
     """Invert this repository's inline_comment serialization exactly.
 
     A grouped root may omit summary-only findings from the same range. Match the
@@ -831,14 +848,14 @@ def reconstruct_root(root, record):
     body = root.body
     candidates = [f for f in record["findings"] if f["path"] == root.path and f["line"] is not None]
     singles = [f for f in candidates
-               if body in (inline_comment([f])["body"], file_comment(f)["body"])]
+               if body in (inline_comment([f], legacy=legacy)["body"], file_comment(f, legacy=legacy)["body"])]
     heading = re.match(r"\*\*([1-9][0-9]*) findings on these lines\*\*\n\n", body)
     if len(singles) == 1 and not heading:
         return singles
     if not singles and not heading:
         peeled = suggestions.peel(body)
         if peeled != body:
-            matched = [f for f in candidates if peeled == inline_comment([f])["body"]]
+            matched = [f for f in candidates if peeled == inline_comment([f], legacy=legacy)["body"]]
             if len(matched) == 1:
                 return matched
     if singles or not heading:
@@ -847,7 +864,7 @@ def reconstruct_root(root, record):
     for index in range(count):
         matches = []
         for position, finding in enumerate(candidates):
-            text = inline_comment([finding])["body"]
+            text = inline_comment([finding], legacy=legacy)["body"]
             text += "\n\n---\n\n" if index != count - 1 else ""
             if rest.startswith(text):
                 matches.append((position, finding, text))
@@ -856,7 +873,7 @@ def reconstruct_root(root, record):
         position, finding, text = matches[0]
         group.append(finding)
         candidates, rest = candidates[position + 1:], rest[len(text):]
-    if (rest or inline_comment(group)["body"] != body
+    if (rest or inline_comment(group, legacy=legacy)["body"] != body
             or len(overlap_groups(group, list(range(len(group))))) != 1):
         raise ReviewAbort("Inline findings could not be reconstructed")
     return group
@@ -1161,7 +1178,7 @@ def summary_items(result, findings, placement, reasons):
     """Table rows and full-text blocks, in the order they are read."""
     rows = [f"| {item['confidence']} | {cell(f['title'])} | {location(f).replace('|', chr(92) + '|')} | {WHERE[where]} |"
             for item, f, where in zip(result["findings"], findings, placement)]
-    loose = [f"**{f['title']}** ({location(f)})\n\n{f['body']}"
+    loose = [_render_finding(f"**{f['title']}** ({location(f)})\n\n{f['body']}")
              + (f"\n\n_Not threaded: {NO_THREAD[reason]}._" if reason else "")
              for f, where, reason in zip(findings, placement, reasons)
              if where == "summary" or (where == "inline" and len(finding_body(f).encode()) > followups.MAX_DATA_BYTES)
@@ -1290,15 +1307,15 @@ def summary_pages(ctx, scope, bundle, result, findings, placement, reasons, run)
     return render, bodies
 
 
-def file_body(finding):
-    return (f"**{finding['title']}**\n\nLocation: {location(finding)} at the reviewed head, "
-            f"outside the diff lines GitHub shows for this file.\n\n{finding['body']}")
+def file_body(finding, *, legacy=False):
+    return _render_finding(f"**{finding['title']}**\n\nLocation: {location(finding)} at the reviewed head, "
+            f"outside the diff lines GitHub shows for this file.\n\n{finding['body']}", legacy)
 
 
-def file_comment(finding):
+def file_comment(finding, *, legacy=False):
     """A file-level thread for a confirmed location the visible diff does not show."""
     return {"path": finding["path"],
-            "body": fit_thread_body(file_body(finding), finding)}
+            "body": fit_thread_body(file_body(finding, legacy=legacy), finding)}
 
 
 def summary_text(ctx, scope, bundle, result, findings, placement, reasons=None):
