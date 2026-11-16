@@ -8,6 +8,7 @@ import pwd
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -104,6 +105,69 @@ class RuntimeTests(unittest.TestCase):
                  'ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY_2', 'OPENAI_API_KEY', 'NODE_OPTIONS'}
         cleaned = runtime.clean_env({**{name: 'synthetic' for name in names}, 'HTTPS_PROXY': 'proxy', 'PATH': '/usr/bin'})
         self.assertEqual({'HTTPS_PROXY': 'proxy', 'PATH': '/usr/bin'}, cleaned)
+
+
+class StartupBarrierTests(unittest.TestCase):
+    def test_recorded_startup_death_releases_pending_barrier(self):
+        repo = Path(__file__).resolve().parents[1]
+        script = r'''
+import json, sys
+from pathlib import Path
+from scripts import review_progress_runtime as runtime
+root = Path(sys.argv[1])
+runtime.DATA = root
+runtime.PID = root / ".runtime-pid"
+runtime.STATE = root / ".runtime-state"
+runtime.PID.write_text("999999")
+runtime.STATE.write_text(json.dumps({"state": "pending", "pid": None, "worker": None}))
+runtime.await_ready()
+print("returned")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            dead = subprocess.run([sys.executable, "-c", script, directory], cwd=repo,
+                                  capture_output=True, text=True, timeout=2)
+        self.assertEqual(0, dead.returncode, dead.stderr)
+        self.assertIn("returned", dead.stdout)
+        self.assertFalse(Path("/proc/999999").exists())
+
+    def test_missing_pid_and_live_action_keep_waiting(self):
+        repo = Path(__file__).resolve().parents[1]
+        script = r'''
+import json, sys
+from pathlib import Path
+from scripts import review_progress_runtime as runtime
+root = Path(sys.argv[1])
+runtime.DATA = root
+runtime.PID = root / ".runtime-pid"
+runtime.STATE = root / ".runtime-state"
+if sys.argv[2] == "live":
+    runtime.PID.write_text(sys.argv[3])
+else:
+    runtime.PID.unlink(missing_ok=True)
+runtime.STATE.write_text(json.dumps({"state": "pending", "pid": None, "worker": None}))
+runtime.await_ready()
+print("returned")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            holder = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)", "review_progress_runtime.py"])
+            try:
+                live = subprocess.run([sys.executable, "-c", script, directory, "live", str(holder.pid)],
+                                      cwd=repo, capture_output=True, text=True, timeout=1)
+                self.fail("live startup returned: " + live.stdout + live.stderr)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                self.fail("live startup must not release the barrier")
+            finally:
+                holder.kill()
+                holder.wait(timeout=5)
+            try:
+                missing = subprocess.run([sys.executable, "-c", script, directory, "missing"],
+                                         cwd=repo, capture_output=True, text=True, timeout=1)
+                self.fail("missing pid returned: " + missing.stdout + missing.stderr)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 if __name__ == '__main__':

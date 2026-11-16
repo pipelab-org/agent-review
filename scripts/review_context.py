@@ -67,7 +67,9 @@ def _bounded(command, limit, *, env=None, timeout=None):
         try:
             # communicate would retain unbounded output. Git local reads are streamed;
             # network fetches below use no stdout and subprocess's wall-clock timeout.
-            deadline = time.monotonic() + timeout if timeout else None
+            # Zero is a spent deadline. A falsy check treats it as unlimited and waits
+            # for the child, so fetch_public's max(0, remaining) can hold the review.
+            deadline = time.monotonic() + timeout if timeout is not None else None
             data = bytearray()
             with selectors.DefaultSelector() as selector:
                 selector.register(proc.stdout, selectors.EVENT_READ)
@@ -244,9 +246,15 @@ class PublicBlob(bytes):
         return value
 
 
-def object_proof(repo, sha, path, limit, *, env=None):
+def object_proof(repo, sha, path, limit, *, env=None, timeout=None):
     """Collect raw content-addressed objects; never follow symlinks/submodules."""
-    commit = _bounded(sections.git_command(repo, 'cat-file', 'commit', sha), limit, env=env)
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    def read(args):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        return _bounded(sections.git_command(repo, *args), limit, env=env, timeout=remaining)
+
+    commit = read(('cat-file', 'commit', sha))
     if commit is None or _oid('commit', commit) != sha:
         raise ValueError
     tree = commit.split(b'\n', 1)[0]
@@ -255,14 +263,14 @@ def object_proof(repo, sha, path, limit, *, env=None):
     oid, proof = tree[5:].decode(), [base64.b64encode(commit).decode()]
     components = path.split('/')
     for index, component in enumerate(components):
-        raw = _bounded(sections.git_command(repo, 'cat-file', 'tree', oid), limit, env=env)
+        raw = read(('cat-file', 'tree', oid))
         if raw is None or _oid('tree', raw) != oid:
             raise ValueError
         proof.append(base64.b64encode(raw).decode())
         mode, oid = _tree_entry(raw, component)
         if mode not in ((b'100644', b'100755') if index == len(components) - 1 else (b'40000',)):
             raise ValueError
-    blob = _bounded(sections.git_command(repo, 'cat-file', 'blob', oid), limit, env=env)
+    blob = read(('cat-file', 'blob', oid))
     if blob is None or _oid('blob', blob) != oid or head_lines(blob) is None:
         raise ValueError
     return PublicBlob(blob, proof)
@@ -340,7 +348,8 @@ def fetch_public(owner, repo, sha, path, *, limit, timeout=REQUEST_TIMEOUT):
                        'show', sha + ':' + path]
             if _bounded(command, limit, env=env, timeout=max(0, deadline - time.monotonic())) is None:
                 return None
-            return object_proof(directory, sha, path, limit, env=env)
+            return object_proof(directory, sha, path, limit, env=env,
+                                timeout=max(0, deadline - time.monotonic()))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 

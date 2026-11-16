@@ -7,7 +7,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import textwrap
+import time
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -344,6 +346,25 @@ class ContextTests(unittest.TestCase):
             context.object_proof(self.root, link_head, ".github/workflows/link.yml", 100000)
         canonical = f"jobs:\n  a:\n    uses: 'example/workflows/.github/workflows/build.yml@{pinned}' # main\n  b:\n    uses: example/workflows/.github/workflows/build.yml@{pinned} # repeated\n  c:\n    steps:\n      - run: |\n          uses: other/repo/.github/workflows/no.yml@{pinned}\n"
         self.assertEqual([("example", "workflows", ".github/workflows/build.yml", pinned)], context._pins(canonical)[0])
+
+    def test_spent_deadline_skips_the_optional_read(self):
+        # Truthiness treats timeout 0 as unlimited, so this delayed writer is read.
+        producer = [sys.executable, "-c",
+                    "import time,sys; time.sleep(0.4); sys.stdout.buffer.write(b'late\\n'); sys.stdout.buffer.flush()"]
+        started = time.monotonic()
+        self.assertIsNone(context._bounded(producer, 100, timeout=0))
+        self.assertLess(time.monotonic() - started, 1)
+        (self.root / ".github/workflows").mkdir(parents=True)
+        (self.root / ".github/workflows/build.yml").write_text("name: upstream\n")
+        subprocess.check_call(["git", "-C", str(self.root), "add", "."])
+        subprocess.check_call(["git", "-C", str(self.root), "commit", "-qm", "base"])
+        head = self.git("rev-parse", "HEAD")
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            context.object_proof(self.root, head, ".github/workflows/build.yml", 100000, timeout=0)
+        self.assertLess(time.monotonic() - started, 1)
+        proof = context.object_proof(self.root, head, ".github/workflows/build.yml", 100000, timeout=5)
+        self.assertEqual(b"name: upstream\n", bytes(proof))
 
 
 

@@ -30,6 +30,7 @@ import time
 
 RUNTIME = Path('/var/lib/agent-review-progress-runtime')
 DATA = Path('/var/lib/agent-review-progress')
+PID = DATA / '.runtime-pid'
 USER = 'agent-review-upload'
 SCRIPT = 'review_progress_runtime.py'
 STATE = DATA / '.runtime-state'
@@ -115,8 +116,14 @@ def supervisor(fd, worker, state):
             pass
 
 
+def record_pid():
+    """Same pid across the action's exec. Await uses it only after this process is gone."""
+    PID.write_text(str(os.getpid()))
+
+
 def bootstrap():
     """Never signal readiness until exec removed the initial secret environment."""
+    record_pid()
     child, fd = None, -1
     try:
         credentials = {k: os.environ[k] for k in RUNTIME_CREDENTIAL}
@@ -140,16 +147,16 @@ def bootstrap():
         os.set_inheritable(fd, True)
         state = 'ready'
     except Exception:
-        if child is not None:
-            if child.stdin:
-                child.stdin.close()
+        if child is not None and child.stdin:
+            child.stdin.close()
             try:
                 child.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                # A failed sudo/bootstrap cannot authorize inference while a
-                # credential still sits in a runner-readable pipe.
-                raise SystemExit('Progress startup could not finish safely') from None
+                # The pipe is closed. A still-running child is the other uid, not
+                # this process. Exec below drops the runner-visible credential.
+                pass
         state = 'unavailable'
+        fd = -1
     # os.execve, not an environment clear: proc retains the old initial block
     # until this replaces the process. No secret is in argv or an output file.
     os.execve('/usr/bin/python3', ['/usr/bin/python3', str(RUNTIME / SCRIPT), 'supervisor',
@@ -157,8 +164,28 @@ def bootstrap():
                                  '--state', state], clean_env())
 
 
+def _startup_exited():
+    """True only when the recorded action pid is gone or is no longer that action.
+
+    A missing pid file is not enough: the background step may not have started,
+    and treating that as finished would admit inference while the credentialed
+    process is still about to start.
+    """
+    try:
+        pid = int(PID.read_text())
+    except (OSError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        command = Path(f'/proc/{pid}/cmdline').read_bytes()
+    except OSError:
+        return True
+    return b'review_progress_runtime.py' not in command and b'review-progress' not in command
+
+
 def await_ready():
-    """Inference startup barrier. An unknown startup never authorizes a model."""
+    """Inference startup barrier. An unknown live startup never authorizes a model."""
     while True:
         try:
             value = json.loads(STATE.read_text())
@@ -168,6 +195,8 @@ def await_ready():
                 return 0
         except (OSError, ValueError):
             pass
+        if _startup_exited():
+            return 0
         time.sleep(0.1)
 
 
