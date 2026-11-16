@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from scripts import review_progress as progress
 from scripts import review_progress_runtime as runtime
@@ -129,6 +130,22 @@ print("returned")
         self.assertEqual(0, dead.returncode, dead.stderr)
         self.assertIn("returned", dead.stdout)
         self.assertFalse(Path("/proc/999999").exists())
+
+    def test_unfamiliar_live_credential_holder_and_unknown_liveness_do_not_admit(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runtime, 'PID', Path(directory) / 'pid'):
+            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                     env={**runtime.clean_env(), 'ACTIONS_RUNTIME_TOKEN': 'synthetic-only'})
+            try:
+                runtime.PID.write_text(str(child.pid))
+                self.assertIn(b'ACTIONS_RUNTIME_TOKEN=synthetic-only', Path(f'/proc/{child.pid}/environ').read_bytes())
+                self.assertFalse(runtime._startup_exited())
+                for error in (PermissionError('synthetic denial'), OSError('synthetic unknown'), OverflowError()):
+                    with self.subTest(error=type(error).__name__), patch.object(runtime.os, 'kill', side_effect=error):
+                        self.assertFalse(runtime._startup_exited())
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+            self.assertTrue(runtime._startup_exited())
 
     def test_missing_pid_and_live_action_keep_waiting(self):
         repo = Path(__file__).resolve().parents[1]

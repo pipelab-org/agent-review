@@ -165,11 +165,11 @@ def bootstrap():
 
 
 def _startup_exited():
-    """True only when the recorded action pid is gone or is no longer that action.
+    """Release only when the kernel confirms the recorded process no longer exists.
 
-    A missing pid file is not enough: the background step may not have started,
-    and treating that as finished would admit inference while the credentialed
-    process is still about to start.
+    kill(pid, 0) sends no signal (POSIX kill(2)). A name change, a reused live
+    PID or an unavailable process read cannot prove credentialed startup ended.
+    https://man7.org/linux/man-pages/man2/kill.2.html
     """
     try:
         pid = int(PID.read_text())
@@ -178,10 +178,12 @@ def _startup_exited():
     if pid <= 0 or pid == os.getpid():
         return False
     try:
-        command = Path(f'/proc/{pid}/cmdline').read_bytes()
-    except OSError:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return True
-    return b'review_progress_runtime.py' not in command and b'review-progress' not in command
+    except (OSError, OverflowError):
+        return False
+    return False
 
 
 def await_ready():
