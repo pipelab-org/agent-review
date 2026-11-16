@@ -17,8 +17,11 @@ jobs:
       uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.12'
-    - name: Install pinned test dependencies
-      run: pip install --require-hashes -r .github/requirements-runtime.txt -r .github/requirements-test.txt
+    - name: Install runtime and verify imports before test dependencies
+      run: |
+        pip install --require-hashes -r .github/requirements-runtime.txt
+        python -c "from scripts import review_context, review_engine, review_sections; import yaml"
+        pip install --require-hashes -r .github/requirements-test.txt
     - name: Unit tests
       run: python -m unittest discover -s scripts -p 'test_*.py'
     - name: Offline provider and publication runtime tests
