@@ -148,7 +148,8 @@ class Host:
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        # Executable ancestors must be closed to other writers; /tmp is not.
+        self.temp = tempfile.TemporaryDirectory(dir=Path.home())
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.identity = s.Identity("fixture", ME, 60001)
