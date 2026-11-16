@@ -84,13 +84,13 @@ and trace the caller's outcome after each recheck.
 PASS_FOCUS = {"bundle": BOUNDARY_FOCUS, "callers": LIFECYCLE_FOCUS}
 FINDING_SCHEMA = {
     "type": "object", "additionalProperties": False,
-    "required": ["path", "line", "end_line", "title", "mechanism", "trigger", "consequence", "repair", "confidence"],
+    "required": ["path", "line", "end_line", "title", "mechanism", "trigger", "consequence", "repair", "confidence", "suggestion"],
     "properties": {**{k: {"type": "string", "minLength": 1} for k in
                       ("path", "title", "mechanism", "trigger", "consequence", "repair")},
                    "line": {"type": "integer", "minimum": 1},
                    "end_line": {"type": "integer", "minimum": 1},
                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                   "suggestion": {"type": "object", "additionalProperties": False,
+                   "suggestion": {"type": ["object", "null"], "additionalProperties": False,
                                   "required": ["original", "replacement"],
                                   "properties": {"original": {"type": "string", "minLength": 1},
                                                  "replacement": {"type": "string"}}}}}
@@ -261,8 +261,8 @@ def stage_files(repo, head, start, paths, exclusions, store):
 
 
 def build_bundle(repo, head, base, settings, exclusions=(), start=None, instructions="",
-                 learning_data=None, learning_metadata=None, store=None, intent=None,
-                 include_intent=None, upstream_required=None, repository="", fetcher=None):
+                 learning_data=None, learning_metadata=None, store=None,
+                 upstream_required=None, repository="", fetcher=None):
     if any(not isinstance(s, str) or not re.fullmatch(r"[0-9a-f]{40}", s) for s in (head, base)):
         raise ReviewAbort("Invalid admitted Git revision")
     if git(repo, "rev-parse", "HEAD").strip() != head:
@@ -295,7 +295,7 @@ def build_bundle(repo, head, base, settings, exclusions=(), start=None, instruct
         meta, text = learnings.without_context(meta, "prompt allowance exceeded"), ""
         layout = plan_layout(repo, files, fields, instructions, settings, store, 0)
     bundle = Bundle({**fields, "files": layout["files"], "sections": layout["sections"],
-                     "instructions": instructions, "learnings": meta, "upstream": [], "intent": None})
+                     "instructions": instructions, "learnings": meta, "upstream": []})
     bundle.store = store
     reserved = meta["bytes"]
 
@@ -310,8 +310,7 @@ def build_bundle(repo, head, base, settings, exclusions=(), start=None, instruct
     # spare room can be measured before the digest exists. manifest_root ignores
     # the field and replaces the placeholder after optional context is chosen.
     bundle["root"] = "0" * 64
-    context.attach(bundle, store, repo, settings, reserved, room_for, intent=intent,
-                   include_intent=include_intent, upstream_required=upstream_required,
+    context.attach(bundle, store, repo, settings, reserved, room_for, upstream_required=upstream_required,
                    repository=repository, fetcher=fetcher)
     bundle["root"] = manifest_root(bundle)
     sections.write_index(bundle, store)
@@ -464,7 +463,7 @@ def validate_schema(data):
         from . import review_suggestions as suggestions
     except ImportError:
         import review_suggestions as suggestions
-    required = set(FINDING_SCHEMA["required"])
+    required = set(FINDING_SCHEMA["required"]) - {"suggestion"}
     for item in data["findings"]:
         if not isinstance(item, dict) or not required <= set(item) <= required | {"suggestion"}:
             raise ReviewAbort("Invalid finding fields")
@@ -472,7 +471,7 @@ def validate_schema(data):
         if "suggestion" in item and (not isinstance(suggestion, dict) or set(suggestion) != {"original", "replacement"}
                                      or not isinstance(suggestion.get("original"), str) or not suggestion["original"]
                                      or not isinstance(suggestion.get("replacement"), str)):
-            raise ReviewAbort("Invalid finding fields")
+            item.pop("suggestion", None)
         for key in ("title", "mechanism", "trigger", "consequence", "repair"):
             item[key] = suggestions.strip_fences(item[key])
         if any(not isinstance(item[k], str) or not item[k].strip() for k in

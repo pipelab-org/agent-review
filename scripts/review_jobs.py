@@ -147,15 +147,11 @@ def prepare(head_dir, output, reply=False):
     check_command(repo, pr, depth)
     proof = records(repo, pr, ctx, policy)
     scope = followups.scope_for(repo, ctx, proof)
-    intent = None
-    if hasattr(pr, "title") or hasattr(pr, "body"):
-        intent = {"title": getattr(pr, "title", None) or "", "body": getattr(pr, "body", None) or ""}
     bundle = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy,
                                  profile["ignore"]["glob"],
                                  start=scope["from"] if scope["kind"] == "incremental" else None,
                                  instructions=profile["review"]["instructions"],
                                  learning_data=learning_data,
-                                 intent=intent,
                                  repository=ctx["repository"])
     threads = []
     if scope["kind"] != "unchanged":
@@ -685,7 +681,6 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
     except ImportError:
         import review_suggestions as suggestions
     comments = []
-    head_blobs = {}
     files = {item["path"]: (index, item) for index, item in enumerate(plan["bundle"]["files"])}
     check_pr(repo, ctx)
     for group in bounded_groups(findings, anchored):
@@ -694,15 +689,12 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
             item = result["findings"][group[0]]
             path = findings[group[0]]["path"]
             entry = files.get(path)
-            if entry is not None and item.get("line") == findings[group[0]]["line"] and item.get("end_line") == findings[group[0]]["end_line"]:
-                if path not in head_blobs:
-                    try:
-                        head_blobs[path] = suggestions.head_lines(
-                            engine.git(head_dir, "show", f"{ctx['head']}:{path}", binary=True))
-                    except engine.ReviewAbort:
-                        head_blobs[path] = None
+            if (entry is not None and isinstance(item.get("suggestion"), dict)
+                    and item.get("line") == findings[group[0]]["line"]
+                    and item.get("end_line") == findings[group[0]]["end_line"]):
+                lines = suggestions.source_lines(head_dir, ctx["head"], path, item["line"], item["end_line"])
                 comment = suggestions.attach(comment, suggestions.widget(
-                    item, head_blobs[path], patch_visible(store, entry[0], entry[1])))
+                    item, lines, patch_visible(store, entry[0], entry[1]), first_line=item["line"]))
         comments.append(comment)
     key = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
     roots = []
@@ -836,13 +828,19 @@ def reconstruct_root(root, record):
         from . import review_suggestions as suggestions
     except ImportError:
         import review_suggestions as suggestions
-    body = suggestions.peel(root.body)
+    body = root.body
     candidates = [f for f in record["findings"] if f["path"] == root.path and f["line"] is not None]
     singles = [f for f in candidates
                if body in (inline_comment([f])["body"], file_comment(f)["body"])]
     heading = re.match(r"\*\*([1-9][0-9]*) findings on these lines\*\*\n\n", body)
     if len(singles) == 1 and not heading:
         return singles
+    if not singles and not heading:
+        peeled = suggestions.peel(body)
+        if peeled != body:
+            matched = [f for f in candidates if peeled == inline_comment([f])["body"]]
+            if len(matched) == 1:
+                return matched
     if singles or not heading:
         raise ReviewAbort("Inline findings could not be reconstructed")
     count, rest, group = int(heading[1]), body[heading.end():], []
@@ -1392,16 +1390,10 @@ def validate_artifact(artifact, head_dir, policy, ctx, profile):
     if plan["kind"] == "review":
         if plan["bundle"].get("version") != engine.BUNDLE_VERSION:
             raise ReviewAbort("Artifact bundle differs from immutable source")
-        included = plan["bundle"].get("intent")
-        intent = None
-        if included is not None:
-            live = github().get_repo(ctx["repository"]).get_pull(ctx["number"])
-            intent = {"title": live.title or "", "body": live.body or ""}
         expected = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy, profile["ignore"]["glob"],
                                       start=plan["scope"]["from"] if plan["scope"]["kind"] == "incremental" else None,
                                       instructions=profile["review"]["instructions"],
                                       learning_metadata=plan["bundle"]["learnings"],
-                                      intent=intent, include_intent=included is not None,
                                       upstream_required=plan["bundle"].get("upstream") or [],
                                       repository=ctx["repository"])
         if expected != plan["bundle"]:

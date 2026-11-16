@@ -593,21 +593,20 @@ class JobTests(unittest.TestCase):
         with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true", "PROGRESS_CANCELLED": "true"}), \
                 patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
             exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertEqual(("POST", "https://api.github.com/repos/example/project/issues/1/comments"), writes[0][:2])
+            self.assertEqual(("PATCH", "https://api.github.com/repos/example/project/issues/comments/77"), writes[0][:2])
             self.assertIn("Review run cancelled", writes[0][2])
-            self.assertIn("agent-review-notice-terminal:v1", writes[0][2])
             self.assertNotIn("Review started", writes[0][2])
-            self.assertEqual(("DELETE", "https://api.github.com/repos/example/project/issues/comments/77"), writes[1][:2])
+            self.assertEqual(1, len(writes))
             self.assertEqual([], reactions, "a cancelled run must not acknowledge receipt")
             os.environ["PROGRESS_ONLY"] = "false"
             exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertEqual(2, len(writes), "a regular invocation cannot claim terminal-writer authority")
+            self.assertEqual(1, len(writes), "a regular invocation cannot claim terminal-writer authority")
             self.assertEqual([], reactions)
             existing = {"id": 77, "body": marker + "<!-- agent-review-status:v1 state=success -->", "user": f.BOT}
             os.environ["PROGRESS_ONLY"] = "true"
             os.environ["PROGRESS_CANCELLED"] = "true"
             exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertEqual(2, len(writes), "cancellation must not delete a success notice")
+            self.assertEqual(1, len(writes), "cancellation must not delete a success notice")
 
     def test_native_claude_turn_stops_keep_the_fixed_reason(self):
         cases = [{"subtype": "error_max_turns"}, {"terminal_reason": "max_turns"}]
@@ -2715,7 +2714,13 @@ class WorkflowTests(unittest.TestCase):
                 self.assertNotIn("OPENAI_API_KEY" if name == "claude" else "ANTHROPIC_API_KEY", json.dumps(job))
                 for step in job["steps"]:
                     if "uses" in step:
-                        self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
+                        if step["uses"].startswith("./"):
+                            self.assertEqual("./trusted-agent-review/.github/actions/review-progress", step["uses"])
+                            source = next(s for s in self.workflow["jobs"]["review"]["steps"]
+                                          if s.get("name") == "Check out immutable agent-review source")
+                            self.assertEqual("${{ needs.source.outputs.reviewer_sha }}", source["with"]["ref"])
+                        else:
+                            self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
 
     def test_codex_followup_has_fresh_read_only_setup_and_no_anthropic_credentials(self):
         job = self.workflow["jobs"]["codex-verification"]
@@ -2787,7 +2792,7 @@ class WorkflowTests(unittest.TestCase):
     def test_publication_preserves_main_review_when_optional_verification_skips_or_fails(self):
         job = self.workflow["jobs"]["publish"]
         self.assertIn("codex-verification", job["needs"])
-        self.assertEqual("!cancelled() && needs.review.result == 'success' && needs.observer.result != 'cancelled'", job["if"])
+        self.assertEqual("!cancelled() && needs.review.result == 'success'", job["if"])
         self.assertIn("observer", job["needs"])
         self.assertNotIn("needs.observer.result == 'success'", job["if"])
         notifier = self.workflow["jobs"]["notify-failure"]
@@ -2833,7 +2838,13 @@ class WorkflowTests(unittest.TestCase):
         for job in self.workflow["jobs"].values():
             for step in job.get("steps", []):
                 if "uses" in step:
-                    self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
+                    if step["uses"].startswith("./"):
+                        self.assertEqual("./trusted-agent-review/.github/actions/review-progress", step["uses"])
+                        source = next(s for s in self.workflow["jobs"]["review"]["steps"]
+                                      if s.get("name") == "Check out immutable agent-review source")
+                        self.assertEqual("${{ needs.source.outputs.reviewer_sha }}", source["with"]["ref"])
+                    else:
+                        self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
         # Both jobs that run Codex (review and inline reply) carry their own setup copy.
         setups = [(name, step) for name, job in self.workflow["jobs"].items() for step in job.get("steps", [])
                   if "openai/codex-action@" in step.get("uses", "")]

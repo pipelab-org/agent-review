@@ -26,9 +26,6 @@ except ImportError:
     from review_followups import MAX_DATA_BYTES
 
 
-FENCE = re.compile(r"(`{3,})suggestion[^\n]*\n")
-
-
 def head_lines(blob):
     if not isinstance(blob, (bytes, bytearray)) or b"\x00" in blob:
         return None
@@ -49,24 +46,15 @@ def _safe_text(text):
 
 
 def strip_fences(text):
-    """Drop model-authored suggestion fences so only the publisher can add one."""
-    if not isinstance(text, str) or "```" not in text:
+    """Neutralize model-authored suggestion info strings, including nested fences.
+
+    GitHub follows CommonMark fenced blocks. Changing only the info word keeps
+    the proposed code visible as prose/code, without an unchecked Apply button.
+    This also safely handles nested quote/list containers and longer fences.
+    """
+    if not isinstance(text, str):
         return text
-    output, index = [], 0
-    while index < len(text):
-        match = FENCE.search(text, index)
-        if not match:
-            output.append(text[index:])
-            break
-        output.append(text[index:match.start()])
-        length = len(match.group(1))
-        close = re.search(rf"(?m)^`{{{length},}}[ \t]*$", text[match.end():])
-        if not close:
-            break
-        index = match.end() + close.end()
-        if index < len(text) and text[index] == "\n":
-            index += 1
-    return "".join(output)
+    return re.sub(r"(`{3,}|~{3,})[ \t]*suggestion", r"\1text", text)
 
 
 def render_fence(replacement):
@@ -83,7 +71,7 @@ def render_fence(replacement):
     return f"{fence}suggestion\n{body}{fence}\n"
 
 
-def widget(finding, lines, visible):
+def widget(finding, lines, visible, *, first_line=1):
     """A fence when original matches one unambiguous visible range, else None."""
     suggestion = finding.get("suggestion") if isinstance(finding, dict) else None
     if not isinstance(suggestion, dict):
@@ -91,13 +79,45 @@ def widget(finding, lines, visible):
     original, replacement = suggestion.get("original"), suggestion.get("replacement")
     start, end = finding.get("line"), finding.get("end_line")
     if (not isinstance(lines, list) or not _safe_text(original) or not isinstance(replacement, str)
-            or type(start) is not int or type(end) is not int or start < 1 or end < start or end > len(lines)):
+            or type(start) is not int or type(end) is not int or start < first_line
+            or end < start or end - first_line >= len(lines)):
         return None
     if not isinstance(visible, set) or any(line not in visible for line in range(start, end + 1)):
         return None
-    if "\n".join(lines[start - 1:end]) != original:
+    if "\n".join(lines[start - first_line:end - first_line + 1]) != original:
         return None
     return render_fence(replacement)
+
+
+def source_lines(repo, head, path, start, end):
+    """Read only the proposed range, with the existing comment byte allowance.
+
+    Oversized optional original lines omit the widget, never the finding.
+    The stream still traverses preceding lines without retaining them.
+    """
+    try:
+        from . import review_context as context
+        from . import review_sections as sections
+    except ImportError:
+        import review_context as context
+        import review_sections as sections
+    if type(start) is not int or type(end) is not int or start < 1 or end < start:
+        return None
+    result, size = [], 0
+    try:
+        for number, (line, overflow) in enumerate(context._lines(
+                sections.git_command(repo, 'cat-file', 'blob', head + ':' + path), MAX_DATA_BYTES), 1):
+            if number < start:
+                continue
+            size += len(line)
+            if overflow or size > MAX_DATA_BYTES or b'\0' in line:
+                return None
+            result.append(line.decode('utf-8').removesuffix('\n'))
+            if number == end:
+                return result
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return None
 
 
 def attach(comment, fence):
@@ -110,16 +130,24 @@ def attach(comment, fence):
 
 
 def peel(body):
-    """Split a publisher-appended suggestion fence off a comment. Legacy bodies stay whole."""
-    if not isinstance(body, str) or "\n\n```" not in body:
+    """Recognize one complete publisher suffix, including replacement blank lines.
+
+    The caller first tries an exact legacy body match. We peel only the precise
+    fence grammar emitted by render_fence, never an arbitrary Markdown block.
+    """
+    if not isinstance(body, str):
         return body
-    prefix, _, suffix = body.rpartition("\n\n")
-    match = re.fullmatch(r"(`{3,})suggestion\n(.*)\1\n", suffix, re.S)
-    if not match:
-        return body
-    fence, content = match.group(1), match.group(2)
-    if content and not content.endswith("\n"):
-        return body
-    if any(len(item.group(0)) >= len(fence) for item in re.finditer(r"`+", content)):
-        return body
-    return prefix
+    for match in re.finditer(r"\n\n(`{3,})suggestion\n", body):
+        fence = match.group(1)
+        suffix = body[match.end():]
+        if not suffix.endswith(fence + "\n"):
+            continue
+        content = suffix[:-len(fence) - 1]
+        if content and not content.endswith("\n"):
+            continue
+        if not _safe_text(content):
+            continue
+        if any(len(item.group(0)) >= len(fence) for item in re.finditer(r"`+", content)):
+            continue
+        return body[:match.start()]
+    return body

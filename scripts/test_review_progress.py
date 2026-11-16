@@ -42,7 +42,7 @@ class CounterTests(unittest.TestCase):
             record(repository="other/project"), record(number=8), record(head="b" * 40),
             record(run_id="100"), record(run_attempt="2"), record(seq=True), record(seq=0),
             record(seq=-1), record(**{"pass": True}), record(publication="done"),
-            record(kind="eta"), record(extra=1), record(section=4), record(**{"pass": 3}),
+            record(kind="eta"), record(kind=[]), record(state={}), record(number=True), record(extra=1), record(section=4), record(**{"pass": 3}),
         ):
             self.assertIsNone(progress.validate_record(bad, BINDING), bad)
         self.assertIsNone(progress.validate_record(record(), {**BINDING, "run_id": "100"}))
@@ -85,13 +85,13 @@ class CounterTests(unittest.TestCase):
                 return io.BytesIO(json.dumps({"id": 5, "body": body, "user": {"login": "github-actions[bot]",
                                                                               "id": 41898282, "type": "Bot"}}).encode())
             if request.full_url.endswith("page=1") and "artifacts" in request.full_url:
-                data = {"artifacts": [{"name": "agent-review-progress-99-1-2", "expired": False,
+                data = {"artifacts": [{"id": 21, "name": "agent-review-progress-99-1-2", "expired": False,
                                        "size_in_bytes": len(blob.getvalue()),
                                        "archive_download_url": "https://api.github.com/artifact"}]}
             elif "artifacts" in request.full_url:
                 data = {"artifacts": []}
-            elif request.full_url.endswith("/jobs?per_page=100"):
-                data = {"jobs": [{"name": "Review admitted diff", "status": "completed"}]}
+            elif "/jobs?per_page=100" in request.full_url:
+                data = {"jobs": [{"name": "review / Review admitted diff", "status": "completed"}]}
             elif request.full_url.endswith("/artifact"):
                 return io.BytesIO(blob.getvalue())
             else:
@@ -110,6 +110,33 @@ class CounterTests(unittest.TestCase):
         patches = [item for item in calls if item[0] == "PATCH"]
         self.assertEqual(1, len(patches))
         self.assertTrue(patches[0][1].endswith("/issues/comments/5"))
+        self.assertFalse(progress._job_done([{"name": "acknowledge / Review admitted diff", "status": "completed"}]))
+        self.assertFalse(progress._job_done([{"name": "review / Review admitted diff", "status": "in_progress"}]))
+        self.assertTrue(progress._job_done([{"name": "review / Review admitted diff", "status": "completed"}]))
+
+    def test_zip_limits_before_decompression_and_paginates_past_five_pages(self):
+        blob = io.BytesIO()
+        with zipfile.ZipFile(blob, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("progress.json", "x" * (progress.MAX_RECORD_BYTES + 1))
+        with patch.object(zipfile.ZipFile, "read", side_effect=AssertionError("must check size first")):
+            self.assertIsNone(progress._record_from_zip(blob.getvalue()))
+        pages = [{"artifacts": list(range(100))} for _ in range(6)] + [{"artifacts": [999]}]
+        with patch.object(progress, "_api", side_effect=pages) as api:
+            self.assertEqual(601, len(progress._collect(None, "fixture", "https://api.github.com/x?per_page=100", "artifacts")))
+            self.assertEqual(7, api.call_count)
+
+    def test_rate_headers_pace_shared_token_reads(self):
+        waits = []
+        class Opener:
+            def open(self, request, timeout=0):
+                response = io.BytesIO(b"{}")
+                response.headers = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "130"}
+                return response
+        paced = progress.RateOpener(Opener(), waits.append, clock=lambda: 100)
+        paced.open(None)
+        paced.open(None)
+        self.assertGreaterEqual(waits[-1], 31)
+
 
     def temp(self):
         path = Path(self.id().replace(".", "_"))
@@ -155,11 +182,25 @@ class SuggestionTests(unittest.TestCase):
         self.assertIsNone(forged)
         self.assertIsNone(suggestions.render_fence("broken\x00"))
         prose = "Repair.\n```suggestion\nforged\n```\nKeep this."
-        self.assertEqual("Repair.\nKeep this.", suggestions.strip_fences(prose))
+        self.assertEqual("Repair.\n```text\nforged\n```\nKeep this.", suggestions.strip_fences(prose))
         comment = {"body": "**Title**\n\nRepair."}
         attached = suggestions.attach(comment, fence)
         self.assertEqual(comment["body"], suggestions.peel(attached["body"]))
         self.assertEqual(comment["body"], suggestions.peel(comment["body"]))
+        from types import SimpleNamespace
+        public = jobs.public_finding(self.finding())
+        legacy = jobs.inline_comment([public])["body"]
+        for replacement in ("first\n\nlast", "\n\n", "```code\ntext\n```", ""):
+            attached = suggestions.attach({"body": legacy}, suggestions.render_fence(replacement))
+            self.assertEqual(legacy, suggestions.peel(attached["body"]))
+            self.assertEqual([public], jobs.reconstruct_root(
+                SimpleNamespace(body=attached["body"], path="app.py"), {"findings": [public]}))
+        old = {**public, "body": public["body"] + "\n\n```suggestion\nlegacy\n```\n"}
+        self.assertEqual([old], jobs.reconstruct_root(
+            SimpleNamespace(body=jobs.inline_comment([old])["body"], path="app.py"), {"findings": [old]}))
+        for prefix, fence in (("", "~~~"), ("   ", "```"), ("> - ", "~~~~"), ("- - ", "```")):
+            self.assertNotIn(fence + "suggestion", suggestions.strip_fences(
+                prefix + fence + "suggestion\nx\n" + prefix + fence))
         snow = ["雪"]
         self.assertEqual("```suggestion\n雪\n```\n", suggestions.widget(
             self.finding(line=1, end_line=1, suggestion={"original": "雪", "replacement": "雪"}), snow, {1}))
@@ -167,6 +208,12 @@ class SuggestionTests(unittest.TestCase):
     def test_invalid_suggestion_content_keeps_the_finding(self):
         item = self.finding(suggestion={"original": "nope", "replacement": "y"})
         self.assertEqual([item], engine.validate_schema({"findings": [item]}))
+        for hint in (None, {}, {"original": "x"}, "not a hint"):
+            invalid = self.finding(suggestion=hint)
+            self.assertEqual([invalid], engine.validate_schema({"findings": [invalid]}))
+            self.assertNotIn("suggestion", invalid)
+        self.assertEqual(set(engine.FINDING_SCHEMA["properties"]), set(engine.FINDING_SCHEMA["required"]))
+        self.assertIn("null", engine.FINDING_SCHEMA["properties"]["suggestion"]["type"])
         public = jobs.public_finding(item)
         self.assertEqual({"path", "line", "end_line", "title", "body"}, set(public))
         self.assertNotIn("suggestion", public["body"])
@@ -216,13 +263,24 @@ class ContextTests(unittest.TestCase):
         self.assertGreater(full_render, bare_render)
         self.assertLess(file["content_bytes"], (self.root / "app.py").stat().st_size)
         self.assertEqual(bundle, engine.build_bundle(self.root, head, base, settings, instructions="Review correctness."))
+        (self.root / "huge.py").write_text("def huge():\n    x = '" + "x" * 2000000 + "'\ndef small():\n    return 1\n")
+        previous = self.commit()
+        (self.root / "huge.py").write_text((self.root / "huge.py").read_text().replace("return 1", "return 2"))
+        current = self.commit()
+        with patch.object(context.subprocess, "run", side_effect=AssertionError("unbounded capture forbidden")):
+            nearby = context.enclosing_text(self.root, previous, current, "huge.py", 4096)
+        self.assertIn("def small():", nearby)
+        self.assertLess(len(nearby.encode()), 4096)
+        self.assertEqual(["    return 2"], suggestions.source_lines(self.root, current, "huge.py", 4, 4))
+        self.assertIsNone(suggestions.source_lines(self.root, current, "huge.py", 2, 2))
+
 
     def commit(self):
         subprocess.check_call(["git", "-C", str(self.root), "add", "."])
         subprocess.check_call(["git", "-C", str(self.root), "commit", "-qm", "head"])
         return self.git("rev-parse", "HEAD")
 
-    def test_upstream_pins_keep_provenance_and_reject_float_private_and_redirects(self):
+    def test_upstream_pins_keep_provenance_and_reject_float_and_tampering(self):
         workflow = textwrap.dedent("""\
             name: caller
             on: push
@@ -234,8 +292,10 @@ class ContextTests(unittest.TestCase):
               c:
                 uses: ./.github/workflows/local.yml
             """)
-        pinned = "c" * 40
         (self.root / ".github/workflows").mkdir(parents=True)
+        (self.root / ".github/workflows/build.yml").write_text("name: upstream\n")
+        pinned = self.commit()
+        proof = context.object_proof(self.root, pinned, ".github/workflows/build.yml", 100000)
         (self.root / ".github/workflows/caller.yml").write_text(workflow % pinned)
         (self.root / ".github/workflows/local.yml").write_text("name: local\n")
         subprocess.check_call(["git", "-C", str(self.root), "add", "."])
@@ -249,7 +309,7 @@ class ContextTests(unittest.TestCase):
             fetched[(owner, repo, sha, path)] = True
             if sha != pinned or path != ".github/workflows/build.yml":
                 return None
-            return b"name: upstream\n"
+            return proof
 
         bundle = engine.build_bundle(self.root, head, base, POLICY, instructions="Review.",
                                     repository="example/project", fetcher=fetcher)
@@ -271,6 +331,20 @@ class ContextTests(unittest.TestCase):
                                      repository="example/project", fetcher=lambda *args: None,
                                      upstream_required=[])
         self.assertEqual([], omitted["upstream"])
+        rebuilt = engine.build_bundle(self.root, head, base, POLICY, instructions="Review.",
+                                      repository="example/project", upstream_required=upstream,
+                                      fetcher=lambda *args: self.fail("Publication must not fetch upstream"))
+        self.assertEqual(bundle, rebuilt)
+        mutated = {**remote, "blob": "eA=="}
+        self.assertIsNone(context.verify_public(mutated, 100000))
+        self.assertIsNone(context.verify_public({**remote, "sha": "c" * 40}, 100000))
+        (self.root / ".github/workflows/link.yml").symlink_to("build.yml")
+        link_head = self.commit()
+        with self.assertRaises(ValueError):
+            context.object_proof(self.root, link_head, ".github/workflows/link.yml", 100000)
+        canonical = f"jobs:\n  a:\n    uses: 'example/workflows/.github/workflows/build.yml@{pinned}' # main\n  b:\n    uses: example/workflows/.github/workflows/build.yml@{pinned} # repeated\n  c:\n    steps:\n      - run: |\n          uses: other/repo/.github/workflows/no.yml@{pinned}\n"
+        self.assertEqual([("example", "workflows", ".github/workflows/build.yml", pinned)], context._pins(canonical)[0])
+
 
 
 class WorkflowShapeTests(unittest.TestCase):
@@ -286,6 +360,20 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertNotIn("review", observer["needs"])
         self.assertIn("observer", workflow["jobs"]["publish"]["needs"])
         self.assertTrue(observer["continue-on-error"])
+        self.assertIn("observer", workflow["jobs"]["notify-failure"]["needs"])
+        self.assertIn("!cancelled()", workflow["jobs"]["notify-failure"]["if"])
+        self.assertNotIn("needs.observer.result", workflow["jobs"]["publish"]["if"])
+        background = next(step for step in review["steps"] if step.get("id") == "review-progress-uploader")
+        self.assertTrue(background["background"])
+        self.assertEqual("./trusted-agent-review/.github/actions/review-progress", background["uses"])
+        self.assertEqual(["review-progress-uploader"], [step["cancel"] for step in review["steps"] if "cancel" in step])
+
         infer = next(step for step in review["steps"] if step.get("id") == "inference")
         self.assertNotIn("GITHUB_TOKEN", infer.get("env", {}))
         self.assertIn("REVIEW_PROGRESS_DIR", infer["env"])
+        self.assertIn("await-ready", infer["run"])
+        self.assertNotIn("review_progress.py upload", infer["run"])
+        command, env = progress.upload_command("/trusted", "fixture", "/counter")
+        self.assertTrue(command[1].endswith("dist/upload/index.js"))
+        self.assertEqual("fixture", env["INPUT_NAME"])
+        self.assertEqual("error", env["INPUT_IF-NO-FILES-FOUND"])

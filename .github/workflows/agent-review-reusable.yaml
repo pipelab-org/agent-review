@@ -175,11 +175,8 @@ jobs:
                        "Review started: preparing the captured diff and running the configured passes. No completed review yet. "
                        "Open Actions for live pass and section progress. This comment updates again when the run finishes.")
             body = marker + "\n" + message + f"\n\n[Actions run](https://github.com/{repo}/actions/runs/{run})."
-            # Cancellation cannot wait for the observer. Create the terminal notice, then delete the
-            # open one so an in-flight progress PATCH addresses a comment that no longer exists.
-            # Issue comment delete: https://docs.github.com/en/rest/issues/comments#delete-an-issue-comment
-            if terminal:
-                body = f"<!-- agent-review-notice-terminal:v1 run={run} state=cancelled -->\n" + body
+            # The caller's cancelled job waits for the reusable review, including
+            # its observer, so all terminal writers can preserve this notice.
             page, found = 1, None
             while True:
                 comments = api("GET", f"{prefix}/issues/{number}/comments?per_page=100&page={page}")
@@ -195,11 +192,6 @@ jobs:
             existing = found.get("body", "") if found else ""
             if any(mark in existing for mark in ("<!-- agent-review-status:v1", "Treat this run as incomplete",
                                                  "Review run cancelled", "<!-- agent-review-notice-terminal:v1")):
-                return
-            if terminal:
-                api("POST", f"{prefix}/issues/{number}/comments", {"body": body})
-                if found is not None:
-                    api("DELETE", f"{prefix}/issues/comments/{found['id']}")
                 return
             if found is not None:
                 api("PATCH", f"{prefix}/issues/comments/{found['id']}", {"body": body})
@@ -471,6 +463,20 @@ jobs:
         ref: ea165f8d65b6e75b540449e92b4886f43607fa02
         path: trusted-upload-artifact
         persist-credentials: false
+    - name: Prepare protected progress transport
+      id: progress-runtime
+      continue-on-error: true
+      run: |
+        sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT -- /usr/bin/python3 trusted-agent-review/scripts/review_progress_runtime.py prepare --source trusted-agent-review/scripts --uploader trusted-upload-artifact --node "$(command -v node)" --uid "$(id -u)" --gid "$(id -g)"
+    - name: Upload live progress from an isolated identity
+      id: review-progress-uploader
+      if: steps.progress-runtime.outcome == 'success'
+      continue-on-error: true
+      background: true
+      uses: ./trusted-agent-review/.github/actions/review-progress
+      env:
+        PR_NUMBER: ${{ github.event.issue.number }}
+        REVIEW_HEAD: ${{ needs.admit.outputs.head }}
     - name: Review the admitted diff
       id: inference
       env:
@@ -489,22 +495,15 @@ jobs:
         ANTHROPIC_API_KEY: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY || '' }}
         ANTHROPIC_API_KEY_2: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY_2 || '' }}
         REVIEW_CODEX_SESSION_USER: ${{ startsWith(env.REVIEW_DEPTH, 'codex') && 'agent-review-model' || '' }}
-        REVIEW_PROGRESS_DIR: ${{ runner.temp }}/agent-review-progress
+        REVIEW_PROGRESS_DIR: /var/lib/agent-review-progress
+        REVIEW_PROGRESS_ENABLED: ${{ steps.progress-runtime.outcome == 'success' }}
       run: |
-        umask 022
-        mkdir -p "$RUNNER_TEMP/agent-review-progress"
-        if [ -f trusted-upload-artifact/dist/index.js ]; then
-          python trusted-agent-review/scripts/review_progress.py upload --dir "$RUNNER_TEMP/agent-review-progress" --action trusted-upload-artifact &
-          echo $! > "$RUNNER_TEMP/agent-review-progress.pid"
+        if [ "$REVIEW_PROGRESS_ENABLED" = true ]; then
+          python /var/lib/agent-review-progress-runtime/review_progress_runtime.py await-ready
         fi
-        set +e
         python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
-        code=$?
-        if [ -f "$RUNNER_TEMP/agent-review-progress.pid" ]; then
-          kill "$(cat "$RUNNER_TEMP/agent-review-progress.pid")" 2>/dev/null || true
-          wait "$(cat "$RUNNER_TEMP/agent-review-progress.pid")" 2>/dev/null || true
-        fi
-        exit "$code"
+    - name: Stop live progress after inference
+      cancel: review-progress-uploader
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
@@ -1026,12 +1025,13 @@ jobs:
     - source
     - admit
     - progress
+    - observer
     - review
     - codex-verification
     - publish
     - reply
     if: |-
-      always() && !inputs.progress_only && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
+      always() && !cancelled() && !inputs.progress_only && ((github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor == 'luckyPipewrench' && github.actor_id == '142104046' && github.run_attempt == '1' && github.triggering_actor == 'luckyPipewrench' && github.event.comment.user.login == 'luckyPipewrench' && github.event.comment.user.id == 142104046 && github.event.comment.user.type == 'User' && github.event.comment.author_association == 'MEMBER' && github.event.issue.pull_request && contains(fromJSON('["/review","/review deep","/review codex","/review codex deep"]'), github.event.comment.body)) && (needs.source.result == 'failure' || needs.source.result == 'cancelled' ||
           needs.admit.result == 'failure' || needs.admit.result == 'cancelled' ||
           needs.review.result == 'failure' || needs.review.result == 'cancelled' || needs.publish.result == 'failure' || needs.publish.result == 'cancelled' || cancelled()) ||
           (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && github.run_attempt == '1' && github.actor == github.event.comment.user.login && github.triggering_actor == github.actor && github.event.comment.user.type == 'User' && github.event.comment.in_reply_to_id && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/resolve'))) && needs.reply.outputs.learnings_revoke_failed == 'true')
@@ -1272,7 +1272,7 @@ jobs:
     # The observer has exited, and joined its last notice write, before publication starts.
     # Its failure or skip must not block a completed review.
     if: >-
-      !cancelled() && needs.review.result == 'success' && needs.observer.result != 'cancelled'
+      !cancelled() && needs.review.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:

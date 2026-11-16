@@ -17,7 +17,7 @@ forwarded to that host. Each job can create at most 500 artifacts
 This job already uploads findings and the outcome record, so progress uploads
 stop at 498. Later counters remain in the step log and the job summary.
 
-An authenticated GITHUB_TOKEN allows 5,000 REST requests an hour
+GITHUB_TOKEN normally allows 1,000 REST requests an hour per repository
 (https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
 The observer waits 15 seconds between polls. Writes keep the existing
 one-second pause. Counters use the signed 64-bit digit width already used for
@@ -45,7 +45,8 @@ NOTICE = "<!-- agent-review-notice:v1 run={run} -->"
 TERMINAL = "<!-- agent-review-notice-terminal:v1 run={run} state={state} -->"
 # 500 artifact creations per job, minus the findings and outcome uploads.
 MAX_UPLOADS = 498
-# 15s * 70 minutes is about 280 requests, inside the 5,000/hour primary limit.
+# Poll cadence is diagnostic only; each request is also paced from rate headers.
+# Without headers, 3600/1000 seconds follows GitHub's normal GITHUB_TOKEN limit.
 POLL_SECONDS = 15
 # Existing comment byte ceiling. A progress record is a counter, not a document.
 MAX_RECORD_BYTES = 65536
@@ -80,7 +81,7 @@ def binding_from_env(env=None):
 
 def _counters(record):
     kind, state = record.get("kind"), record.get("state")
-    if kind not in KINDS or state not in STATES or record.get("publication") != "pending":
+    if not isinstance(kind, str) or not isinstance(state, str) or kind not in KINDS or state not in STATES or record.get("publication") != "pending":
         return False
     if kind == "threads":
         return set(record) == {"schema", "repository", "number", "head", "run_id", "run_attempt",
@@ -105,7 +106,9 @@ def validate_record(payload, binding):
         return None
     if not isinstance(record, dict) or binding is None or record.get("schema") != SCHEMA:
         return None
-    if any(record.get(key) != binding[key] for key in ("repository", "number", "head", "run_id", "run_attempt")):
+    if type(record.get("number")) is not int:
+        return None
+    if any(record.get(key) != binding.get(key) for key in ("repository", "number", "head", "run_id", "run_attempt")):
         return None
     if not bounded(record.get("seq")) or not _counters(record):
         return None
@@ -163,6 +166,7 @@ def write_progress(seq, *, kind, state, pass_index=None, passes=None, section=No
         target = path / f"{seq}.json"
         temporary = path / f".{seq}.json.partial"
         temporary.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        temporary.chmod(0o644)
         os.replace(temporary, target)
         return True
     except (OSError, ValueError, TypeError):
@@ -178,16 +182,60 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _collect(opener, token, url, key):
-    """Follow artifact pages. per_page 100 is the REST maximum, and a job can hold 500 artifacts."""
-    rows = []
-    for page in range(1, 6):
-        payload = _api(opener, token, "GET", url + f"&page={page}")
-        batch = payload.get(key) or [] if isinstance(payload, dict) else []
+class RateOpener:
+    """Use GitHub's published remaining/reset and Retry-After headers.
+
+    No response bodies or credentials are logged. The observer is best effort;
+    rate waits can delay diagnostics but cannot affect the inference allowance.
+    """
+    def __init__(self, opener, sleep, clock=time.time):
+        self.opener, self.sleep, self.clock = opener, sleep, clock
+        self.remaining, self.reset, self.last, self.retry = None, None, None, 0
+
+    def _headers(self, headers):
+        headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        def number(key):
+            raw = headers.get(key, '')
+            return int(raw) if re.fullmatch(r'[0-9]{1,12}', raw) else None
+        remaining, reset = number('x-ratelimit-remaining'), number('x-ratelimit-reset')
+        if remaining is not None and reset is not None:
+            self.remaining, self.reset = remaining, reset
+        retry = number('retry-after')
+        if retry is not None:
+            self.retry = self.clock() + retry
+
+    def open(self, request, timeout=30):
+        now = self.clock()
+        spacing = 3600 / 1000
+        if self.remaining is not None and self.reset is not None and self.reset > now:
+            spacing = (self.reset - now + 1) / max(self.remaining, 1)
+        wait = max(self.retry - now, 0 if self.last is None else self.last + spacing - now, 0)
+        if self.remaining == 0 and self.reset is not None:
+            wait = max(wait, self.reset - now + 1)
+        if wait > 0:
+            self.sleep(wait)
+        self.last = self.clock()
+        try:
+            response = self.opener.open(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            self._headers(error.headers)
+            raise
+        self._headers(getattr(response, 'headers', {}))
+        return response
+
+
+def _collect(opener, token, url, key=None):
+    """Read all REST pages; a run can contain artifacts from more than one job."""
+    rows, page = [], 1
+    while True:
+        payload = _api(opener, token, 'GET', url + f'&page={page}')
+        batch = payload.get(key) if key and isinstance(payload, dict) else payload
+        if not isinstance(batch, list):
+            raise ValueError('Invalid diagnostic list')
         rows.extend(batch)
         if len(batch) < 100:
-            break
-    return rows
+            return rows
+        page += 1
 
 
 def _api(opener, token, method, url):
@@ -198,9 +246,9 @@ def _api(opener, token, method, url):
         return json.load(response)
 
 
-def _download(token, url):
+def _download(token, url, *, opener=None):
     """Download an artifact zip. Drop Authorization before following the one-minute redirect."""
-    opener = urllib.request.build_opener(NoRedirect)
+    opener = opener or urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"})
     try:
@@ -210,7 +258,7 @@ def _download(token, url):
         location = error.headers.get("Location") if error.code in (301, 302, 303, 307, 308) else None
         if not location or not location.startswith("https://"):
             raise
-        with urllib.request.urlopen(urllib.request.Request(location), timeout=30) as response:
+        with urllib.request.build_opener(NoRedirect).open(urllib.request.Request(location), timeout=30) as response:
             return response.read(MAX_RECORD_BYTES + 1)
 
 
@@ -220,8 +268,9 @@ def _record_from_zip(blob):
     try:
         import io
         archive = zipfile.ZipFile(io.BytesIO(blob))
-        names = [info.filename for info in archive.infolist() if not info.is_dir()]
-        if names != ["progress.json"]:
+        entries = archive.infolist()
+        if (len(entries) != 1 or entries[0].filename != "progress.json"
+                or entries[0].file_size > MAX_RECORD_BYTES or entries[0].flag_bits & 1):
             return None
         payload = archive.read("progress.json")
     except (zipfile.BadZipFile, ValueError, RuntimeError, KeyError):
@@ -236,29 +285,37 @@ def _record_from_zip(blob):
 
 def upload_command(action_dir, name, path):
     """Invoke the pinned upload-artifact action. The public REST API has no upload method."""
-    return ["node", str(Path(action_dir) / "dist" / "index.js")], {
-        "INPUT_name": name, "INPUT_path": str(path), "INPUT_if-no-files-found": "error",
-        "INPUT_overwrite": "false", "INPUT_compression-level": "6", "INPUT_include-hidden-files": "false"}
+    return ["node", str(Path(action_dir) / "dist" / "upload" / "index.js")], {
+        "INPUT_NAME": name, "INPUT_PATH": str(path), "INPUT_IF-NO-FILES-FOUND": "error",
+        "INPUT_OVERWRITE": "false", "INPUT_COMPRESSION-LEVEL": "6", "INPUT_INCLUDE-HIDDEN-FILES": "false"}
 
 
 def serve_uploads(directory, action_dir, *, limit=MAX_UPLOADS, env=None, run=None, stop=None):
     """Upload each new record once. Failures and a missing action are ignored."""
     binding = binding_from_env(env)
-    if binding is None or not Path(action_dir, "dist", "index.js").is_file():
+    if binding is None or not Path(action_dir, "dist", "upload", "index.js").is_file():
         return 0
-    sent, seen = 0, set()
+    sent, seen, highest = 0, set(), 0
     runner = run or __import__("subprocess").run
     while sent < limit and (stop is None or not stop()):
         try:
-            files = sorted(Path(directory).glob("*.json"), key=lambda item: int(item.stem))
+            files = sorted((item for item in Path(directory).glob("*.json") if re.fullmatch(r"[1-9][0-9]*", item.stem)), key=lambda item: int(item.stem), reverse=True)
         except (OSError, ValueError):
             files = []
         for item in files:
-            if item.name in seen or sent >= limit:
+            if item.name in seen or sent >= limit or int(item.stem) <= highest:
                 continue
             seen.add(item.name)
             try:
-                record = validate_record(item.read_text(encoding="utf-8"), binding)
+                import stat
+                descriptor = os.open(item, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(descriptor, 'rb') as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        continue
+                    raw = stream.read(MAX_RECORD_BYTES + 1)
+                if len(raw) > MAX_RECORD_BYTES:
+                    continue
+                record = validate_record(raw.decode('utf-8'), binding)
                 if record is None:
                     continue
                 import tempfile
@@ -267,10 +324,12 @@ def serve_uploads(directory, action_dir, *, limit=MAX_UPLOADS, env=None, run=Non
                     target.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
                     command, inputs = upload_command(action_dir, artifact_name(
                         binding["run_id"], binding["run_attempt"], record["seq"]), temporary)
-                    runner(command, env={**os.environ, **inputs}, check=False,
+                    runner(command, env={**(env if env is not None else os.environ), **inputs}, check=False,
                            stdout=__import__("subprocess").DEVNULL, stderr=__import__("subprocess").DEVNULL)
                 sent += 1
-            except (OSError, ValueError, TypeError):
+                highest = record["seq"]
+                break  # Older pending counters are superseded by this newest record.
+            except (OSError, ValueError, TypeError, UnicodeError):
                 try:
                     print("Progress artifact upload unavailable", flush=True)
                 except OSError:
@@ -281,87 +340,101 @@ def serve_uploads(directory, action_dir, *, limit=MAX_UPLOADS, env=None, run=Non
     return sent
 
 
-def _job_done(jobs, name):
-    matched = [job for job in jobs if job.get("name") == name]
-    if not matched:
-        return False
-    return all(job.get("status") == "completed" for job in matched)
+def _job_done(jobs, name='Review admitted diff'):
+    # Reusable job names carry caller prefixes. A skipped acknowledge invocation
+    # must never be mistaken for the actual review. Observed hosted producer:
+    # `acknowledge / Review admitted diff`, `review / Review admitted diff`.
+    matched = [job for job in jobs if isinstance(job, dict) and isinstance(job.get('name'), str)
+               and (job['name'] == 'review / ' + name or job['name'].endswith(' / review / ' + name))]
+    matched = [job for job in matched if job.get('conclusion') != 'skipped']
+    return bool(matched) and all(job.get('status') == 'completed' for job in matched)
 
 
 def observe(env=None, *, opener=None, sleep=None, iterations=None):
-    """Patch this run's open notice from progress artifacts, then stop. Always best effort."""
+    """Apply only the newest unseen counter to the existing open notice."""
     try:
         env = os.environ if env is None else env
         binding = binding_from_env(env)
-        token = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")
+        token = env.get('GH_TOKEN') or env.get('GITHUB_TOKEN')
         if binding is None or not token:
             return 0
-        opener = opener or urllib.request.build_opener(NoRedirect)
         sleep = time.sleep if sleep is None else sleep
-        repo, run = binding["repository"], binding["run_id"]
-        prefix = f"https://api.github.com/repos/{repo}"
-        applied, quiet = 0, False
-        steps = 0
+        opener = RateOpener(opener or urllib.request.build_opener(NoRedirect), sleep)
+        repo, run = binding['repository'], binding['run_id']
+        prefix = f'https://api.github.com/repos/{repo}'
+        applied, quiet, steps, notice_id, rejected = 0, False, 0, None, set()
         while iterations is None or steps < iterations:
             steps += 1
             try:
-                listed = _collect(opener, token, f"{prefix}/actions/runs/{run}/artifacts?per_page=100", "artifacts")
-                jobs = _api(opener, token, "GET", f"{prefix}/actions/runs/{run}/jobs?per_page=100")
-                comments = _api(opener, token, "GET",
-                                f"{prefix}/issues/{binding['number']}/comments?per_page=100")
-            except (urllib.error.URLError, urllib.error.HTTPError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-                if iterations is not None:
+                jobs = _collect(opener, token, f'{prefix}/actions/runs/{run}/jobs?per_page=100', 'jobs')
+                if notice_id is None:
+                    comments = _collect(opener, token, f"{prefix}/issues/{binding['number']}/comments?per_page=100")
+                    matches = [item for item in comments if _notice(item, run)]
+                    notice = matches[0] if len(matches) == 1 else None
+                    if notice is not None:
+                        notice_id = notice['id']
+                else:
+                    notice = _api(opener, token, 'GET', f'{prefix}/issues/comments/{notice_id}')
+                    if not _notice(notice, run):
+                        break
+                if notice is not None and is_terminal(notice.get('body')):
                     break
+                listed = _collect(opener, token, f'{prefix}/actions/runs/{run}/artifacts?per_page=100', 'artifacts')
+                candidates = []
+                for artifact in listed:
+                    if not isinstance(artifact, dict):
+                        continue
+                    match = NAME.fullmatch(artifact.get('name') or '')
+                    identity = artifact.get('id')
+                    if (not match or match[1] != run or match[2] != '1' or int(match[3]) <= applied
+                            or type(identity) is not int or identity <= 0 or identity in rejected
+                            or artifact.get('expired') or not bounded(artifact.get('size_in_bytes'))
+                            or artifact['size_in_bytes'] > MAX_RECORD_BYTES):
+                        continue
+                    candidates.append((int(match[3]), identity))
+                for seq, identity in sorted(candidates, reverse=True):
+                    try:
+                        blob = _download(token, f'{prefix}/actions/artifacts/{identity}/zip', opener=opener)
+                        payload = _record_from_zip(blob)
+                        record = validate_record(payload, binding) if payload else None
+                        if record is None or record['seq'] != seq:
+                            rejected.add(identity)
+                            continue
+                        if notice is not None and decide(notice.get('body'), record, applied) == 'patch':
+                            body = notice_text(record)
+                            updated = _patch(opener, token, f"{prefix}/issues/comments/{notice['id']}", body)
+                            if isinstance(updated, dict) and updated.get('body') == body:
+                                applied = seq
+                        break
+                    except (urllib.error.URLError, ValueError, KeyError, TypeError):
+                        continue
+                review_done = _job_done(jobs)
+                absent = not any(isinstance(job, dict) and isinstance(job.get('name'), str)
+                                 and (job['name'] == 'review / Review admitted diff'
+                                      or job['name'].endswith(' / review / Review admitted diff'))
+                                 and job.get('conclusion') != 'skipped' for job in jobs)
+                if (review_done or absent) and quiet:
+                    break
+                quiet = review_done or absent
+            except (urllib.error.URLError, ValueError, KeyError, TypeError):
+                pass
+            if iterations is None or steps < iterations:
                 sleep(POLL_SECONDS)
-                continue
-            notice = None
-            for comment in comments if isinstance(comments, list) else []:
-                author = comment.get("user") or {}
-                body = comment.get("body") or ""
-                if (author.get("login") == "github-actions[bot]" and author.get("id") == 41898282
-                        and author.get("type") == "Bot"
-                        and body.startswith(NOTICE.format(run=run) + "\n")):
-                    notice = comment
-            records = []
-            for artifact in listed:
-                match = NAME.fullmatch(artifact.get("name") or "")
-                if (not match or match.group(1) != run or match.group(2) != "1"
-                        or artifact.get("expired") or not bounded(artifact.get("size_in_bytes") or 0)
-                        or artifact["size_in_bytes"] > MAX_RECORD_BYTES):
-                    continue
-                try:
-                    blob = _download(token, artifact["archive_download_url"])
-                    payload = _record_from_zip(blob)
-                except (urllib.error.URLError, urllib.error.HTTPError, ValueError, KeyError, TypeError):
-                    continue
-                record = validate_record(payload, binding) if payload else None
-                if record is not None and record["seq"] == int(match.group(3)):
-                    records.append(record)
-            records.sort(key=lambda item: item["seq"])
-            for record in records:
-                if notice is None or decide(notice.get("body"), record, applied) != "patch":
-                    continue
-                body = notice_text(record)
-                try:
-                    time.sleep(1)
-                    updated = _patch(opener, token, f"{prefix}/issues/comments/{notice['id']}", body)
-                except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TypeError):
-                    continue
-                if isinstance(updated, dict) and updated.get("body") == body:
-                    notice, applied = updated, record["seq"]
-            review_done = _job_done(jobs.get("jobs") or [] if isinstance(jobs, dict) else [], "Review admitted diff")
-            if review_done and quiet:
-                break
-            quiet = review_done
-            if iterations is not None:
-                break
-            sleep(POLL_SECONDS)
     except Exception:
         try:
-            print("Review progress notice unavailable; inference continues", flush=True)
+            print('Review progress notice unavailable; inference continues', flush=True)
         except OSError:
             pass
     return 0
+
+
+def _notice(item, run):
+    if not isinstance(item, dict) or type(item.get('id')) is not int or item['id'] <= 0:
+        return False
+    author, body = item.get('user'), item.get('body')
+    return (isinstance(author, dict) and author.get('login') == 'github-actions[bot]'
+            and author.get('id') == 41898282 and author.get('type') == 'Bot'
+            and isinstance(body, str) and body.startswith(NOTICE.format(run=run) + '\n'))
 
 
 def _patch(opener, token, url, body):

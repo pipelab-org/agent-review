@@ -443,7 +443,7 @@ def render_section(bundle, store, section):
         from . import review_context as context
     except ImportError:
         import review_context as context
-    parts = [context.intent_render(bundle, section)]
+    parts = []
     for seg in bundle["sections"][section]["segments"]:
         file = bundle["files"][seg["file"]]
         data = read_range(store.patch(seg["file"]), seg["start"], seg["end"])
