@@ -230,6 +230,29 @@ class RepositoryPlanTests(unittest.TestCase):
         self.assertIn(".git/agent-review/index.tsv", e.claude_prompt(bundle, "bundle"))
         self.assertTrue(bundle.store.index().read_text().startswith("file\tpath\tstate"))
 
+    def test_multi_section_spare_capacity_carries_immutable_full_file_context(self):
+        (self.root / "keep.txt").write_text("".join(f"large line {i}\n" for i in range(7000)))
+        (self.root / "small.py").write_text("def useful_context():\n    return 42\n")
+        head = self.head()
+        settings = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
+        bundle = e.build_bundle(self.root, head, self.base, settings)
+        self.assertGreater(len(bundle["sections"]), 1)
+        small = next(f for f in bundle["files"] if f["path"] == "small.py")
+        self.assertEqual("full", small["content"])
+        self.assertEqual("regions", next(f for f in bundle["files"] if f["path"] == "keep.txt")["content"])
+        self.check_exact(bundle)
+        prompts = [e.section_prompt(bundle, provider, strategy, i)
+                   for i in range(len(bundle["sections"])) for provider, strategy in e.PROMPT_KINDS]
+        self.assertTrue(any("def useful_context():" in p for p in prompts))
+        self.assertTrue(all(e.token_bound(p) + e.token_bound(json.dumps(e.SECTION_SCHEMA))
+                            <= settings["max_model_tokens"] - settings["max_output_tokens"] for p in prompts))
+        self.assertEqual(bundle, e.build_bundle(self.root, head, self.base, settings))
+        index = next(i for i, f in enumerate(bundle["files"]) if f["path"] == "small.py")
+        bundle.store.content(index).write_text("tampered\n")
+        with self.assertRaises(e.ReviewAbort):
+            for i in range(len(bundle["sections"])):
+                e.section_prompt(bundle, "claude", "bundle", i)
+
     def test_changed_instructions_exclusions_and_learning_bytes_change_the_plan_identity(self):
         (self.root / "keep.txt").write_text("changed\n")
         head = self.head()

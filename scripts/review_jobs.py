@@ -147,11 +147,16 @@ def prepare(head_dir, output, reply=False):
     check_command(repo, pr, depth)
     proof = records(repo, pr, ctx, policy)
     scope = followups.scope_for(repo, ctx, proof)
+    intent = None
+    if hasattr(pr, "title") or hasattr(pr, "body"):
+        intent = {"title": getattr(pr, "title", None) or "", "body": getattr(pr, "body", None) or ""}
     bundle = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy,
                                  profile["ignore"]["glob"],
                                  start=scope["from"] if scope["kind"] == "incremental" else None,
                                  instructions=profile["review"]["instructions"],
-                                 learning_data=learning_data)
+                                 learning_data=learning_data,
+                                 intent=intent,
+                                 repository=ctx["repository"])
     threads = []
     if scope["kind"] != "unchanged":
         try:
@@ -369,10 +374,20 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
             review_dir = sessions.stage_head(head_dir, workspace)
             bundle = engine.attach_store(plan["bundle"], engine.sections.Store.for_checkout(review_dir))
         passes = []
+        try:
+            from . import review_progress as progress_records
+        except ImportError:
+            import review_progress as progress_records
+        progress_seq = {"n": 0}
         for pass_index, strategy in enumerate(policy["passes"], 1):
-            def progress(state, kind, section, total):
+            def progress(state, kind, section, total, pass_index=pass_index):
                 stage = f"section {section + 1}/{total}" if kind == "section" else "cross-section consolidation"
                 report_progress(f"Review pass {pass_index}/{len(policy['passes'])}, {stage}: {state}. Publication pending.")
+                progress_seq["n"] += 1
+                progress_records.write_progress(
+                    progress_seq["n"], kind=kind, state=state, pass_index=pass_index,
+                    passes=len(policy["passes"]), section=None if section is None else section + 1,
+                    sections_count=total)
 
             def invoke(current, prompt, schema, validator, key, strategy=strategy):
                 if policy["provider"] == "claude":
@@ -391,6 +406,8 @@ def infer(plan_path, output, head_dir, action=None, codex_home=None):
                           and bool(plan.get("threads")))
     if needs_verification and policy["provider"] == "claude":
         report_progress("Review passes processed; checking prior threads. Publication pending.")
+        progress_seq["n"] += 1
+        progress_records.write_progress(progress_seq["n"], kind="threads", state="started")
         try:
             prompt = verification_prompt(plan)
             kwargs = dict(prompt=prompt, schema=VERIFICATION_SCHEMA,
@@ -663,7 +680,30 @@ def publish_review(repo, pr, ctx, policy, plan, result, verification=None, head_
     placement, reasons = place_findings(plan, result, findings, previous, store)
     anchored = [i for i, where in enumerate(placement) if where == "inline"]
     filed = [i for i, where in enumerate(placement) if where == "file"]
-    comments = [inline_comment([findings[i] for i in group]) for group in bounded_groups(findings, anchored)]
+    try:
+        from . import review_suggestions as suggestions
+    except ImportError:
+        import review_suggestions as suggestions
+    comments = []
+    head_blobs = {}
+    files = {item["path"]: (index, item) for index, item in enumerate(plan["bundle"]["files"])}
+    check_pr(repo, ctx)
+    for group in bounded_groups(findings, anchored):
+        comment = inline_comment([findings[i] for i in group])
+        if len(group) == 1 and head_dir is not None:
+            item = result["findings"][group[0]]
+            path = findings[group[0]]["path"]
+            entry = files.get(path)
+            if entry is not None and item.get("line") == findings[group[0]]["line"] and item.get("end_line") == findings[group[0]]["end_line"]:
+                if path not in head_blobs:
+                    try:
+                        head_blobs[path] = suggestions.head_lines(
+                            engine.git(head_dir, "show", f"{ctx['head']}:{path}", binary=True))
+                    except engine.ReviewAbort:
+                        head_blobs[path] = None
+                comment = suggestions.attach(comment, suggestions.widget(
+                    item, head_blobs[path], patch_visible(store, entry[0], entry[1])))
+        comments.append(comment)
     key = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
     roots = []
     def fresh():
@@ -790,16 +830,22 @@ def reconstruct_root(root, record):
     A grouped root may omit summary-only findings from the same range. Match the
     actual rendered members in record order; ambiguous or partial matches refuse
     resolution. Delimiters inside finding bodies are data, not split points.
+    A publisher suggestion fence is not part of the recorded finding.
     """
+    try:
+        from . import review_suggestions as suggestions
+    except ImportError:
+        import review_suggestions as suggestions
+    body = suggestions.peel(root.body)
     candidates = [f for f in record["findings"] if f["path"] == root.path and f["line"] is not None]
     singles = [f for f in candidates
-               if root.body in (inline_comment([f])["body"], file_comment(f)["body"])]
-    heading = re.match(r"\*\*([1-9][0-9]*) findings on these lines\*\*\n\n", root.body)
+               if body in (inline_comment([f])["body"], file_comment(f)["body"])]
+    heading = re.match(r"\*\*([1-9][0-9]*) findings on these lines\*\*\n\n", body)
     if len(singles) == 1 and not heading:
         return singles
     if singles or not heading:
         raise ReviewAbort("Inline findings could not be reconstructed")
-    count, rest, group = int(heading[1]), root.body[heading.end():], []
+    count, rest, group = int(heading[1]), body[heading.end():], []
     for index in range(count):
         matches = []
         for position, finding in enumerate(candidates):
@@ -812,7 +858,7 @@ def reconstruct_root(root, record):
         position, finding, text = matches[0]
         group.append(finding)
         candidates, rest = candidates[position + 1:], rest[len(text):]
-    if (rest or inline_comment(group)["body"] != root.body
+    if (rest or inline_comment(group)["body"] != body
             or len(overlap_groups(group, list(range(len(group))))) != 1):
         raise ReviewAbort("Inline findings could not be reconstructed")
     return group
@@ -1344,10 +1390,20 @@ def validate_artifact(artifact, head_dir, policy, ctx, profile):
     if meta["sha"] != ctx["learnings"]["sha"]:
         raise ReviewAbort("Artifact learnings differ from trusted context")
     if plan["kind"] == "review":
+        if plan["bundle"].get("version") != engine.BUNDLE_VERSION:
+            raise ReviewAbort("Artifact bundle differs from immutable source")
+        included = plan["bundle"].get("intent")
+        intent = None
+        if included is not None:
+            live = github().get_repo(ctx["repository"]).get_pull(ctx["number"])
+            intent = {"title": live.title or "", "body": live.body or ""}
         expected = engine.build_bundle(head_dir, ctx["head"], ctx["base"], policy, profile["ignore"]["glob"],
                                       start=plan["scope"]["from"] if plan["scope"]["kind"] == "incremental" else None,
                                       instructions=profile["review"]["instructions"],
-                                      learning_metadata=plan["bundle"]["learnings"])
+                                      learning_metadata=plan["bundle"]["learnings"],
+                                      intent=intent, include_intent=included is not None,
+                                      upstream_required=plan["bundle"].get("upstream") or [],
+                                      repository=ctx["repository"])
         if expected != plan["bundle"]:
             raise ReviewAbort("Artifact bundle differs from immutable source")
         if result is not None:
@@ -1428,7 +1484,7 @@ def publish_artifact(path, head_dir, verification_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("prepare", "infer", "verify", "publish", "check-config"))
+    parser.add_argument("mode", choices=("prepare", "infer", "verify", "publish", "check-config", "observe"))
     parser.add_argument("--head", type=Path)
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
@@ -1451,6 +1507,12 @@ def main():
         elif args.mode == "publish":
             with reliability.runtime():
                 publish_artifact(args.input, args.head.resolve(), args.verification)
+        elif args.mode == "observe":
+            try:
+                from . import review_progress as progress_records
+            except ImportError:
+                import review_progress as progress_records
+            progress_records.observe()
     except (Exception, KeyboardInterrupt) as error:
         # Our abort messages are fixed text/config keys; vendor exceptions may echo secrets.
         message = str(error) if isinstance(error, (ReviewAbort, followups.FollowupAbort)) else type(error).__name__

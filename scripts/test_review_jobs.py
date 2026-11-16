@@ -587,21 +587,27 @@ class JobTests(unittest.TestCase):
                         if "/pulls/" in req.full_url else self.event["comment"]
                         if "/issues/comments/9" in req.full_url else [existing])
             else:
-                writes.append((req.method, req.full_url, json.loads(req.data)["body"]))
+                writes.append((req.method, req.full_url, json.loads(req.data)["body"] if req.data else None))
                 data = {}
             return io.BytesIO(json.dumps(data).encode())
         with patch.dict(os.environ, {"GH_TOKEN": "fixture", "PROGRESS_ONLY": "true", "PROGRESS_CANCELLED": "true"}), \
                 patch("urllib.request.urlopen", side_effect=request), patch("time.sleep"):
             exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertEqual(1, len(writes))
-            self.assertEqual(("PATCH", "https://api.github.com/repos/example/project/issues/comments/77"), writes[0][:2])
+            self.assertEqual(("POST", "https://api.github.com/repos/example/project/issues/1/comments"), writes[0][:2])
             self.assertIn("Review run cancelled", writes[0][2])
+            self.assertIn("agent-review-notice-terminal:v1", writes[0][2])
             self.assertNotIn("Review started", writes[0][2])
+            self.assertEqual(("DELETE", "https://api.github.com/repos/example/project/issues/comments/77"), writes[1][:2])
             self.assertEqual([], reactions, "a cancelled run must not acknowledge receipt")
             os.environ["PROGRESS_ONLY"] = "false"
             exec(compile(script, "<trusted-progress>", "exec"), {})
-            self.assertEqual(1, len(writes), "a regular invocation cannot claim terminal-writer authority")
+            self.assertEqual(2, len(writes), "a regular invocation cannot claim terminal-writer authority")
             self.assertEqual([], reactions)
+            existing = {"id": 77, "body": marker + "<!-- agent-review-status:v1 state=success -->", "user": f.BOT}
+            os.environ["PROGRESS_ONLY"] = "true"
+            os.environ["PROGRESS_CANCELLED"] = "true"
+            exec(compile(script, "<trusted-progress>", "exec"), {})
+            self.assertEqual(2, len(writes), "cancellation must not delete a success notice")
 
     def test_native_claude_turn_stops_keep_the_fixed_reason(self):
         cases = [{"subtype": "error_max_turns"}, {"terminal_reason": "max_turns"}]
@@ -2781,7 +2787,9 @@ class WorkflowTests(unittest.TestCase):
     def test_publication_preserves_main_review_when_optional_verification_skips_or_fails(self):
         job = self.workflow["jobs"]["publish"]
         self.assertIn("codex-verification", job["needs"])
-        self.assertEqual("!cancelled() && needs.review.result == 'success'", job["if"])
+        self.assertEqual("!cancelled() && needs.review.result == 'success' && needs.observer.result != 'cancelled'", job["if"])
+        self.assertIn("observer", job["needs"])
+        self.assertNotIn("needs.observer.result == 'success'", job["if"])
         notifier = self.workflow["jobs"]["notify-failure"]
         self.assertIn("codex-verification", notifier["needs"])
         self.assertIn("|| cancelled()", notifier["if"])

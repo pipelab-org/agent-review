@@ -89,7 +89,11 @@ FINDING_SCHEMA = {
                       ("path", "title", "mechanism", "trigger", "consequence", "repair")},
                    "line": {"type": "integer", "minimum": 1},
                    "end_line": {"type": "integer", "minimum": 1},
-                   "confidence": {"type": "string", "enum": ["high", "medium", "low"]}}}
+                   "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                   "suggestion": {"type": "object", "additionalProperties": False,
+                                  "required": ["original", "replacement"],
+                                  "properties": {"original": {"type": "string", "minLength": 1},
+                                                 "replacement": {"type": "string"}}}}}
 OUTPUT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["findings"],
                  "properties": {"findings": {"type": "array", "maxItems": MAX_FINDINGS, "items": FINDING_SCHEMA}}}
 # A bounded section also returns cross-section questions, capped like findings per output.
@@ -194,7 +198,7 @@ def token_bound(text):
 BINARY_MESSAGE = "Changed binary file is outside source review coverage; declare an exclusion"
 # Manifest format version. Bump it with any change to what the plan binds or how a
 # section is rendered, so an older artifact can never validate against a newer plan.
-BUNDLE_VERSION = 2
+BUNDLE_VERSION = 4
 # The prompt shapes a depth can send; planning sizes the largest of them.
 PROMPT_KINDS = (("claude", "bundle"), ("claude", "callers"), ("codex", "callers"))
 # Width of every number in a section note while the section count is still unknown.
@@ -257,7 +261,8 @@ def stage_files(repo, head, start, paths, exclusions, store):
 
 
 def build_bundle(repo, head, base, settings, exclusions=(), start=None, instructions="",
-                 learning_data=None, learning_metadata=None, store=None):
+                 learning_data=None, learning_metadata=None, store=None, intent=None,
+                 include_intent=None, upstream_required=None, repository="", fetcher=None):
     if any(not isinstance(s, str) or not re.fullmatch(r"[0-9a-f]{40}", s) for s in (head, base)):
         raise ReviewAbort("Invalid admitted Git revision")
     if git(repo, "rev-parse", "HEAD").strip() != head:
@@ -290,9 +295,25 @@ def build_bundle(repo, head, base, settings, exclusions=(), start=None, instruct
         meta, text = learnings.without_context(meta, "prompt allowance exceeded"), ""
         layout = plan_layout(repo, files, fields, instructions, settings, store, 0)
     bundle = Bundle({**fields, "files": layout["files"], "sections": layout["sections"],
-                     "instructions": instructions, "learnings": meta})
-    bundle["root"] = manifest_root(bundle)
+                     "instructions": instructions, "learnings": meta, "upstream": [], "intent": None})
     bundle.store = store
+    reserved = meta["bytes"]
+
+    def room_for(section):
+        return _section_room(bundle, settings, reserved, section)
+
+    try:
+        from . import review_context as context
+    except ImportError:
+        import review_context as context
+    # The section note embeds this digest. Its width is always 64 hex digits, so
+    # spare room can be measured before the digest exists. manifest_root ignores
+    # the field and replaces the placeholder after optional context is chosen.
+    bundle["root"] = "0" * 64
+    context.attach(bundle, store, repo, settings, reserved, room_for, intent=intent,
+                   include_intent=include_intent, upstream_required=upstream_required,
+                   repository=repository, fetcher=fetcher)
+    bundle["root"] = manifest_root(bundle)
     sections.write_index(bundle, store)
     if text:
         bundle["learnings_text"] = text
@@ -350,8 +371,30 @@ def plan_layout(repo, files, fields, instructions, settings, store, reserved):
             # packing below the exact current block size, retaining the compact
             # section-note allowance instead of reserving that unbounded list.
             planned = sections.plan_sections(files, min(capacity, blocks - 1))
-    return {"files": entries,
-            "sections": [sections.section_entry(i, segments) for i, segments in enumerate(planned)]}
+    section_entries = [sections.section_entry(i, segments) for i, segments in enumerate(planned)]
+    if len(planned) > 1:
+        # Patches have already been assigned in full. Spend only the remaining
+        # section allowance on optional immutable head blobs, in Git path order.
+        # The conservative framing above includes the largest possible note.
+        probe = {"files": entries, "sections": section_entries}
+        remaining = [capacity - token_bound(sections.render_section(probe, store, i))
+                     for i in range(len(planned))]
+        ending = {seg["file"]: i for i, group in enumerate(planned) for seg in group
+                  if seg["end"] == files[seg["file"]]["patch"]["bytes"]}
+        for index, file in enumerate(files):
+            if file["deleted"] or index not in ending:
+                continue
+            content = sections.stream_to_file(
+                sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
+                store.content(index), message=BINARY_MESSAGE)
+            cost = sections.content_cost(content)
+            section = ending[index]
+            if cost <= remaining[section]:
+                entries[index] = content_entry(file, "full", content)
+                remaining[section] -= cost
+            else:
+                store.content(index).unlink(missing_ok=True)
+    return {"files": entries, "sections": section_entries}
 
 
 def content_entry(file, mode, content=None):
@@ -403,14 +446,35 @@ def fit_contents(repo, files, segments, fields, instructions, settings, store, r
     return entries
 
 
+def _section_room(bundle, settings, reserved, section):
+    """Spare bytes of one section's largest real prompt, after patches and full-file context."""
+    available = settings["max_model_tokens"] - settings["max_output_tokens"]
+    schema = token_bound(json.dumps(SECTION_SCHEMA if len(bundle["sections"]) > 1 else OUTPUT_SCHEMA))
+    used = max(token_bound(section_prompt(bundle, provider, strategy, section))
+               for provider, strategy in PROMPT_KINDS)
+    return available - schema - reserved - used
+
+
 def validate_schema(data):
     if not isinstance(data, dict) or set(data) != {"findings"} or not isinstance(data["findings"], list):
         raise ReviewAbort("Invalid findings schema")
     if len(data["findings"]) > MAX_FINDINGS:
         raise ReviewAbort("Findings exceed the six-candidate per-pass schema")
+    try:
+        from . import review_suggestions as suggestions
+    except ImportError:
+        import review_suggestions as suggestions
+    required = set(FINDING_SCHEMA["required"])
     for item in data["findings"]:
-        if not isinstance(item, dict) or set(item) != set(FINDING_SCHEMA["required"]):
+        if not isinstance(item, dict) or not required <= set(item) <= required | {"suggestion"}:
             raise ReviewAbort("Invalid finding fields")
+        suggestion = item.get("suggestion")
+        if "suggestion" in item and (not isinstance(suggestion, dict) or set(suggestion) != {"original", "replacement"}
+                                     or not isinstance(suggestion.get("original"), str) or not suggestion["original"]
+                                     or not isinstance(suggestion.get("replacement"), str)):
+            raise ReviewAbort("Invalid finding fields")
+        for key in ("title", "mechanism", "trigger", "consequence", "repair"):
+            item[key] = suggestions.strip_fences(item[key])
         if any(not isinstance(item[k], str) or not item[k].strip() for k in
                ("path", "title", "mechanism", "trigger", "consequence", "repair", "confidence")):
             raise ReviewAbort("Invalid finding text")

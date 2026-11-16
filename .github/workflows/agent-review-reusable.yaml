@@ -175,18 +175,35 @@ jobs:
                        "Review started: preparing the captured diff and running the configured passes. No completed review yet. "
                        "Open Actions for live pass and section progress. This comment updates again when the run finishes.")
             body = marker + "\n" + message + f"\n\n[Actions run](https://github.com/{repo}/actions/runs/{run})."
-            page = 1
+            # Cancellation cannot wait for the observer. Create the terminal notice, then delete the
+            # open one so an in-flight progress PATCH addresses a comment that no longer exists.
+            # Issue comment delete: https://docs.github.com/en/rest/issues/comments#delete-an-issue-comment
+            if terminal:
+                body = f"<!-- agent-review-notice-terminal:v1 run={run} state=cancelled -->\n" + body
+            page, found = 1, None
             while True:
                 comments = api("GET", f"{prefix}/issues/{number}/comments?per_page=100&page={page}")
                 for item in comments:
                     author = item.get("user", {})
                     if (author.get("login") == "github-actions[bot]" and author.get("id") == 41898282
                             and author.get("type") == "Bot" and item.get("body", "").startswith(marker + "\n")):
-                        api("PATCH", f"{prefix}/issues/comments/{item['id']}", {"body": body})
-                        return
-                if len(comments) < 100:
+                        found = item
+                        break
+                if found is not None or len(comments) < 100:
                     break
                 page += 1
+            existing = found.get("body", "") if found else ""
+            if any(mark in existing for mark in ("<!-- agent-review-status:v1", "Treat this run as incomplete",
+                                                 "Review run cancelled", "<!-- agent-review-notice-terminal:v1")):
+                return
+            if terminal:
+                api("POST", f"{prefix}/issues/{number}/comments", {"body": body})
+                if found is not None:
+                    api("DELETE", f"{prefix}/issues/comments/{found['id']}")
+                return
+            if found is not None:
+                api("PATCH", f"{prefix}/issues/comments/{found['id']}", {"body": body})
+                return
             api("POST", f"{prefix}/issues/{number}/comments", {"body": body})
         try:
             main()
@@ -446,6 +463,14 @@ jobs:
         python trusted-agent-review/scripts/codex_identity_setup.py runtime
         umask 022
         npm install --global --prefix /var/lib/agent-review-runtime @openai/codex@0.165.0
+    - name: Fetch the pinned artifact uploader
+      continue-on-error: true
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: actions/upload-artifact
+        ref: ea165f8d65b6e75b540449e92b4886f43607fa02
+        path: trusted-upload-artifact
+        persist-credentials: false
     - name: Review the admitted diff
       id: inference
       env:
@@ -464,7 +489,22 @@ jobs:
         ANTHROPIC_API_KEY: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY || '' }}
         ANTHROPIC_API_KEY_2: ${{ !startsWith(env.REVIEW_DEPTH, 'codex') && secrets.ANTHROPIC_API_KEY_2 || '' }}
         REVIEW_CODEX_SESSION_USER: ${{ startsWith(env.REVIEW_DEPTH, 'codex') && 'agent-review-model' || '' }}
-      run: python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
+        REVIEW_PROGRESS_DIR: ${{ runner.temp }}/agent-review-progress
+      run: |
+        umask 022
+        mkdir -p "$RUNNER_TEMP/agent-review-progress"
+        if [ -f trusted-upload-artifact/dist/index.js ]; then
+          python trusted-agent-review/scripts/review_progress.py upload --dir "$RUNNER_TEMP/agent-review-progress" --action trusted-upload-artifact &
+          echo $! > "$RUNNER_TEMP/agent-review-progress.pid"
+        fi
+        set +e
+        python trusted-agent-review/scripts/review_jobs.py infer --head pr-head --input "$RUNNER_TEMP/agent-review/plan.json" --output "$RUNNER_TEMP/agent-review/findings.json" --codex-action trusted-codex-action --codex-home "$RUNNER_TEMP/agent-review-codex-home"
+        code=$?
+        if [ -f "$RUNNER_TEMP/agent-review-progress.pid" ]; then
+          kill "$(cat "$RUNNER_TEMP/agent-review-progress.pid")" 2>/dev/null || true
+          wait "$(cat "$RUNNER_TEMP/agent-review-progress.pid")" 2>/dev/null || true
+        fi
+        exit "$code"
     - name: Preserve findings and complete pass receipts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
@@ -939,6 +979,47 @@ jobs:
         REVIEW_OUTCOME_PATH: ${{ runner.temp }}/agent-review-outcome/outcome.json
     env:
       REVIEW_DEPTH: default
+  observer:
+    name: Update the review notice from progress artifacts
+    needs:
+    - source
+    - admit
+    - progress
+    # Parallel with review. A failed observer must not skip publication: publish tolerates
+    # every result except cancellation, and this job is marked continue-on-error.
+    if: ${{ !cancelled() && needs.source.result == 'success' && needs.admit.result == 'success' && needs.admit.outputs.admitted == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+    - name: Check out immutable agent-review source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: pipelab-org/agent-review
+        ref: ${{ needs.source.outputs.reviewer_sha }}
+        path: trusted-agent-review
+        persist-credentials: 'false'
+    - name: Set up the Python version the pinned dependencies were hashed for
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      with:
+        python-version: '3.12'
+    - name: Install pinned engine dependencies
+      run: pip install --require-hashes -r trusted-agent-review/.github/requirements-runtime.txt
+    - name: Apply validated progress records to this run's notice
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.issue.number }}
+        REVIEW_HEAD: ${{ needs.admit.outputs.head }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      run: python trusted-agent-review/scripts/review_jobs.py observe
   notify-failure:
     name: Report incomplete review
     needs:
@@ -1187,8 +1268,11 @@ jobs:
     - admit
     - review
     - codex-verification
+    - observer
+    # The observer has exited, and joined its last notice write, before publication starts.
+    # Its failure or skip must not block a completed review.
     if: >-
-      !cancelled() && needs.review.result == 'success'
+      !cancelled() && needs.review.result == 'success' && needs.observer.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
