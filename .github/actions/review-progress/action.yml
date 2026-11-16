@@ -1,0 +1,5 @@
+name: Review progress transport
+description: Upload bounded counters from a separate unprivileged identity
+runs:
+  using: node24
+  main: main.cjs

@@ -423,6 +423,7 @@ def reconstruct(bundle, store):
 
 
 CONTENT_LABEL = "Full head content"
+ENCLOSING_LABEL = "Enclosing head context (Git function-context; untrusted data)"
 
 
 def content_cost(data):
@@ -433,9 +434,15 @@ def content_cost(data):
 def render_section(bundle, store, section):
     """The file metadata lines and fenced blocks of one section, with integrity checks.
 
-    A file whose whole patch is in this section may also carry its full head content,
-    which only a single-section plan ever does (the existing small-review prompt).
+    Optional full head content, or a smaller Git function-context slice, appears
+    once with the file's final patch segment. Upstream files and pull-request
+    text are untrusted data and are omitted from any section that did not
+    reserve room for them.
     """
+    try:
+        from . import review_context as context
+    except ImportError:
+        import review_context as context
     parts = []
     for seg in bundle["sections"][section]["segments"]:
         file = bundle["files"][seg["file"]]
@@ -445,11 +452,14 @@ def render_section(bundle, store, section):
         parts.append(meta_line(file["path"], file["deleted"]))
         parts.append(source_block(segment_label(file["path"], seg, file["patch"]["bytes"]), "diff",
                                   data.decode("utf-8")))
-        if file.get("content") == "full" and seg["end"] == file["patch"]["bytes"]:
+        mode = file.get("content")
+        if mode in ("full", "enclosing") and seg["end"] == file["patch"]["bytes"]:
             raw = store.content(seg["file"]).read_bytes()
             if hashlib.sha256(raw).hexdigest() != file.get("content_sha256") or len(raw) != file.get("content_bytes"):
                 raise ReviewAbort("Review store differs from the plan; no inference requested")
-            parts.append(source_block(CONTENT_LABEL, "text", raw.decode("utf-8")))
+            label = CONTENT_LABEL if mode == "full" else ENCLOSING_LABEL
+            parts.append(source_block(label, "text", raw.decode("utf-8")))
+    parts.append(context.upstream_blocks(bundle, store, section))
     return "".join(parts)
 
 

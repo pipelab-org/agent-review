@@ -20,7 +20,8 @@
           "trigger",
           "consequence",
           "repair",
-          "confidence"
+          "confidence",
+          "suggestion"
         ],
         "properties": {
           "path": {
@@ -62,6 +63,26 @@
               "medium",
               "low"
             ]
+          },
+          "suggestion": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "original",
+              "replacement"
+            ],
+            "properties": {
+              "original": {
+                "type": "string",
+                "minLength": 1
+              },
+              "replacement": {
+                "type": "string"
+              }
+            }
           }
         }
       }

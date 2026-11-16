@@ -202,7 +202,7 @@ class CallerTests(unittest.TestCase):
         self.assertEqual('true', caller['jobs']['acknowledge']['with']['progress_only'])
         self.assertNotIn('secrets', caller['jobs']['acknowledge'])
         condition = WORKFLOW['jobs']['notify-failure']['if']
-        self.assertTrue(condition.startswith('always() && !inputs.progress_only && ((' + gate + ') && ('))
+        self.assertTrue(condition.startswith('always() && !cancelled() && !inputs.progress_only && ((' + gate + ') && ('))
         self.assertTrue(condition.endswith("(" + reply_gate + ") && needs.reply.outputs.learnings_revoke_failed == 'true')"))
 
     def test_progress_is_best_effort_and_a_cancelled_run_starts_nothing_new(self):
@@ -444,7 +444,7 @@ class ReporterTests(unittest.TestCase):
 
     def test_reporter_is_host_only_and_minimally_privileged(self):
         job = WORKFLOW['jobs']['notify-failure']
-        self.assertEqual(['source', 'admit', 'progress', 'review', 'codex-verification', 'publish', 'reply'], job['needs'])
+        self.assertEqual(['source', 'admit', 'progress', 'observer', 'review', 'codex-verification', 'publish', 'reply'], job['needs'])
         self.assertIn('always()', job['if'])
         self.assertEqual({'pull-requests': 'write'}, job['permissions'])
         self.assertNotIn('container', job)

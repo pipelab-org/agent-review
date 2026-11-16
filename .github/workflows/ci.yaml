@@ -17,8 +17,11 @@ jobs:
       uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.12'
-    - name: Install pinned test dependencies
-      run: pip install --require-hashes -r .github/requirements-runtime.txt -r .github/requirements-test.txt
+    - name: Install runtime and verify imports before test dependencies
+      run: |
+        pip install --require-hashes -r .github/requirements-runtime.txt
+        python -c "from scripts import review_context, review_engine, review_sections; import yaml"
+        pip install --require-hashes -r .github/requirements-test.txt
     - name: Unit tests
       run: python -m unittest discover -s scripts -p 'test_*.py'
     - name: Offline provider and publication runtime tests
@@ -118,6 +121,46 @@ jobs:
         fi
     - name: Real native Codex sessions with offline Responses and no provider credentials
       run: python scripts/hosted_codex_sandbox_proof.py native --user "$REVIEW_PROOF_USER" --codex /var/lib/agent-review-runtime/bin/codex
+  progress-transport-proof:
+    # Production progress is first-attempt-only. This fixture uploads a synthetic
+    # counter to this CI run, with no provider, pull-request mutation or caller pin.
+    if: github.run_attempt == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    env:
+      PR_NUMBER: '1'
+      REVIEW_HEAD: ${{ github.sha }}
+      REVIEW_PROGRESS_DIR: /var/lib/agent-review-progress
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: actions/upload-artifact
+        ref: ea165f8d65b6e75b540449e92b4886f43607fa02
+        path: trusted-upload-artifact
+        persist-credentials: false
+    - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+      with:
+        node-version: '24'
+    - name: Prepare protected progress transport
+      run: sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT -- /usr/bin/python3 scripts/review_progress_runtime.py prepare --source scripts --uploader trusted-upload-artifact --node "$(command -v node)" --uid "$(id -u)" --gid "$(id -g)"
+    - name: Start the real background action
+      id: progress-uploader
+      background: true
+      uses: ./.github/actions/review-progress
+    - name: Require a real live artifact and a credential-free supervisor
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 scripts/hosted_progress_proof.py probe
+    - name: Stop the real background action
+      cancel: progress-uploader
+    - name: Require process cleanup after runner cancellation
+      run: python3 scripts/hosted_progress_proof.py stopped
 'on':
   pull_request:
     branches:

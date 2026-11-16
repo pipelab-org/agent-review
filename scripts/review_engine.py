@@ -84,12 +84,16 @@ and trace the caller's outcome after each recheck.
 PASS_FOCUS = {"bundle": BOUNDARY_FOCUS, "callers": LIFECYCLE_FOCUS}
 FINDING_SCHEMA = {
     "type": "object", "additionalProperties": False,
-    "required": ["path", "line", "end_line", "title", "mechanism", "trigger", "consequence", "repair", "confidence"],
+    "required": ["path", "line", "end_line", "title", "mechanism", "trigger", "consequence", "repair", "confidence", "suggestion"],
     "properties": {**{k: {"type": "string", "minLength": 1} for k in
                       ("path", "title", "mechanism", "trigger", "consequence", "repair")},
                    "line": {"type": "integer", "minimum": 1},
                    "end_line": {"type": "integer", "minimum": 1},
-                   "confidence": {"type": "string", "enum": ["high", "medium", "low"]}}}
+                   "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                   "suggestion": {"type": ["object", "null"], "additionalProperties": False,
+                                  "required": ["original", "replacement"],
+                                  "properties": {"original": {"type": "string", "minLength": 1},
+                                                 "replacement": {"type": "string"}}}}}
 OUTPUT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["findings"],
                  "properties": {"findings": {"type": "array", "maxItems": MAX_FINDINGS, "items": FINDING_SCHEMA}}}
 # A bounded section also returns cross-section questions, capped like findings per output.
@@ -194,7 +198,7 @@ def token_bound(text):
 BINARY_MESSAGE = "Changed binary file is outside source review coverage; declare an exclusion"
 # Manifest format version. Bump it with any change to what the plan binds or how a
 # section is rendered, so an older artifact can never validate against a newer plan.
-BUNDLE_VERSION = 2
+BUNDLE_VERSION = 4
 # The prompt shapes a depth can send; planning sizes the largest of them.
 PROMPT_KINDS = (("claude", "bundle"), ("claude", "callers"), ("codex", "callers"))
 # Width of every number in a section note while the section count is still unknown.
@@ -257,7 +261,8 @@ def stage_files(repo, head, start, paths, exclusions, store):
 
 
 def build_bundle(repo, head, base, settings, exclusions=(), start=None, instructions="",
-                 learning_data=None, learning_metadata=None, store=None):
+                 learning_data=None, learning_metadata=None, store=None,
+                 upstream_required=None, repository="", fetcher=None):
     if any(not isinstance(s, str) or not re.fullmatch(r"[0-9a-f]{40}", s) for s in (head, base)):
         raise ReviewAbort("Invalid admitted Git revision")
     if git(repo, "rev-parse", "HEAD").strip() != head:
@@ -290,9 +295,24 @@ def build_bundle(repo, head, base, settings, exclusions=(), start=None, instruct
         meta, text = learnings.without_context(meta, "prompt allowance exceeded"), ""
         layout = plan_layout(repo, files, fields, instructions, settings, store, 0)
     bundle = Bundle({**fields, "files": layout["files"], "sections": layout["sections"],
-                     "instructions": instructions, "learnings": meta})
-    bundle["root"] = manifest_root(bundle)
+                     "instructions": instructions, "learnings": meta, "upstream": []})
     bundle.store = store
+    reserved = meta["bytes"]
+
+    def room_for(section):
+        return _section_room(bundle, settings, reserved, section)
+
+    try:
+        from . import review_context as context
+    except ImportError:
+        import review_context as context
+    # The section note embeds this digest. Its width is always 64 hex digits, so
+    # spare room can be measured before the digest exists. manifest_root ignores
+    # the field and replaces the placeholder after optional context is chosen.
+    bundle["root"] = "0" * 64
+    context.attach(bundle, store, repo, settings, reserved, room_for, upstream_required=upstream_required,
+                   repository=repository, fetcher=fetcher)
+    bundle["root"] = manifest_root(bundle)
     sections.write_index(bundle, store)
     if text:
         bundle["learnings_text"] = text
@@ -350,8 +370,33 @@ def plan_layout(repo, files, fields, instructions, settings, store, reserved):
             # packing below the exact current block size, retaining the compact
             # section-note allowance instead of reserving that unbounded list.
             planned = sections.plan_sections(files, min(capacity, blocks - 1))
-    return {"files": entries,
-            "sections": [sections.section_entry(i, segments) for i, segments in enumerate(planned)]}
+    section_entries = [sections.section_entry(i, segments) for i, segments in enumerate(planned)]
+    if len(planned) > 1:
+        # Patches have already been assigned in full. Spend only the remaining
+        # section allowance on optional immutable head blobs, in Git path order.
+        # The conservative framing above includes the largest possible note.
+        probe = {"files": entries, "sections": section_entries}
+        remaining = [capacity - token_bound(sections.render_section(probe, store, i))
+                     for i in range(len(planned))]
+        ending = {seg["file"]: i for i, group in enumerate(planned) for seg in group
+                  if seg["end"] == files[seg["file"]]["patch"]["bytes"]}
+        for index, file in enumerate(files):
+            if file["deleted"] or index not in ending:
+                continue
+            content = sections.stream_to_file(
+                sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
+                os.devnull, message=BINARY_MESSAGE, publish=False)
+            cost = sections.content_cost(content)
+            section = ending[index]
+            if cost <= remaining[section]:
+                sections.stream_to_file(
+                    sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
+                    store.content(index), message=BINARY_MESSAGE)
+                entries[index] = content_entry(file, "full", content)
+                remaining[section] -= cost
+            else:
+                store.content(index).unlink(missing_ok=True)
+    return {"files": entries, "sections": section_entries}
 
 
 def content_entry(file, mode, content=None):
@@ -377,7 +422,7 @@ def fit_contents(repo, files, segments, fields, instructions, settings, store, r
         if not file["deleted"]:
             contents[index] = sections.stream_to_file(
                 sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
-                store.content(index), message=BINARY_MESSAGE)
+                os.devnull, message=BINARY_MESSAGE, publish=False)
     full = set(contents)
 
     def size():
@@ -397,10 +442,22 @@ def fit_contents(repo, files, segments, fields, instructions, settings, store, r
         return None
     for index, file in enumerate(files):
         if index in full:
+            sections.stream_to_file(
+                sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
+                store.content(index), message=BINARY_MESSAGE)
             entries[index] = content_entry(file, "full", contents[index])
         else:
             store.content(index).unlink(missing_ok=True)
     return entries
+
+
+def _section_room(bundle, settings, reserved, section):
+    """Spare bytes of one section's largest real prompt, after patches and full-file context."""
+    available = settings["max_model_tokens"] - settings["max_output_tokens"]
+    schema = token_bound(json.dumps(SECTION_SCHEMA if len(bundle["sections"]) > 1 else OUTPUT_SCHEMA))
+    used = max(token_bound(section_prompt(bundle, provider, strategy, section, sizing=True))
+               for provider, strategy in PROMPT_KINDS)
+    return available - schema - reserved - used
 
 
 def validate_schema(data):
@@ -408,9 +465,15 @@ def validate_schema(data):
         raise ReviewAbort("Invalid findings schema")
     if len(data["findings"]) > MAX_FINDINGS:
         raise ReviewAbort("Findings exceed the six-candidate per-pass schema")
+    required = set(FINDING_SCHEMA["required"]) - {"suggestion"}
     for item in data["findings"]:
-        if not isinstance(item, dict) or set(item) != set(FINDING_SCHEMA["required"]):
+        if not isinstance(item, dict) or not required <= set(item) <= required | {"suggestion"}:
             raise ReviewAbort("Invalid finding fields")
+        suggestion = item.get("suggestion")
+        if "suggestion" in item and (not isinstance(suggestion, dict) or set(suggestion) != {"original", "replacement"}
+                                     or not isinstance(suggestion.get("original"), str) or not suggestion["original"]
+                                     or not isinstance(suggestion.get("replacement"), str)):
+            item.pop("suggestion", None)
         if any(not isinstance(item[k], str) or not item[k].strip() for k in
                ("path", "title", "mechanism", "trigger", "consequence", "repair", "confidence")):
             raise ReviewAbort("Invalid finding text")
@@ -467,7 +530,7 @@ def unopened_regions(bundle, receipts):
     """
     opened = {path for r in receipts for path in r["files_opened"]}
     return sorted(f["path"] for f in bundle["files"]
-                  if not f["deleted"] and f.get("content") == "regions" and f["path"] not in opened)
+                  if not f["deleted"] and f.get("content") in ("regions", "enclosing") and f["path"] not in opened)
 
 
 UNVERIFIED_LOCATION_NOTE = "_Location could not be confirmed at the reviewed head; listed in the summary only._"
@@ -1005,7 +1068,7 @@ def how_to_read(provider):
 
 def region_guidance(bundle, how):
     """Name region-only files and request deeper reads without requiring them."""
-    paths = [f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") == "regions"]
+    paths = [f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") in ("regions", "enclosing")]
     if not paths:
         return ""
     return ("These changed files are too large to send whole; their complete unified diffs below "
@@ -1137,10 +1200,14 @@ def pass_note(bundle, provider, strategy, section, ledger):
     return section_note(bundle.store, strategy, section + 1, len(bundle["sections"]), bundle["root"], ledger.meta())
 
 
-def section_prompt(bundle, provider, strategy, section, ledger=None):
-    """Public text of one section's prompt (learning text is appended separately)."""
+def section_prompt(bundle, provider, strategy, section, ledger=None, *, sizing=False):
+    """Public prompt, reserving the planner's maximum ledger widths when sizing."""
     ledger = ledger or Ledger()
-    return prompt_text(bundle, provider, strategy, pass_note(bundle, provider, strategy, section, ledger),
+    note = (section_note(bundle.store, strategy, section + 1, len(bundle["sections"]),
+                         bundle["root"], PLACEHOLDER_LEDGER)
+            if sizing and len(bundle["sections"]) > 1
+            else pass_note(bundle, provider, strategy, section, ledger))
+    return prompt_text(bundle, provider, strategy, note,
                        sections.render_section(bundle, getattr(bundle, "store", None), section))
 
 

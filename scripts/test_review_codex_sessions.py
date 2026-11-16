@@ -148,6 +148,7 @@ class Host:
 
 class Base(unittest.TestCase):
     def setUp(self):
+        # The executable predicate accepts root-owned sticky /tmp; avoid HOME permissions.
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
