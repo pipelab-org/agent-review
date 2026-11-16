@@ -182,15 +182,30 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class ProgressUnavailable(RuntimeError):
+    """Diagnostics yield rather than delaying a terminal writer."""
+
+
 class RateOpener:
     """Use GitHub's published remaining/reset and Retry-After headers.
 
     No response bodies or credentials are logged. The observer is best effort;
-    rate waits can delay diagnostics but cannot affect the inference allowance.
+    Rate exhaustion or an overlong wait disables diagnostics without holding publication.
     """
     def __init__(self, opener, sleep, clock=time.time):
         self.opener, self.sleep, self.clock = opener, sleep, clock
         self.remaining, self.reset, self.last, self.retry = None, None, None, 0
+        self.deadline = None
+
+    def begin_poll(self):
+        # One existing poll interval bounds all requests, pages and rate waits.
+        self.deadline = time.monotonic() + POLL_SECONDS
+
+    def read_timeout(self, maximum=30):
+        left = POLL_SECONDS if self.deadline is None else self.deadline - time.monotonic()
+        if left <= 0:
+            raise ProgressUnavailable('Progress poll deadline reached')
+        return min(maximum, left)
 
     def _headers(self, headers):
         headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
@@ -212,13 +227,21 @@ class RateOpener:
         wait = max(self.retry - now, 0 if self.last is None else self.last + spacing - now, 0)
         if self.remaining == 0 and self.reset is not None:
             wait = max(wait, self.reset - now + 1)
+        left = POLL_SECONDS if self.deadline is None else self.deadline - time.monotonic()
+        if self.remaining == 0 or wait >= left:
+            raise ProgressUnavailable('Progress yields to terminal publication')
         if wait > 0:
             self.sleep(wait)
+        left = POLL_SECONDS if self.deadline is None else self.deadline - time.monotonic()
+        if left <= 0:
+            raise ProgressUnavailable('Progress poll deadline reached')
         self.last = self.clock()
         try:
-            response = self.opener.open(request, timeout=timeout)
+            response = self.opener.open(request, timeout=min(timeout, left))
         except urllib.error.HTTPError as error:
             self._headers(error.headers)
+            if error.code in (403, 429):
+                raise ProgressUnavailable('Progress API unavailable') from None
             raise
         self._headers(getattr(response, 'headers', {}))
         return response
@@ -258,7 +281,8 @@ def _download(token, url, *, opener=None):
         location = error.headers.get("Location") if error.code in (301, 302, 303, 307, 308) else None
         if not location or not location.startswith("https://"):
             raise
-        with urllib.request.build_opener(NoRedirect).open(urllib.request.Request(location), timeout=30) as response:
+        timeout = opener.read_timeout() if isinstance(opener, RateOpener) else 30
+        with urllib.request.build_opener(NoRedirect).open(urllib.request.Request(location), timeout=timeout) as response:
             return response.read(MAX_RECORD_BYTES + 1)
 
 
@@ -366,7 +390,10 @@ def observe(env=None, *, opener=None, sleep=None, iterations=None):
         while iterations is None or steps < iterations:
             steps += 1
             try:
+                opener.begin_poll()
                 jobs = _collect(opener, token, f'{prefix}/actions/runs/{run}/jobs?per_page=100', 'jobs')
+                if _job_done(jobs):
+                    break
                 if notice_id is None:
                     comments = _collect(opener, token, f"{prefix}/issues/{binding['number']}/comments?per_page=100")
                     matches = [item for item in comments if _notice(item, run)]
@@ -374,9 +401,7 @@ def observe(env=None, *, opener=None, sleep=None, iterations=None):
                     if notice is not None:
                         notice_id = notice['id']
                 else:
-                    notice = _api(opener, token, 'GET', f'{prefix}/issues/comments/{notice_id}')
-                    if not _notice(notice, run):
-                        break
+                    notice = None
                 if notice is not None and is_terminal(notice.get('body')):
                     break
                 listed = _collect(opener, token, f'{prefix}/actions/runs/{run}/artifacts?per_page=100', 'artifacts')
@@ -392,6 +417,10 @@ def observe(env=None, *, opener=None, sleep=None, iterations=None):
                             or artifact['size_in_bytes'] > MAX_RECORD_BYTES):
                         continue
                     candidates.append((int(match[3]), identity))
+                if candidates and notice is None and notice_id is not None:
+                    notice = _api(opener, token, 'GET', f'{prefix}/issues/comments/{notice_id}')
+                    if not _notice(notice, run) or is_terminal(notice.get('body')):
+                        break
                 for seq, identity in sorted(candidates, reverse=True):
                     try:
                         blob = _download(token, f'{prefix}/actions/artifacts/{identity}/zip', opener=opener)
@@ -416,6 +445,8 @@ def observe(env=None, *, opener=None, sleep=None, iterations=None):
                 if (review_done or absent) and quiet:
                     break
                 quiet = review_done or absent
+            except ProgressUnavailable:
+                break
             except (urllib.error.URLError, ValueError, KeyError, TypeError):
                 pass
             if iterations is None or steps < iterations:

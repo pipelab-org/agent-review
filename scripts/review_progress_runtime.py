@@ -33,6 +33,9 @@ DATA = Path('/var/lib/agent-review-progress')
 PID = DATA / '.runtime-pid'
 USER = 'agent-review-upload'
 SCRIPT = 'review_progress_runtime.py'
+# Existing worker ACK and cleanup windows, shared with the startup barrier.
+STARTUP_ACK_TIMEOUT = 30
+STARTUP_TIMEOUT = 2 * STARTUP_ACK_TIMEOUT
 STATE = DATA / '.runtime-state'
 TRANSPORT = {'PATH', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy',
              'all_proxy', 'no_proxy', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'}
@@ -140,7 +143,7 @@ def bootstrap():
         child.stdin.flush()
         # The worker consumes the secret before inference is allowed to read any
         # same-UID pipe descriptors. Its stdout carries only this fixed ACK.
-        if not select.select([child.stdout], [], [], 30)[0] or child.stdout.readline() != b'ready\n':
+        if not select.select([child.stdout], [], [], STARTUP_ACK_TIMEOUT)[0] or child.stdout.readline() != b'ready\n':
             raise ValueError('Uploader startup unavailable')
         child.stdout.close()
         fd = child.stdin.fileno()
@@ -150,7 +153,7 @@ def bootstrap():
         if child is not None and child.stdin:
             child.stdin.close()
             try:
-                child.wait(timeout=30)
+                child.wait(timeout=STARTUP_ACK_TIMEOUT)
             except subprocess.TimeoutExpired:
                 # The pipe is closed. A still-running child is the other uid, not
                 # this process. Exec below drops the runner-visible credential.
@@ -186,8 +189,9 @@ def _startup_exited():
     return False
 
 
-def await_ready():
-    """Inference startup barrier. An unknown live startup never authorizes a model."""
+def await_ready(timeout=STARTUP_TIMEOUT):
+    """Fail promptly if startup stays unknown; expiry never authorizes inference."""
+    deadline = time.monotonic() + timeout
     while True:
         try:
             value = json.loads(STATE.read_text())
@@ -199,7 +203,9 @@ def await_ready():
             pass
         if _startup_exited():
             return 0
-        time.sleep(0.1)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Progress startup could not be confirmed')
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
 def worker():
@@ -267,5 +273,7 @@ def main():
 if __name__ == '__main__':
     try:
         raise SystemExit(main())
+    except TimeoutError:
+        raise SystemExit('Progress startup could not be confirmed; inference did not start') from None
     except Exception:
         raise SystemExit('Progress runtime unavailable') from None

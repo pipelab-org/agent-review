@@ -183,7 +183,7 @@ jobs:
                 for item in comments:
                     author = item.get("user", {})
                     if (author.get("login") == "github-actions[bot]" and author.get("id") == 41898282
-                            and author.get("type") == "Bot" and item.get("body", "").startswith(marker + "\n")):
+                            and author.get("type") == "Bot" and marker in item.get("body", "").splitlines()):
                         found = item
                         break
                 if found is not None or len(comments) < 100:

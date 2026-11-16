@@ -147,44 +147,22 @@ print("returned")
                 child.wait(timeout=5)
             self.assertTrue(runtime._startup_exited())
 
-    def test_missing_pid_and_live_action_keep_waiting(self):
-        repo = Path(__file__).resolve().parents[1]
-        script = r'''
-import json, sys
-from pathlib import Path
-from scripts import review_progress_runtime as runtime
-root = Path(sys.argv[1])
-runtime.DATA = root
-runtime.PID = root / ".runtime-pid"
-runtime.STATE = root / ".runtime-state"
-if sys.argv[2] == "live":
-    runtime.PID.write_text(sys.argv[3])
-else:
-    runtime.PID.unlink(missing_ok=True)
-runtime.STATE.write_text(json.dumps({"state": "pending", "pid": None, "worker": None}))
-runtime.await_ready()
-print("returned")
-'''
-        with tempfile.TemporaryDirectory() as directory:
-            holder = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(30)", "review_progress_runtime.py"])
-            try:
-                live = subprocess.run([sys.executable, "-c", script, directory, "live", str(holder.pid)],
-                                      cwd=repo, capture_output=True, text=True, timeout=1)
-                self.fail("live startup returned: " + live.stdout + live.stderr)
-            except subprocess.TimeoutExpired:
-                pass
-            else:
-                self.fail("live startup must not release the barrier")
-            finally:
-                holder.kill()
-                holder.wait(timeout=5)
-            try:
-                missing = subprocess.run([sys.executable, "-c", script, directory, "missing"],
-                                         cwd=repo, capture_output=True, text=True, timeout=1)
-                self.fail("missing pid returned: " + missing.stdout + missing.stderr)
-            except subprocess.TimeoutExpired:
-                pass
+    def test_missing_pid_and_live_action_fail_closed_by_the_startup_deadline(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(runtime, 'PID', Path(directory) / 'pid'), \
+                patch.object(runtime, 'STATE', Path(directory) / 'state'):
+            runtime.STATE.write_text(json.dumps({"state": "pending"}))
+            for mode in ('missing', 'live', 'unreadable'):
+                with self.subTest(mode=mode):
+                    if mode == 'missing':
+                        runtime.PID.unlink(missing_ok=True)
+                    else:
+                        runtime.PID.write_text(str(os.getpid() if mode == 'live' else os.getpid() + 1))
+                    with patch.object(runtime.os, 'kill', side_effect=PermissionError('denied')):
+                        with self.assertRaisesRegex(TimeoutError, 'Progress startup could not be confirmed'):
+                            runtime.await_ready(timeout=0)
+            for state in ('ready', 'unavailable'):
+                runtime.STATE.write_text(json.dumps({"state": state}))
+                self.assertEqual(0, runtime.await_ready(timeout=0))
 
 
 if __name__ == '__main__':

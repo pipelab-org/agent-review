@@ -235,7 +235,15 @@ class RepositoryPlanTests(unittest.TestCase):
         (self.root / "small.py").write_text("def useful_context():\n    return 42\n")
         head = self.head()
         settings = dict(POLICY, max_model_tokens=40_000, max_output_tokens=16_000)
-        bundle = e.build_bundle(self.root, head, self.base, settings)
+        stream = s.stream_to_file
+        def refuse_oversize_disk(command, target, **kwargs):
+            if 'cat-file' in command and command[-1].endswith(':keep.txt'):
+                self.assertEqual(__import__('os').devnull, str(target),
+                                 "optional oversized head blobs must be measured without consuming disk")
+                self.assertFalse(kwargs.get('publish', True))
+            return stream(command, target, **kwargs)
+        with patch.object(s, 'stream_to_file', side_effect=refuse_oversize_disk):
+            bundle = e.build_bundle(self.root, head, self.base, settings)
         self.assertGreater(len(bundle["sections"]), 1)
         small = next(f for f in bundle["files"] if f["path"] == "small.py")
         self.assertEqual("full", small["content"])
@@ -244,6 +252,18 @@ class RepositoryPlanTests(unittest.TestCase):
         prompts = [e.section_prompt(bundle, provider, strategy, i)
                    for i in range(len(bundle["sections"])) for provider, strategy in e.PROMPT_KINDS]
         self.assertTrue(any("def useful_context():" in p for p in prompts))
+        # Fill exactly the optional room, then render the real populated ledger.
+        ledger = e.Ledger()
+        ledger.entries = [(0, "question", "keep.txt", "x" * 120)] * 120
+        last = len(bundle["sections"]) - 1
+        room = e._section_room(bundle, settings, 0, last)
+        self.assertGreaterEqual(room, 0)
+        render = s.render_section
+        with patch.object(s, "render_section", side_effect=lambda *args: render(*args) + "x" * room):
+            for provider, strategy in e.PROMPT_KINDS:
+                real = e.section_prompt(bundle, provider, strategy, last, ledger)
+                self.assertLessEqual(e.token_bound(real) + e.token_bound(json.dumps(e.SECTION_SCHEMA)),
+                                     settings["max_model_tokens"] - settings["max_output_tokens"])
         self.assertTrue(all(e.token_bound(p) + e.token_bound(json.dumps(e.SECTION_SCHEMA))
                             <= settings["max_model_tokens"] - settings["max_output_tokens"] for p in prompts))
         self.assertEqual(bundle, e.build_bundle(self.root, head, self.base, settings))

@@ -202,8 +202,14 @@ def enclosing_text(repo, start, head, path, limit):
 def _pins(text):
     """Only job-level reusable calls; YAML handles comments/quotes, not run scripts."""
     try:
+        # Optional discovery does not need aliases. Reject them before SafeLoader
+        # constructs merge keys (YAML 1.1 merge type), whose expansion is not
+        # bounded by the workflow's byte size.
+        # https://yaml.org/type/merge.html
+        if any(isinstance(token, yaml.tokens.AliasToken) for token in yaml.scan(text)):
+            return [], []
         value = yaml.safe_load(text)
-    except (yaml.YAMLError, RecursionError):
+    except (yaml.YAMLError, RecursionError, ValueError):
         return [], []
     jobs = value.get('jobs') if isinstance(value, dict) else None
     if not isinstance(jobs, dict):

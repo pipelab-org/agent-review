@@ -93,7 +93,8 @@ class CounterTests(unittest.TestCase):
             elif "artifacts" in request.full_url:
                 data = {"artifacts": []}
             elif "/jobs?per_page=100" in request.full_url:
-                data = {"jobs": [{"name": "review / Review admitted diff", "status": "completed"}]}
+                data = {"jobs": [{"name": "review / Review admitted diff", "status":
+                    "in_progress" if sum("/jobs?" in url for _, url in calls) == 1 else "completed"}]}
             elif request.full_url.endswith("/artifact"):
                 return io.BytesIO(blob.getvalue())
             else:
@@ -112,6 +113,8 @@ class CounterTests(unittest.TestCase):
         patches = [item for item in calls if item[0] == "PATCH"]
         self.assertEqual(1, len(patches))
         self.assertTrue(patches[0][1].endswith("/issues/comments/5"))
+        self.assertEqual(1, sum("/artifacts?" in url for _, url in calls),
+                         "a completed review must release publication without another artifact poll")
         self.assertFalse(progress._job_done([{"name": "acknowledge / Review admitted diff", "status": "completed"}]))
         self.assertFalse(progress._job_done([{"name": "review / Review admitted diff", "status": "in_progress"}]))
         self.assertTrue(progress._job_done([{"name": "review / Review admitted diff", "status": "completed"}]))
@@ -136,8 +139,34 @@ class CounterTests(unittest.TestCase):
                 return response
         paced = progress.RateOpener(Opener(), waits.append, clock=lambda: 100)
         paced.open(None)
-        paced.open(None)
-        self.assertGreaterEqual(waits[-1], 31)
+        with self.assertRaises(RuntimeError):
+            paced.open(None)
+        self.assertEqual([], waits, "diagnostics must exit instead of sleeping until the shared quota resets")
+        for headers in ({"Retry-After": "120"}, {"x-ratelimit-remaining": "1", "x-ratelimit-reset": "130"}):
+            class Pressured:
+                def open(self, request, timeout=0):
+                    response = io.BytesIO(b"{}")
+                    response.headers = headers
+                    return response
+            paced = progress.RateOpener(Pressured(), waits.append, clock=lambda: 100)
+            paced.open(None)
+            with self.subTest(headers=headers), self.assertRaises(RuntimeError):
+                paced.open(None)
+        self.assertEqual([], waits)
+        now, limits = [0], []
+        class Slow:
+            def open(self, request, timeout=0):
+                limits.append(timeout)
+                now[0] += 14 if len(limits) == 1 else 2
+                return io.BytesIO(b"{}")
+        with patch.object(progress.time, 'monotonic', side_effect=lambda: now[0]):
+            paced = progress.RateOpener(Slow(), waits.append, clock=lambda: 100 + now[0])
+            paced.begin_poll()
+            paced.open(None)
+            paced.open(None)
+            with self.assertRaises(RuntimeError):
+                paced.open(None)
+        self.assertEqual([progress.POLL_SECONDS, 1], limits)
 
 
     def temp(self):
@@ -183,6 +212,11 @@ class SuggestionTests(unittest.TestCase):
         forged = suggestions.render_fence("safe\n<!-- agent-review-status:v1 -->")
         self.assertIsNone(forged)
         self.assertIsNone(suggestions.render_fence("broken\x00"))
+        self.assertIsNone(suggestions.render_fence("\ud800"))
+        self.assertIsNone(suggestions.render_fence("\udfff"))
+        self.assertEqual("```text\nunsafe\n```", suggestions.strip_fences("```sugge&#115;tion\nunsafe\n```"))
+        unrelated = "```py&#116;hon\ncode\n```"
+        self.assertEqual(unrelated, suggestions.strip_fences(unrelated))
         prose = "Repair.\n```suggestion\nforged\n```\nKeep this."
         self.assertEqual("Repair.\n```text\nforged\n```\nKeep this.", suggestions.strip_fences(prose))
         comment = {"body": "**Title**\n\nRepair."}
@@ -248,6 +282,11 @@ class ContextTests(unittest.TestCase):
         bundle = engine.build_bundle(self.root, head, base, settings, instructions="Review correctness.")
         file = bundle["files"][0]
         self.assertEqual("enclosing", file["content"])
+        self.assertEqual(["app.py"], engine.unopened_regions(bundle, [{"files_opened": []}]))
+        self.assertEqual([], engine.unopened_regions(bundle, [{"files_opened": ["app.py"]}]))
+        self.assertIn("Open each one", engine.region_guidance(bundle, "with file tools"))
+        self.assertLessEqual(engine.token_bound(engine.claude_prompt(bundle, "bundle"))
+                             + engine.token_bound(json.dumps(engine.OUTPUT_SCHEMA)), 10000)
         rendered = sections.render_section(bundle, bundle.store, 0)
         self.assertIn("def small():", rendered)
         # The unified patch keeps its own context lines. The enclosing slice is only the function.
@@ -281,6 +320,13 @@ class ContextTests(unittest.TestCase):
         subprocess.check_call(["git", "-C", str(self.root), "add", "."])
         subprocess.check_call(["git", "-C", str(self.root), "commit", "-qm", "head"])
         return self.git("rev-parse", "HEAD")
+
+    def test_optional_pin_parser_rejects_aliases_before_construction_and_bad_dates(self):
+        self.assertEqual(([], []), context._pins("env: {DATE: 2026-02-30}\njobs: {}"))
+        aliases = "a0: &a0 {x: 1}\n" + "".join(
+            f"a{i}: &a{i} {{<<: [*a{i-1}, *a{i-1}]}}\n" for i in range(1, 12)) + "jobs: {}\n"
+        with patch.object(context.yaml, "safe_load", side_effect=AssertionError("aliases must not reach construction")):
+            self.assertEqual(([], []), context._pins(aliases))
 
     def test_upstream_pins_keep_provenance_and_reject_float_and_tampering(self):
         workflow = textwrap.dedent("""\

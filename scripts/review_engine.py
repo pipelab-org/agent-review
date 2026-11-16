@@ -385,10 +385,13 @@ def plan_layout(repo, files, fields, instructions, settings, store, reserved):
                 continue
             content = sections.stream_to_file(
                 sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
-                store.content(index), message=BINARY_MESSAGE)
+                os.devnull, message=BINARY_MESSAGE, publish=False)
             cost = sections.content_cost(content)
             section = ending[index]
             if cost <= remaining[section]:
+                sections.stream_to_file(
+                    sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
+                    store.content(index), message=BINARY_MESSAGE)
                 entries[index] = content_entry(file, "full", content)
                 remaining[section] -= cost
             else:
@@ -419,7 +422,7 @@ def fit_contents(repo, files, segments, fields, instructions, settings, store, r
         if not file["deleted"]:
             contents[index] = sections.stream_to_file(
                 sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
-                store.content(index), message=BINARY_MESSAGE)
+                os.devnull, message=BINARY_MESSAGE, publish=False)
     full = set(contents)
 
     def size():
@@ -439,6 +442,9 @@ def fit_contents(repo, files, segments, fields, instructions, settings, store, r
         return None
     for index, file in enumerate(files):
         if index in full:
+            sections.stream_to_file(
+                sections.git_command(repo, "cat-file", "blob", fields["head"] + ":" + file["path"]),
+                store.content(index), message=BINARY_MESSAGE)
             entries[index] = content_entry(file, "full", contents[index])
         else:
             store.content(index).unlink(missing_ok=True)
@@ -449,7 +455,7 @@ def _section_room(bundle, settings, reserved, section):
     """Spare bytes of one section's largest real prompt, after patches and full-file context."""
     available = settings["max_model_tokens"] - settings["max_output_tokens"]
     schema = token_bound(json.dumps(SECTION_SCHEMA if len(bundle["sections"]) > 1 else OUTPUT_SCHEMA))
-    used = max(token_bound(section_prompt(bundle, provider, strategy, section))
+    used = max(token_bound(section_prompt(bundle, provider, strategy, section, sizing=True))
                for provider, strategy in PROMPT_KINDS)
     return available - schema - reserved - used
 
@@ -530,7 +536,7 @@ def unopened_regions(bundle, receipts):
     """
     opened = {path for r in receipts for path in r["files_opened"]}
     return sorted(f["path"] for f in bundle["files"]
-                  if not f["deleted"] and f.get("content") == "regions" and f["path"] not in opened)
+                  if not f["deleted"] and f.get("content") in ("regions", "enclosing") and f["path"] not in opened)
 
 
 UNVERIFIED_LOCATION_NOTE = "_Location could not be confirmed at the reviewed head; listed in the summary only._"
@@ -1068,7 +1074,7 @@ def how_to_read(provider):
 
 def region_guidance(bundle, how):
     """Name region-only files and request deeper reads without requiring them."""
-    paths = [f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") == "regions"]
+    paths = [f["path"] for f in bundle["files"] if not f["deleted"] and f.get("content") in ("regions", "enclosing")]
     if not paths:
         return ""
     return ("These changed files are too large to send whole; their complete unified diffs below "
@@ -1200,10 +1206,14 @@ def pass_note(bundle, provider, strategy, section, ledger):
     return section_note(bundle.store, strategy, section + 1, len(bundle["sections"]), bundle["root"], ledger.meta())
 
 
-def section_prompt(bundle, provider, strategy, section, ledger=None):
-    """Public text of one section's prompt (learning text is appended separately)."""
+def section_prompt(bundle, provider, strategy, section, ledger=None, *, sizing=False):
+    """Public prompt, reserving the planner's maximum ledger widths when sizing."""
     ledger = ledger or Ledger()
-    return prompt_text(bundle, provider, strategy, pass_note(bundle, provider, strategy, section, ledger),
+    note = (section_note(bundle.store, strategy, section + 1, len(bundle["sections"]),
+                         bundle["root"], PLACEHOLDER_LEDGER)
+            if sizing and len(bundle["sections"]) > 1
+            else pass_note(bundle, provider, strategy, section, ledger))
+    return prompt_text(bundle, provider, strategy, note,
                        sections.render_section(bundle, getattr(bundle, "store", None), section))
 
 

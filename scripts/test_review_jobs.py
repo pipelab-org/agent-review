@@ -602,7 +602,7 @@ class JobTests(unittest.TestCase):
             exec(compile(script, "<trusted-progress>", "exec"), {})
             self.assertEqual(1, len(writes), "a regular invocation cannot claim terminal-writer authority")
             self.assertEqual([], reactions)
-            existing = {"id": 77, "body": marker + "<!-- agent-review-status:v1 state=success -->", "user": f.BOT}
+            existing = {"id": 77, "body": "<!-- agent-review-status:v1 state=success -->\n" + marker + "Completed review.", "user": f.BOT}
             os.environ["PROGRESS_ONLY"] = "true"
             os.environ["PROGRESS_CANCELLED"] = "true"
             exec(compile(script, "<trusted-progress>", "exec"), {})

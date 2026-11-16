@@ -18,6 +18,7 @@ an empty replacement is an empty fence body (a deletion).
 """
 from __future__ import annotations
 
+import html
 import re
 
 try:
@@ -42,7 +43,8 @@ def head_lines(blob):
 def _safe_text(text):
     if not isinstance(text, str) or "\x00" in text or "<!--" in text or "agent-review-" in text:
         return False
-    return all(ch in "\n\t" or ord(ch) >= 32 and ord(ch) != 127 for ch in text)
+    return all(ch in "\n\t" or (ord(ch) >= 32 and ord(ch) != 127
+                                and not 0xD800 <= ord(ch) <= 0xDFFF) for ch in text)
 
 
 def strip_fences(text):
@@ -54,7 +56,10 @@ def strip_fences(text):
     """
     if not isinstance(text, str):
         return text
-    return re.sub(r"(`{3,}|~{3,})[ \t]*suggestion", r"\1text", text)
+    def neutralize(match):
+        info = html.unescape(match[3])
+        return match[1] + match[2] + "text" + info[len("suggestion"):] if info.startswith("suggestion") else match[0]
+    return re.sub(r"(`{3,}|~{3,})([ \t]*)([^\s`~]+)", neutralize, text)
 
 
 def render_fence(replacement):
